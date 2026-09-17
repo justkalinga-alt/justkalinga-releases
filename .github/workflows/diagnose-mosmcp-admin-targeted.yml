@@ -22,25 +22,35 @@ jobs:
           curl -fL 'https://downloads.wordpress.org/plugin/miniorange-secure-mcp-server.1.4.12.zip' -o /tmp/mosmcp.zip
           mkdir -p /tmp/mosmcp
           unzip -q /tmp/mosmcp.zip -d /tmp/mosmcp
-      - name: Print bootstrap construction
+      - name: Verify Dormant Abilities Provider
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
           root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
-          p=root/'includes/common/views/admin/class-admin-app.php'
-          lines=p.read_text(errors='replace').splitlines()
-          for a,b in [(181,249)]:
-              print(f'===== ADMIN_APP {a}-{b} =====')
-              for n in range(a,min(b,len(lines))+1): print(f'{n}: {lines[n-1]}')
-          print('===== BOOTSTRAP CALLEES =====')
-          names=['debug','connection_summary','site','settings','abilities','roles','nhi','oauth','direct_connection','get_abilities_payload']
-          for q in root.rglob('*.php'):
-              try: ql=q.read_text(errors='replace').splitlines()
+          needle='Dormant_Abilities_Provider'
+          found=[]
+          for p in root.rglob('*.php'):
+              try: lines=p.read_text(errors='replace').splitlines()
               except: continue
-              for i,line in enumerate(ql,1):
-                  low=line.lower()
-                  if any(x in low for x in names) and ('payload' in low or 'bootstrap' in low):
-                      print(f'{q.relative_to(root)}:{i}: {line.strip()[:400]}')
+              for i,line in enumerate(lines,1):
+                  if needle in line:
+                      found.append((p.relative_to(root),i,line.strip()))
+          print('DORMANT_REFERENCES',len(found))
+          for p,i,line in found: print(f'{p}:{i}: {line}')
+          print('===== ADMIN IMPORTS =====')
+          p=root/'includes/common/views/admin/class-admin-app.php'
+          for i,line in enumerate(p.read_text(errors='replace').splitlines()[:40],1): print(f'{i}: {line}')
+          print('===== PROVIDER-LIKE FILES =====')
+          for p in root.rglob('*dormant*'):
+              print(p.relative_to(root))
+          for p in root.rglob('*provider*.php'):
+              print(p.relative_to(root))
+          print('===== AUTOLOAD =====')
+          for p in root.rglob('*.php'):
+              try: t=p.read_text(errors='replace')
+              except: continue
+              if 'spl_autoload_register' in t or 'autoload' in p.name.lower() or 'classmap' in t.lower():
+                  print(p.relative_to(root))
           PY
