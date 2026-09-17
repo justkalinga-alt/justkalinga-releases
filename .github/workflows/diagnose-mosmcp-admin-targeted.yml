@@ -1,0 +1,86 @@
+name: Target miniOrange admin renderer crash
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/diagnose-mosmcp-admin-targeted.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/bridge.zip
+          curl -fL 'https://downloads.wordpress.org/plugin/miniorange-secure-mcp-server.1.4.12.zip' -o /tmp/mosmcp.zip
+          mkdir -p /tmp/bridge /tmp/mosmcp
+          unzip -q /tmp/bridge.zip -d /tmp/bridge
+          unzip -q /tmp/mosmcp.zip -d /tmp/mosmcp
+
+      - name: Locate admin page and renderer code
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
+          terms=['add_menu_page','add_submenu_page','wp_get_abilities','get_all_registered','get_annotations','annotations','ability editor','role & ability','role and ability','ability matrix']
+          rows=[]
+          for p in root.rglob('*.php'):
+              try: lines=p.read_text(errors='replace').splitlines()
+              except: continue
+              for i,line in enumerate(lines,1):
+                  low=line.lower()
+                  if any(t.lower() in low for t in terms):
+                      rows.append((str(p.relative_to(root)),i,' '.join(line.strip().split())[:320]))
+          for r in rows:
+              print('%s:%d: %s'%r)
+          PY
+
+      - name: Print focused admin files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
+          picks=[]
+          for p in root.rglob('*.php'):
+              try: t=p.read_text(errors='replace')
+              except: continue
+              low=t.lower()
+              if ('wp_get_abilities' in t or 'get_annotations' in t) and ('admin' in str(p).lower() or 'role' in low or 'matrix' in low or 'permission' in low):
+                  picks.append(p)
+          print('FOCUSED_FILES', len(picks))
+          for p in picks[:25]:
+              print('\n===== FILE',p.relative_to(root),'=====')
+              lines=p.read_text(errors='replace').splitlines()
+              for i,line in enumerate(lines,1):
+                  if any(x in line for x in ['wp_get_abilities','get_annotations','annotations','get_input_schema','get_output_schema','get_category']):
+                      a=max(1,i-12); b=min(len(lines),i+18)
+                      print(f'--- context {a}-{b} ---')
+                      for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
+          PY
+
+      - name: Print Bridge annotation registrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=next(Path('/tmp/bridge').rglob('jk-social-supabase-bridge.php'))
+          lines=p.read_text(errors='replace').splitlines()
+          for i,line in enumerate(lines,1):
+              if "'annotations'" in line or '"annotations"' in line:
+                  a=max(1,i-6); b=min(len(lines),i+14)
+                  print(f'--- bridge annotation context {a}-{b} ---')
+                  for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
+          PY
