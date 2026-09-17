@@ -1,0 +1,225 @@
+name: Build JK Social Hub 0.8.4 IST
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/build-jksh-084-ist.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Fetch and verify exact live 0.8.3 export
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-hub-live-v0.8.3-export.zip'
+          EXPECT='89ebebfa96a169d5ee8d46ee1456255da880f7aea0f93ff1dd9abe6ce9f4e202'
+          curl -fL --retry 4 --retry-all-errors "$URL" -o /tmp/jksh083.zip
+          test "$(sha256sum /tmp/jksh083.zip | awk '{print $1}')" = "$EXPECT"
+          rm -rf /tmp/jksh084 && mkdir -p /tmp/jksh084
+          unzip -q /tmp/jksh083.zip -d /tmp/jksh084
+          test -f /tmp/jksh084/jk-social-hub/jk-social-hub.php
+          grep -q 'Version:     0.8.3' /tmp/jksh084/jk-social-hub/jk-social-hub.php
+      - name: Apply IST-only human interface patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('/tmp/jksh084/jk-social-hub')
+          main = root / 'jk-social-hub.php'
+          pages = root / 'src/Admin/Pages.php'
+          abilities = root / 'src/Mcp/Abilities.php'
+          settings = root / 'src/Services/Settings.php'
+
+          def replace_exact(path, old, new, count=None):
+              text = path.read_text()
+              found = text.count(old)
+              if found == 0:
+                  raise SystemExit(f'Missing expected patch target in {path}: {old[:120]!r}')
+              if count is not None and found != count:
+                  raise SystemExit(f'Unexpected target count in {path}: {found} != {count} for {old[:100]!r}')
+              path.write_text(text.replace(old, new))
+
+          # Version and release description.
+          replace_exact(main, 'v0.8.3 adds a read-only signed relay-worker handshake to existing live readiness diagnostics while preserving Dry Run and live-publish safety gates.', 'v0.8.4 makes Asia/Kolkata (IST) the only human-facing scheduling and display timezone while preserving UTC internally for platform APIs, queue safety and token storage.', 1)
+          replace_exact(main, ' * Version:     0.8.3', ' * Version:     0.8.4', 1)
+          replace_exact(main, "define( 'JKSH_VERSION', '0.8.3' );", "define( 'JKSH_VERSION', '0.8.4' );", 1)
+
+          # Freeze the operational setting to IST.
+          replace_exact(settings, "'timezone'        => sanitize_text_field( $input['timezone'] ?? 'Asia/Kolkata' ),", "'timezone'        => 'Asia/Kolkata',", 1)
+
+          # Add one central UTC -> IST renderer for all admin human-readable timestamps.
+          marker = "\tprivate function footer(): void {\n\t\techo '</div>';\n\t}\n"
+          helper = marker + r'''
+
+	private function ist_time( mixed $utc_value ): string {
+		$value = trim( (string) $utc_value );
+		if ( '' === $value || '0000-00-00 00:00:00' === $value ) {
+			return '';
+		}
+		try {
+			$utc = new \DateTimeImmutable( $value, new \DateTimeZone( 'UTC' ) );
+			return $utc->setTimezone( new \DateTimeZone( 'Asia/Kolkata' ) )->format( 'Y-m-d H:i:s' );
+		} catch ( \Throwable $e ) {
+			return $value;
+		}
+	}
+'''
+          replace_exact(pages, marker, helper, 1)
+
+          # Human-facing labels.
+          label_replacements = {
+              'Publish UTC': 'Publish IST',
+              'Token expiry UTC': 'Token expiry IST',
+              'Last checked UTC': 'Last checked IST',
+              'Created UTC': 'Created IST',
+              'Scheduled UTC': 'Scheduled IST',
+              'Time UTC': 'Time IST',
+              'Hub operational timezone': 'Human-facing timezone (fixed to IST)',
+          }
+          text = pages.read_text()
+          for old, new in label_replacements.items():
+              text = text.replace(old, new)
+          text = text.replace("$this->stat_card( 'Timezone', (string) $settings->get( 'timezone' ), 'Human-facing timezone (fixed to IST)' );", "$this->stat_card( 'Timezone', 'Asia/Kolkata (IST)', 'Human-facing timezone (fixed to IST)' );")
+          pages.write_text(text)
+
+          # Render stored UTC timestamps as IST everywhere users see them.
+          replacements = [
+              ("esc_html( (string) $row->publish_at )", "esc_html( $this->ist_time( $row->publish_at ) )"),
+              ("esc_html( $row->created_at )", "esc_html( $this->ist_time( $row->created_at ) )"),
+              ("esc_html( (string) $row->scheduled_at )", "esc_html( $this->ist_time( $row->scheduled_at ) )"),
+              ("esc_html( $row->created_at )", "esc_html( $this->ist_time( $row->created_at ) )"),
+              ("esc_html( (string) $account->token_expires_at )", "esc_html( $this->ist_time( $account->token_expires_at ) )"),
+              ("esc_html( (string) $account->last_checked_at )", "esc_html( $this->ist_time( $account->last_checked_at ) )"),
+          ]
+          text = pages.read_text()
+          for old, new in replacements:
+              text = text.replace(old, new)
+
+          # Calendar grouping must follow IST date boundaries, not UTC date boundaries.
+          old_calendar = "$date = $row->publish_at ? substr( $row->publish_at, 0, 10 ) : 'Unscheduled';"
+          new_calendar = "$ist_publish_at = $row->publish_at ? $this->ist_time( $row->publish_at ) : '';\n\t\t\t$date = $ist_publish_at ? substr( $ist_publish_at, 0, 10 ) : 'Unscheduled';"
+          if old_calendar not in text:
+              raise SystemExit('Calendar date grouping target not found')
+          text = text.replace(old_calendar, new_calendar, 1)
+
+          # Make the timezone setting visibly fixed, not editable.
+          old_tz_field = '<label><span>Operational timezone</span><input name="jksh_settings[timezone]" value="<?php echo esc_attr( $settings[\'timezone\'] ); ?>"></label>'
+          new_tz_field = '<label><span>Operational timezone</span><input value="Asia/Kolkata (IST)" readonly><input type="hidden" name="jksh_settings[timezone]" value="Asia/Kolkata"></label>'
+          if old_tz_field not in text:
+              raise SystemExit('Timezone settings field target not found')
+          text = text.replace(old_tz_field, new_tz_field, 1)
+          pages.write_text(text)
+
+          # MCP: accept IST, convert once to UTC for the existing orchestrator, and return IST only.
+          old_schema = "\t\t\t\t\t'scheduled_at_utc' => array( 'type' => 'string' ),"
+          new_schema = "\t\t\t\t\t'scheduled_at_ist' => array( 'type' => 'string', 'description' => 'Schedule time in Asia/Kolkata (IST). Accepted formats include YYYY-MM-DD HH:MM:SS and YYYY-MM-DDTHH:MM.' ),"
+          replace_exact(abilities, old_schema, new_schema, 1)
+
+          old_method = "\tpublic function create_dry_run_content( mixed $input ): array|\\WP_Error {\n\t\treturn ( new ContentOrchestrator() )->create_dry_run( is_array( $input ) ? $input : array() );\n\t}"
+          new_method = r'''	public function create_dry_run_content( mixed $input ): array|\WP_Error {
+		$input = is_array( $input ) ? $input : array();
+		$ist_value = trim( (string) ( $input['scheduled_at_ist'] ?? '' ) );
+		if ( '' !== $ist_value ) {
+			$ist = new \DateTimeZone( 'Asia/Kolkata' );
+			$when = \DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $ist_value, $ist );
+			if ( ! $when ) {
+				$when = \DateTimeImmutable::createFromFormat( 'Y-m-d\TH:i', $ist_value, $ist );
+			}
+			if ( ! $when ) {
+				try {
+					$when = new \DateTimeImmutable( $ist_value, $ist );
+				} catch ( \Throwable $e ) {
+					$when = false;
+				}
+			}
+			if ( ! $when ) {
+				return new \WP_Error( 'jksh_invalid_schedule_ist', 'scheduled_at_ist must be a valid Asia/Kolkata (IST) date/time.' );
+			}
+			$input['scheduled_at_utc'] = $when->setTimezone( new \DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' );
+		}
+		unset( $input['scheduled_at_ist'] );
+		$result = ( new ContentOrchestrator() )->create_dry_run( $input );
+		if ( is_array( $result ) && ! empty( $result['scheduled_at_utc'] ) ) {
+			try {
+				$utc = new \DateTimeImmutable( (string) $result['scheduled_at_utc'], new \DateTimeZone( 'UTC' ) );
+				$result['scheduled_at_ist'] = $utc->setTimezone( new \DateTimeZone( 'Asia/Kolkata' ) )->format( 'Y-m-d H:i:s' );
+			} catch ( \Throwable $e ) {
+				$result['scheduled_at_ist'] = (string) $result['scheduled_at_utc'];
+			}
+			unset( $result['scheduled_at_utc'] );
+		}
+		return $result;
+	}'''
+          replace_exact(abilities, old_method, new_method, 1)
+
+          # Release notes.
+          readme = root / 'README.md'
+          if readme.exists():
+              rt = readme.read_text()
+              rt += "\n\n## 0.8.4\n- Asia/Kolkata (IST) is the only human-facing timezone in Composer, Calendar, Variants, Queue, Logs, Accounts and MCP scheduling.\n- UTC remains internal for platform APIs, queue execution and stored token timestamps.\n"
+              readme.write_text(rt)
+          PY
+      - name: Validate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=/tmp/jksh084/jk-social-hub
+          grep -q 'Version:     0.8.4' "$ROOT/jk-social-hub.php"
+          grep -q "define( 'JKSH_VERSION', '0.8.4' );" "$ROOT/jk-social-hub.php"
+          grep -q 'Publish IST' "$ROOT/src/Admin/Pages.php"
+          grep -q 'Scheduled IST' "$ROOT/src/Admin/Pages.php"
+          grep -q 'Time IST' "$ROOT/src/Admin/Pages.php"
+          grep -q 'Created IST' "$ROOT/src/Admin/Pages.php"
+          grep -q 'Token expiry IST' "$ROOT/src/Admin/Pages.php"
+          grep -q 'scheduled_at_ist' "$ROOT/src/Mcp/Abilities.php"
+          if grep -qE 'Publish UTC|Scheduled UTC|Time UTC|Created UTC|Token expiry UTC|Last checked UTC' "$ROOT/src/Admin/Pages.php"; then
+            echo 'A human-facing UTC label remains in Pages.php' >&2
+            exit 1
+          fi
+          find "$ROOT" -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: Package 0.8.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f /tmp/jk-social-hub-v0.8.4-ist.zip
+          cd /tmp/jksh084
+          zip -qr /tmp/jk-social-hub-v0.8.4-ist.zip jk-social-hub
+          unzip -t /tmp/jk-social-hub-v0.8.4-ist.zip
+          mkdir -p "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/reports"
+          cp /tmp/jk-social-hub-v0.8.4-ist.zip "$GITHUB_WORKSPACE/dist/jk-social-hub-v0.8.4-ist.zip"
+          SHA="$(sha256sum /tmp/jk-social-hub-v0.8.4-ist.zip | awk '{print $1}')"
+          SIZE="$(stat -c%s /tmp/jk-social-hub-v0.8.4-ist.zip)"
+          {
+            echo 'JK Social Hub v0.8.4 IST'
+            echo "sha256=$SHA"
+            echo "bytes=$SIZE"
+            echo 'base_live_version=0.8.3'
+            echo 'base_export_sha256=89ebebfa96a169d5ee8d46ee1456255da880f7aea0f93ff1dd9abe6ce9f4e202'
+            echo 'human_timezone=Asia/Kolkata (IST)'
+            echo 'internal_storage=UTC where required by existing queue/platform contracts'
+          } > "$GITHUB_WORKSPACE/reports/jksh-084-ist-manifest.txt"
+      - name: Commit distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-hub-v0.8.4-ist.zip reports/jksh-084-ist-manifest.txt
+          if git diff --cached --quiet; then
+            echo '0.8.4 package already current.'
+          else
+            git commit -m 'Build JK Social Hub 0.8.4 IST'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
