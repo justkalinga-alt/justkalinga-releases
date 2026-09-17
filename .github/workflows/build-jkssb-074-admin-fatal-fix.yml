@@ -1,0 +1,75 @@
+name: Build Bridge 0.7.4 admin fatal fix
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/build-jkssb-074-admin-fatal-fix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact live Bridge 0.7.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 15 \
+            'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' \
+            -o /tmp/source.zip
+          rm -rf /tmp/work
+          mkdir -p /tmp/work
+          unzip -q /tmp/source.zip -d /tmp/work
+          test -f /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          sha256sum /tmp/source.zip | tee /tmp/source.sha256
+
+      - name: Apply minimal admin fatal repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php')
+          s=p.read_text()
+          old_hook="        add_action( 'admin_footer', array( $this, 'inject_composer_upload_ui' ) );\n"
+          if old_hook not in s:
+              raise SystemExit('Expected broken admin_footer hook not found')
+          s=s.replace(old_hook, '', 1)
+          if 'function inject_composer_upload_ui' in s:
+              raise SystemExit('Unexpected method exists; refusing minimal hook-removal patch')
+          if ' * Version: 0.7.3' not in s:
+              raise SystemExit('Expected plugin header version not found')
+          s=s.replace(' * Version: 0.7.3', ' * Version: 0.7.4', 1)
+          if "const VERSION  = '0.7.3';" not in s:
+              raise SystemExit('Expected VERSION constant not found')
+          s=s.replace("const VERSION  = '0.7.3';", "const VERSION  = '0.7.4';", 1)
+          p.write_text(s)
+          PY
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -l /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          grep -q 'Version: 0.7.4' /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          ! grep -q "inject_composer_upload_ui" /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          cd /tmp/work
+          zip -qr /tmp/jk-social-supabase-bridge-v0.7.4.zip jk-social-supabase-bridge
+          unzip -t /tmp/jk-social-supabase-bridge-v0.7.4.zip
+          sha256sum /tmp/jk-social-supabase-bridge-v0.7.4.zip | tee /tmp/jk-social-supabase-bridge-v0.7.4.sha256
+
+      - name: Upload verified repair artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jk-social-supabase-bridge-v0.7.4-admin-fatal-fix
+          path: |
+            /tmp/jk-social-supabase-bridge-v0.7.4.zip
+            /tmp/jk-social-supabase-bridge-v0.7.4.sha256
+            /tmp/source.sha256
+          if-no-files-found: error
+          retention-days: 7
