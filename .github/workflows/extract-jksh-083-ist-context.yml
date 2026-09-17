@@ -1,0 +1,68 @@
+name: Extract JK Social Hub 0.8.3 IST patch context
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/extract-jksh-083-ist-context.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Fetch exact live export
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-hub-live-v0.8.3-export.zip'
+          EXPECT='89ebebfa96a169d5ee8d46ee1456255da880f7aea0f93ff1dd9abe6ce9f4e202'
+          curl -fL --retry 4 --retry-all-errors "$URL" -o /tmp/jksh083.zip
+          test "$(sha256sum /tmp/jksh083.zip | awk '{print $1}')" = "$EXPECT"
+          rm -rf /tmp/jksh083 && mkdir -p /tmp/jksh083
+          unzip -q /tmp/jksh083.zip -d /tmp/jksh083
+      - name: Extract patch context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          BASE=/tmp/jksh083/jk-social-hub
+          {
+            echo '===== jk-social-hub.php ====='
+            sed -n '1,180p' "$BASE/jk-social-hub.php"
+            echo
+            echo '===== src/Admin/Pages.php ====='
+            sed -n '1,560p' "$BASE/src/Admin/Pages.php"
+            echo
+            echo '===== src/Mcp/Abilities.php 1-220 ====='
+            sed -n '1,220p' "$BASE/src/Mcp/Abilities.php"
+            echo
+            echo '===== src/Mcp/Abilities.php 220-520 ====='
+            sed -n '220,520p' "$BASE/src/Mcp/Abilities.php"
+            echo
+            echo '===== src/Services/ContentOrchestrator.php ====='
+            cat "$BASE/src/Services/ContentOrchestrator.php"
+            echo
+            echo '===== src/Services/LiveStreaming.php ====='
+            cat "$BASE/src/Services/LiveStreaming.php"
+            echo
+            echo '===== src/Services/YouTubeLive.php ====='
+            sed -n '1,300p' "$BASE/src/Services/YouTubeLive.php"
+          } > reports/jksh-083-ist-context.txt
+      - name: Commit context
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add reports/jksh-083-ist-context.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add JK Social Hub 0.8.3 IST patch context'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
