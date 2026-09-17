@@ -15,93 +15,34 @@ jobs:
   diagnose:
     runs-on: ubuntu-latest
     steps:
-      - name: Download exact packages
+      - name: Download exact Bridge
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 --connect-timeout 15 \
-            'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' \
-            -o /tmp/bridge.zip
-          curl -fL --retry 3 --connect-timeout 15 \
-            'https://downloads.wordpress.org/plugin/miniorange-secure-mcp-server.1.4.12.zip' \
-            -o /tmp/mosmcp.zip
-          echo "bridge_sha256=$(sha256sum /tmp/bridge.zip | cut -d' ' -f1)"
-          echo "mosmcp_sha256=$(sha256sum /tmp/mosmcp.zip | cut -d' ' -f1)"
-          mkdir -p /tmp/bridge /tmp/mosmcp
+          curl -fL --retry 3 --connect-timeout 15 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/bridge.zip
+          mkdir -p /tmp/bridge
           unzip -q /tmp/bridge.zip -d /tmp/bridge
-          unzip -q /tmp/mosmcp.zip -d /tmp/mosmcp
-          echo "bridge_files=$(find /tmp/bridge -type f | wc -l)"
-          echo "mosmcp_files=$(find /tmp/mosmcp -type f | wc -l)"
-
-      - name: Analyze JK ability registrations safely
+      - name: Print composer injector
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import re
-          root=Path('/tmp/bridge')
-          php=list(root.rglob('*.php'))
-          texts=[]
-          for p in php:
-              try: t=p.read_text(errors='replace')
-              except Exception: continue
-              texts.append((p,t))
-          alltext='\n'.join(t for _,t in texts)
-          names=sorted(set(re.findall(r"['\"](jk-social(?:-supabase)?/[a-z0-9-]+)['\"]", alltext)))
-          categories=sorted(set(re.findall(r"wp_register_ability_category\s*\(\s*['\"]([^'\"]+)", alltext)))
-          ability_categories=re.findall(r"'category'\s*=>\s*['\"]([^'\"]+)['\"]", alltext)
-          print('registered_ability_names=', len(names))
-          print('registered_categories=', categories)
-          print('ability_category_values=', sorted(set(ability_categories)))
-          print('has_wp_register_ability=', 'wp_register_ability' in alltext)
-          print('has_output_schema=', "'output_schema'" in alltext or '"output_schema"' in alltext)
-          print('has_meta_annotations=', "'annotations'" in alltext or '"annotations"' in alltext)
-          print('additionalProperties_true_count=', len(re.findall(r"additionalProperties['\"]?\s*=>\s*true", alltext, re.I)))
-          print('additionalProperties_false_count=', len(re.findall(r"additionalProperties['\"]?\s*=>\s*false", alltext, re.I)))
-          # print only registration signatures / metadata keywords, not source bodies
-          for p,t in texts:
-              if 'wp_register_ability' in t:
-                  print('ability_registration_file=', p.relative_to(root))
-                  for key in ['label','description','category','input_schema','output_schema','meta','annotations','show_in_rest','public']:
-                      print(f'  {key}=', bool(re.search(r"['\"]"+re.escape(key)+r"['\"]\s*=>", t)))
+          p=next(Path('/tmp/bridge').rglob('jk-social-supabase-bridge.php'))
+          lines=p.read_text(errors='replace').splitlines()
+          targets=['function inject_composer_upload_ui','inject_composer_upload_ui(', 'get_current_screen', 'jksh-composer']
+          seen=set()
+          for i,line in enumerate(lines,1):
+              if any(t in line for t in targets):
+                  a=max(1,i-35); b=min(len(lines),i+140)
+                  key=(a,b)
+                  if key in seen: continue
+                  seen.add(key)
+                  print(f'===== {a}-{b} =====')
+                  for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
           PY
-
-      - name: Locate miniOrange ability admin renderer assumptions
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          root=Path('/tmp/mosmcp')
-          needles=['wp_get_abilities','get_annotations','get_input_schema','get_output_schema','input_schema','output_schema','annotations','get_category','category']
-          hits=[]
-          for p in root.rglob('*.php'):
-              try: lines=p.read_text(errors='replace').splitlines()
-              except Exception: continue
-              for i,line in enumerate(lines,1):
-                  if any(n in line for n in needles):
-                      low=line.lower()
-                      if ('abilit' in low or 'schema' in low or 'annotation' in low or 'categor' in low):
-                          clean=' '.join(line.strip().split())
-                          if len(clean)>240: clean=clean[:240]+'...'
-                          hits.append((str(p.relative_to(root)),i,clean))
-          print('renderer_related_hits=', len(hits))
-          for item in hits[:180]:
-              print('%s:%d: %s'%item)
-          PY
-
       - name: PHP syntax check
         shell: bash
         run: |
           set -euo pipefail
-          failed=0
-          while IFS= read -r -d '' f; do
-            if ! php -l "$f" >/tmp/lint.txt 2>&1; then
-              echo "LINT_FAIL ${f#/tmp/bridge/}"
-              cat /tmp/lint.txt
-              failed=1
-            fi
-          done < <(find /tmp/bridge -type f -name '*.php' -print0)
-          echo "bridge_php_lint_failed=$failed"
-          exit "$failed"
+          php -l /tmp/bridge/jk-social-supabase-bridge/jk-social-supabase-bridge.php
