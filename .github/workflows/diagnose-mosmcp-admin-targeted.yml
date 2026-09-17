@@ -9,29 +9,98 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Download exact Bridge
+      - name: Download and patch exact Bridge
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/bridge.zip
-          mkdir -p /tmp/bridge
-          unzip -q /tmp/bridge.zip -d /tmp/bridge
-      - name: Print Bridge registration structure
-        shell: bash
-        run: |
-          set -euo pipefail
+          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/base.zip
+          rm -rf /tmp/jkssb && mkdir -p /tmp/jkssb
+          unzip -q /tmp/base.zip -d /tmp/jkssb
           python3 - <<'PY'
           from pathlib import Path
-          p=next(Path('/tmp/bridge').rglob('jk-social-supabase-bridge.php'))
-          lines=p.read_text(errors='replace').splitlines()
-          print('FILE',p)
-          for a,b in [(1,180),(max(1,len(lines)-180),len(lines))]:
-              print(f'===== {a}-{b} =====')
-              for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
+          p=Path('/tmp/jkssb/jk-social-supabase-bridge/jk-social-supabase-bridge.php')
+          s=p.read_text()
+          s=s.replace('Version: 0.7.3','Version: 0.7.4',1)
+          s=s.replace("const VERSION  = '0.7.3';","const VERSION  = '0.7.4';",1)
+          marker="        wp_register_ability( 'jk-social-supabase/get-readiness', array("
+          reg="""        wp_register_ability( 'jk-social-supabase/diagnose-mosmcp-admin', array(
+            'label'               => 'Diagnose miniOrange Admin Bootstrap',
+            'description'         => 'Runs the miniOrange admin bootstrap builder inside a read-only Throwable guard and returns only sanitized diagnostic information.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array( 'type' => 'object', 'properties' => array(), 'additionalProperties' => false ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_diagnose_mosmcp_admin' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true, 'destructive' => false, 'idempotent' => true ) ) ),
+        ) );
+
+"""
+          if marker not in s: raise SystemExit('registration marker missing')
+          s=s.replace(marker,reg+marker,1)
+          endmarker="\n}\n\nregister_activation_hook( __FILE__, array( 'JKSSB_Bridge', 'activate' ) );"
+          method="""
+
+    public function ability_diagnose_mosmcp_admin( $input = array() ) {
+        $class = '\\MoSMCP\\Common\\Views\\Admin\\Admin_App';
+        if ( ! class_exists( $class ) ) {
+            return array( 'ok' => false, 'stage' => 'class_lookup', 'message' => 'miniOrange Admin_App class is not loaded.' );
+        }
+        try {
+            $ref = new ReflectionClass( $class );
+            if ( ! $ref->hasMethod( 'build_bootstrap' ) ) {
+                return array( 'ok' => false, 'stage' => 'method_lookup', 'message' => 'build_bootstrap method is unavailable.' );
+            }
+            $method = $ref->getMethod( 'build_bootstrap' );
+            if ( method_exists( $method, 'setAccessible' ) ) $method->setAccessible( true );
+            $bootstrap = $method->invoke( null );
+            $json = wp_json_encode( $bootstrap );
+            return array(
+                'ok' => true,
+                'stage' => 'bootstrap_complete',
+                'bootstrap_type' => gettype( $bootstrap ),
+                'bootstrap_keys' => is_array( $bootstrap ) ? array_values( array_map( 'strval', array_keys( $bootstrap ) ) ) : array(),
+                'json_encode_ok' => false !== $json,
+                'json_last_error' => json_last_error_msg(),
+            );
+        } catch ( Throwable $e ) {
+            return array(
+                'ok' => false,
+                'stage' => 'bootstrap_exception',
+                'exception_class' => get_class( $e ),
+                'message' => sanitize_text_field( $e->getMessage() ),
+                'file' => basename( $e->getFile() ),
+                'line' => (int) $e->getLine(),
+            );
+        }
+    }
+"""
+          if endmarker not in s: raise SystemExit('class end marker missing')
+          s=s.replace(endmarker,method+endmarker,1)
+          p.write_text(s)
           PY
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -l /tmp/jkssb/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          cd /tmp/jkssb
+          zip -qr /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip jk-social-supabase-bridge
+          unzip -t /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip
+          sha256sum /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip
+      - name: Stage binary package on recovery branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CONTENT=$(base64 -w 0 /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip)
+          API='https://api.github.com/repos/${{ github.repository }}/contents/diagnostics/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip'
+          PAYLOAD=$(jq -n --arg message 'Stage temporary Bridge 0.7.4 diagnostic ZIP' --arg content "$CONTENT" --arg branch '${{ github.ref_name }}' '{message:$message,content:$content,branch:$branch}')
+          curl -fsS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$API" -d "$PAYLOAD" >/tmp/put.json
+          jq -r '.content.sha' /tmp/put.json
