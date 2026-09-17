@@ -1,0 +1,64 @@
+name: Publish temporary Bridge 0.7.4 dist ZIP
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/publish-jkssb-074-temp-dist.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Build verified 0.7.4 from exact live 0.7.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 15 \
+            'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' \
+            -o /tmp/source.zip
+          test "$(sha256sum /tmp/source.zip | awk '{print $1}')" = '3c5aca4c7c7c7b6953f3fef98a88fe0664ea920bb35d897b971b1872d412461f'
+          rm -rf /tmp/work && mkdir -p /tmp/work
+          unzip -q /tmp/source.zip -d /tmp/work
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php')
+          s=p.read_text()
+          hook="        add_action( 'admin_footer', array( $this, 'inject_composer_upload_ui' ) );\n"
+          if hook not in s:
+              raise SystemExit('broken hook missing')
+          if 'function inject_composer_upload_ui' in s:
+              raise SystemExit('unexpected callback method exists')
+          s=s.replace(hook,'',1)
+          s=s.replace(' * Version: 0.7.3',' * Version: 0.7.4',1)
+          s=s.replace("const VERSION  = '0.7.3';","const VERSION  = '0.7.4';",1)
+          p.write_text(s)
+          PY
+          php -l /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          mkdir -p dist
+          cd /tmp/work
+          zip -qr "$GITHUB_WORKSPACE/dist/jk-social-supabase-bridge-v0.7.4.zip" jk-social-supabase-bridge
+          cd "$GITHUB_WORKSPACE"
+          test "$(sha256sum dist/jk-social-supabase-bridge-v0.7.4.zip | awk '{print $1}')" = '36c51441fb4cdd7ef0ec210896bacbeb5f0bc50f35c21d4a89695fb346223f3a'
+          unzip -t dist/jk-social-supabase-bridge-v0.7.4.zip
+      - name: Commit temporary dist ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Repair Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-supabase-bridge-v0.7.4.zip
+          if git diff --cached --quiet; then
+            echo 'dist ZIP already current'
+          else
+            git commit -m 'Add temporary verified Bridge 0.7.4 repair ZIP'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
