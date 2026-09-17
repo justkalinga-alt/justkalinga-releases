@@ -1,0 +1,7 @@
+JK Social Hub v0.8.4 IST
+sha256=857eb0a071351355e7da63a9891b08da5afd80df050c04fb3f96c9fa088eec46
+bytes=91968
+base_live_version=0.8.3
+base_export_sha256=89ebebfa96a169d5ee8d46ee1456255da880f7aea0f93ff1dd9abe6ce9f4e202
+human_timezone=Asia/Kolkata (IST)
+internal_storage=UTC where required by queue/platform contracts
