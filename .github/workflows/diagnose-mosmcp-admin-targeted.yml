@@ -15,17 +15,14 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Download packages
+      - name: Download miniOrange
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/bridge.zip
           curl -fL 'https://downloads.wordpress.org/plugin/miniorange-secure-mcp-server.1.4.12.zip' -o /tmp/mosmcp.zip
-          mkdir -p /tmp/bridge /tmp/mosmcp
-          unzip -q /tmp/bridge.zip -d /tmp/bridge
+          mkdir -p /tmp/mosmcp
           unzip -q /tmp/mosmcp.zip -d /tmp/mosmcp
-
-      - name: Print complete admin ability payload and callers
+      - name: Print bootstrap construction
         shell: bash
         run: |
           set -euo pipefail
@@ -34,60 +31,16 @@ jobs:
           root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
           p=root/'includes/common/views/admin/class-admin-app.php'
           lines=p.read_text(errors='replace').splitlines()
-          for a,b in [(250,390),(1,180)]:
+          for a,b in [(181,249)]:
               print(f'===== ADMIN_APP {a}-{b} =====')
               for n in range(a,min(b,len(lines))+1): print(f'{n}: {lines[n-1]}')
-          print('===== CALLERS =====')
+          print('===== BOOTSTRAP CALLEES =====')
+          names=['debug','connection_summary','site','settings','abilities','roles','nhi','oauth','direct_connection','get_abilities_payload']
           for q in root.rglob('*.php'):
               try: ql=q.read_text(errors='replace').splitlines()
               except: continue
               for i,line in enumerate(ql,1):
-                  if 'get_abilities_payload' in line or 'abilities_payload' in line:
-                      print(f'{q.relative_to(root)}:{i}: {line.strip()}')
-          print('===== ROLE API =====')
-          for path in ['includes/common/controllers/nhi/class-nhi-controller.php','includes/common/apis/nhi/class-nhi-routes.php']:
-              q=root/path
-              if not q.exists(): continue
-              ql=q.read_text(errors='replace').splitlines()
-              for i,line in enumerate(ql,1):
                   low=line.lower()
-                  if 'abilit' in low or 'role' in low:
-                      a=max(1,i-3); b=min(len(ql),i+6)
-                      print(f'--- {path} {a}-{b} ---')
-                      for n in range(a,b+1): print(f'{n}: {ql[n-1]}')
-          PY
-
-      - name: Inspect admin JS assumptions
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
-          for p in root.rglob('*.js'):
-              try: text=p.read_text(errors='replace')
-              except: continue
-              low=text.lower()
-              if 'abilities' in low and ('required_cap' in low or 'object_level' in low or 'category' in low):
-                  print('JS_FILE',p.relative_to(root))
-                  lines=text.splitlines()
-                  for i,line in enumerate(lines,1):
-                      ll=line.lower()
-                      if any(x in ll for x in ['required_cap','object_level','abilities','category']):
-                          print(f'{i}: {line[:500]}')
-          PY
-
-      - name: Inspect Bridge public meta and categories
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p=next(Path('/tmp/bridge').rglob('jk-social-supabase-bridge.php'))
-          lines=p.read_text(errors='replace').splitlines()
-          for i,line in enumerate(lines,1):
-              if '$public_meta' in line or 'wp_register_ability_category' in line or "'category'" in line and i < 180:
-                  a=max(1,i-8); b=min(len(lines),i+15)
-                  print(f'--- BRIDGE {a}-{b} ---')
-                  for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
+                  if any(x in low for x in names) and ('payload' in low or 'bootstrap' in low):
+                      print(f'{q.relative_to(root)}:{i}: {line.strip()[:400]}')
           PY
