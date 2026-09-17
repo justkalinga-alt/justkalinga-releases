@@ -1,0 +1,57 @@
+name: Import exact live JK Social Hub 0.8.3
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/import-jksh-live-083.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import-live-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Download and verify exact live export
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-hub-live-v0.8.3-export.zip'
+          EXPECT='89ebebfa96a169d5ee8d46ee1456255da880f7aea0f93ff1dd9abe6ce9f4e202'
+          curl -fL --retry 4 --retry-all-errors --connect-timeout 30 "$URL" -o /tmp/jksh083.zip
+          ACTUAL="$(sha256sum /tmp/jksh083.zip | awk '{print $1}')"
+          test "$ACTUAL" = "$EXPECT"
+          unzip -t /tmp/jksh083.zip
+          rm -rf /tmp/jksh083
+          mkdir -p /tmp/jksh083
+          unzip -q /tmp/jksh083.zip -d /tmp/jksh083
+          test -f /tmp/jksh083/jk-social-hub/jk-social-hub.php
+          grep -q 'Version: 0.8.3' /tmp/jksh083/jk-social-hub/jk-social-hub.php
+          rm -rf sources/jk-social-hub-0.8.3-live
+          mkdir -p sources/jk-social-hub-0.8.3-live
+          cp -a /tmp/jksh083/jk-social-hub/. sources/jk-social-hub-0.8.3-live/
+          mkdir -p dist
+          cp /tmp/jksh083.zip dist/jk-social-hub-live-v0.8.3-export.zip
+      - name: PHP lint exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          find sources/jk-social-hub-0.8.3-live -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: Commit exact source and archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add sources/jk-social-hub-0.8.3-live dist/jk-social-hub-live-v0.8.3-export.zip
+          if git diff --cached --quiet; then
+            echo 'Exact source already imported.'
+          else
+            git commit -m 'Import exact live JK Social Hub 0.8.3 source'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
