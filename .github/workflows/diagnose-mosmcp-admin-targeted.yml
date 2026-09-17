@@ -15,27 +15,23 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Download miniOrange
+      - name: Download exact Bridge
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL 'https://downloads.wordpress.org/plugin/miniorange-secure-mcp-server.1.4.12.zip' -o /tmp/mosmcp.zip
-          mkdir -p /tmp/mosmcp
-          unzip -q /tmp/mosmcp.zip -d /tmp/mosmcp
-      - name: Trace bootstrap callees
+          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/bridge.zip
+          mkdir -p /tmp/bridge
+          unzip -q /tmp/bridge.zip -d /tmp/bridge
+      - name: Print Bridge registration structure
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
-          needles=['function connection_summary','connection_summary(', 'DOWNLOAD_NONCE_ACTION', 'function issuer_url', 'function resource_url']
-          for p in root.rglob('*.php'):
-              try: lines=p.read_text(errors='replace').splitlines()
-              except: continue
-              for i,line in enumerate(lines,1):
-                  if any(n in line for n in needles):
-                      a=max(1,i-20); b=min(len(lines),i+90)
-                      print(f'===== {p.relative_to(root)} {a}-{b} =====')
-                      for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
+          p=next(Path('/tmp/bridge').rglob('jk-social-supabase-bridge.php'))
+          lines=p.read_text(errors='replace').splitlines()
+          print('FILE',p)
+          for a,b in [(1,180),(max(1,len(lines)-180),len(lines))]:
+              print(f'===== {a}-{b} =====')
+              for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
           PY
