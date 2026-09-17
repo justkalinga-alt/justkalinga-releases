@@ -7,6 +7,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY package.json worker.mjs ./
 
+RUN sed -i "s|if (req.method === 'GET' && path === '/v1/health') {|if (req.method === 'GET' \&\& (path === '/' || path === '/health' || path === '/v1/health')) {|" worker.mjs
+
 ENV NODE_ENV=production
 EXPOSE 8080
 
