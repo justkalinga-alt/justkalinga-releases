@@ -1,4 +1,4 @@
-name: Diagnose miniOrange admin crash
+name: Trace live Bridge admin hooks
 
 on:
   push:
@@ -15,14 +15,15 @@ jobs:
   diagnose:
     runs-on: ubuntu-latest
     steps:
-      - name: Download exact Bridge
+      - name: Download exact live Bridge
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 3 --connect-timeout 15 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/bridge.zip
-          mkdir -p /tmp/bridge
+          rm -rf /tmp/bridge && mkdir -p /tmp/bridge
           unzip -q /tmp/bridge.zip -d /tmp/bridge
-      - name: Print composer injector
+          unzip -l /tmp/bridge.zip
+      - name: Trace hooks and UI strings
         shell: bash
         run: |
           set -euo pipefail
@@ -30,16 +31,28 @@ jobs:
           from pathlib import Path
           p=next(Path('/tmp/bridge').rglob('jk-social-supabase-bridge.php'))
           lines=p.read_text(errors='replace').splitlines()
-          targets=['function inject_composer_upload_ui','inject_composer_upload_ui(', 'get_current_screen', 'jksh-composer']
-          seen=set()
+          terms=[
+              'admin_footer','admin_head','admin_enqueue_scripts','admin_menu',
+              'composer','compose','upload / choose media','media ready in supabase',
+              'return=compose','bundle_id','master title','source / master copy',
+              'content idea','attachment_id','media_attachment_ids','social upload'
+          ]
+          print('SOURCE',p)
+          print('TOTAL_LINES',len(lines))
+          hits=[]
           for i,line in enumerate(lines,1):
-              if any(t in line for t in targets):
-                  a=max(1,i-35); b=min(len(lines),i+140)
-                  key=(a,b)
-                  if key in seen: continue
-                  seen.add(key)
-                  print(f'===== {a}-{b} =====')
-                  for n in range(a,b+1): print(f'{n}: {lines[n-1]}')
+              low=line.lower()
+              if any(t in low for t in terms): hits.append(i)
+          print('HITS',hits)
+          printed=set()
+          for i in hits:
+              a=max(1,i-8); b=min(len(lines),i+18)
+              if any(a <= x <= b for x in printed):
+                  continue
+              print(f'===== {a}-{b} =====')
+              for n in range(a,b+1):
+                  print(f'{n}: {lines[n-1]}')
+                  printed.add(n)
           PY
       - name: PHP syntax check
         shell: bash
