@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { URL } from 'node:url';
 
-const VERSION = '0.1.1-back4app';
+const VERSION = '0.1.2-back4app';
 const CONTRACT = 'jksh-relay-v1';
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC_KEY_B64 = process.env.JKSH_PUBLIC_KEY_B64 || '';
@@ -210,7 +210,7 @@ function stopJob(jobId) {
 
 async function handler(req, res) {
   const path = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
-  if (req.method === 'GET' && path === '/v1/health') {
+  if (req.method === 'GET' && ['/', '/health', '/v1/health'].includes(path)) {
     return json(res, 200, {
       ok: true,
       service: 'jksh-live-relay-worker',
