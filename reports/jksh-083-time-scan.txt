@@ -1,0 +1,140 @@
+# JK Social Hub 0.8.3 time scan
+
+## UTC / scheduling references
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeLive.php:96:		$scheduled_ts = $scheduled ? strtotime( $scheduled . ' UTC' ) : false;
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeLive.php:118:			'scheduled_start_at_utc' => gmdate( 'c', $scheduled_ts ),
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeLive.php:225:			'provisioned_at_utc' => gmdate( 'c' ),
+/tmp/jksh083/jk-social-hub/src/Services/Settings.php:34:			'timezone'        => 'Asia/Kolkata',
+/tmp/jksh083/jk-social-hub/src/Services/Settings.php:69:			'timezone'        => sanitize_text_field( $input['timezone'] ?? 'Asia/Kolkata' ),
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeConnector.php:139:		$expires_at = $expires_in ? gmdate( 'Y-m-d H:i:s', time() + $expires_in ) : null;
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeConnector.php:165:				'last_checked_at'     => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:30:		$scheduled_at = $this->scheduled_at( (string) ( $input['scheduled_at_utc'] ?? '' ) );
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:84:			$dispatcher->schedule( $job_id, strtotime( $scheduled_at . ' UTC' ) ?: time() + 10 );
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:93:					'context' => array( 'platform' => $platform, 'scheduled_at_utc' => $scheduled_at, 'publish_mode' => 'dry_run' ),
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:98:		return array( 'content_id' => $content_id, 'publish_mode' => 'dry_run', 'scheduled_at_utc' => $scheduled_at, 'variants' => $created );
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:143:			$ts = strtotime( $value . ( str_contains( $value, 'UTC' ) || str_contains( $value, 'Z' ) ? '' : ' UTC' ) );
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:145:				return gmdate( 'Y-m-d H:i:s', max( time(), $ts ) );
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:148:		return gmdate( 'Y-m-d H:i:s', time() );
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeClient.php:285:		$expires_at  = ! empty( $account->token_expires_at ) ? strtotime( (string) $account->token_expires_at . ' UTC' ) : false;
+/tmp/jksh083/jk-social-hub/src/Services/YouTubeClient.php:321:		$expiry = $expires_in ? gmdate( 'Y-m-d H:i:s', time() + $expires_in ) : null;
+/tmp/jksh083/jk-social-hub/src/Services/YouTubePublisher.php:303:				$status['publishAt'] = gmdate( 'c', $ts );
+/tmp/jksh083/jk-social-hub/src/Services/YouTubePublisher.php:310:				$metadata['recordingDetails'] = array( 'recordingDate' => gmdate( 'c', $ts ) );
+/tmp/jksh083/jk-social-hub/src/Services/MetaPublisher.php:29:			$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+/tmp/jksh083/jk-social-hub/src/Services/MetaPublisher.php:76:			$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+/tmp/jksh083/jk-social-hub/src/Services/MetaPublisher.php:162:				$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+/tmp/jksh083/jk-social-hub/src/Services/LiveStreaming.php:66:		if ( $scheduled && ! strtotime( $scheduled . ' UTC' ) ) {
+/tmp/jksh083/jk-social-hub/src/Services/LiveWorker.php:155:		$this->streams->update( $id, array( 'worker_job_id' => $worker_id, 'status' => 'relay_starting', 'started_at' => current_time( 'mysql', true ), 'last_error' => '' ) );
+/tmp/jksh083/jk-social-hub/src/Services/LiveWorker.php:178:		$this->streams->update( $id, array( 'status' => 'relay_stopped', 'ended_at' => current_time( 'mysql', true ), 'last_error' => '' ) );
+/tmp/jksh083/jk-social-hub/src/Services/MetaConnector.php:184:		$expires_at = $expires_in > 0 ? gmdate( 'Y-m-d H:i:s', time() + $expires_in ) : null;
+/tmp/jksh083/jk-social-hub/src/Services/MetaConnector.php:262:					'last_checked_at'     => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Services/MetaConnector.php:316:					'last_checked_at'     => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Services/TemplateVariables.php:13:			'today'           => wp_date( 'Y-m-d', null, new \DateTimeZone( $settings['timezone'] ) ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:49:		$now   = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:91:				'started_at' => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:155:					'scheduled_at'       => gmdate( 'Y-m-d H:i:s', $next ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:184:					'completed_at'       => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:226:					'scheduled_at'       => gmdate( 'Y-m-d H:i:s', $next ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:266:			'timestamp' => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:274:				'completed_at'       => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:297:				'completed_at' => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:320:				'completed_at'       => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/CLI/Commands.php:22:					'timezone'         => $settings->get( 'timezone' ),
+/tmp/jksh083/jk-social-hub/src/Repositories/LiveStreamRepository.php:12:		$now = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/LiveStreamRepository.php:72:		$fields['updated_at'] = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/TemplateRepository.php:19:		$now = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/JobRepository.php:14:		$now = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/JobRepository.php:70:		$data['updated_at'] = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/ContentRepository.php:14:		$now = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/AccountRepository.php:64:		$now      = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/AccountRepository.php:114:			'updated_at' => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Repositories/AccountRepository.php:117:			$data['last_checked_at'] = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/AccountRepository.php:130:				'last_checked_at'       => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Repositories/AccountRepository.php:132:				'updated_at'            => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Repositories/LogRepository.php:27:				'created_at'   => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Repositories/VariantRepository.php:14:		$now = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/VariantRepository.php:69:		$allowed['updated_at'] = current_time( 'mysql', true );
+/tmp/jksh083/jk-social-hub/src/Repositories/VariantRepository.php:78:				'updated_at' => current_time( 'mysql', true ),
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:54:			<?php $this->stat_card( 'Timezone', (string) $settings->get( 'timezone' ), 'Hub operational timezone' ); ?>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:89:				<label><span>Schedule date/time (IST)</span><input name="publish_at" type="datetime-local" value="<?php echo esc_attr( wp_date( 'Y-m-d\TH:i', time() + HOUR_IN_SECONDS, new \DateTimeZone( 'Asia/Kolkata' ) ) ); ?>"></label>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:112:		$timezone    = new \DateTimeZone( 'Asia/Kolkata' );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:113:		$when        = \DateTimeImmutable::createFromFormat( 'Y-m-d\TH:i', $local_time, $timezone );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:115:			$when = new \DateTimeImmutable( '+1 hour', $timezone );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:117:		$utc = $when->setTimezone( new \DateTimeZone( 'UTC' ) );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:198:					'context'    => array( 'platform' => $platform, 'scheduled_at_utc' => $scheduled_at, 'publish_mode' => $job_publish_mode ),
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:214:		echo '<section class="jksh-card"><table class="widefat striped"><thead><tr><th>ID</th><th>Content</th><th>Platform</th><th>Type</th><th>Status</th><th>Publish UTC</th><th>External</th></tr></thead><tbody>';
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:358:			<table class="widefat striped"><thead><tr><th>Name</th><th>Channel ID</th><th>Status</th><th>Token expiry UTC</th><th>Last checked UTC</th><th>Actions</th></tr></thead><tbody>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:374:			<table class="widefat striped"><thead><tr><th>Platform</th><th>Name</th><th>External ID</th><th>Status</th><th>Token expiry UTC</th><th>Last checked UTC</th><th>Actions</th></tr></thead><tbody>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:421:			<div class="jksh-form-grid"><label><span>Brand name</span><input name="jksh_settings[brand_name]" value="<?php echo esc_attr( $settings['brand_name'] ); ?>"></label><label><span>Operational timezone</span><input name="jksh_settings[timezone]" value="<?php echo esc_attr( $settings['timezone'] ); ?>"></label></div>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:472:		echo '<table class="widefat striped"><thead><tr><th>ID</th><th>Title</th><th>Type</th><th>Status</th><th>Created UTC</th></tr></thead><tbody>';
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:483:		echo '<section class="jksh-card"><table class="widefat striped"><thead><tr><th>Job</th><th>Variant</th><th>Platform</th><th>Status</th><th>Attempts</th><th>Scheduled UTC</th><th>Error</th></tr></thead><tbody>';
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:494:		echo '<table class="widefat striped"><thead><tr><th>Time UTC</th><th>User</th><th>Action</th><th>Content</th><th>Variant</th><th>Result</th><th>Message</th></tr></thead><tbody>';
+/tmp/jksh083/jk-social-hub/src/Mcp/Abilities.php:117:					'scheduled_at_utc' => array( 'type' => 'string' ),
+/tmp/jksh083/jk-social-hub/src/Mcp/Abilities.php:428:				$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+/tmp/jksh083/jk-social-hub/src/Rest/Routes.php:94:			'timezone'        => (string) $settings->get( 'timezone', 'Asia/Kolkata' ),
+/tmp/jksh083/jk-social-hub/src/Rest/Routes.php:95:			'wordpress_tz'    => wp_timezone_string(),
+
+## User-facing time labels
+/tmp/jksh083/jk-social-hub/src/Services/ContentOrchestrator.php:4:use JKSH\Queue\Dispatcher;
+/tmp/jksh083/jk-social-hub/src/Services/MetaConnector.php:364:			$message .= ' Instagram was not discovered. Check Audit Logs for the sanitized discovery diagnostic, then reconnect after correcting Meta permissions if needed.';
+/tmp/jksh083/jk-social-hub/src/Plugin.php:8:use JKSH\Queue\Dispatcher;
+/tmp/jksh083/jk-social-hub/src/Queue/Dispatcher.php:2:namespace JKSH\Queue;
+/tmp/jksh083/jk-social-hub/src/Admin/Menu.php:17:		add_submenu_page( 'jksh-dashboard', 'Calendar', 'Calendar', 'jksh_view', 'jksh-calendar', array( $pages, 'calendar' ) );
+/tmp/jksh083/jk-social-hub/src/Admin/Menu.php:18:		add_submenu_page( 'jksh-dashboard', 'Queue', 'Queue', 'jksh_view', 'jksh-queue', array( $pages, 'queue' ) );
+/tmp/jksh083/jk-social-hub/src/Admin/Menu.php:22:		add_submenu_page( 'jksh-dashboard', 'Logs', 'Logs', 'jksh_view', 'jksh-logs', array( $pages, 'logs' ) );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:4:use JKSH\Queue\Dispatcher;
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:56:			<?php $this->stat_card( 'Queue Jobs', (string) count( $jobs->recent( 200 ) ), 'Recent jobs loaded' ); ?>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:59:			<section class="jksh-card"><h2>Today's workflow</h2><ol class="jksh-steps"><li>Create master content</li><li>Generate platform variants</li><li>Preview and approve</li><li>Schedule</li><li>Queue with captured safety mode</li><li>Verify preflight / logs</li></ol><p><a class="button button-primary" href="<?php echo esc_url( admin_url( 'admin.php?page=jksh-composer' ) ); ?>">Create test content</a></p></section>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:89:				<label><span>Schedule date/time (IST)</span><input name="publish_at" type="datetime-local" value="<?php echo esc_attr( wp_date( 'Y-m-d\TH:i', time() + HOUR_IN_SECONDS, new \DateTimeZone( 'Asia/Kolkata' ) ) ); ?>"></label>
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:214:		echo '<section class="jksh-card"><table class="widefat striped"><thead><tr><th>ID</th><th>Content</th><th>Platform</th><th>Type</th><th>Status</th><th>Publish UTC</th><th>External</th></tr></thead><tbody>';
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:226:		$this->header( 'Calendar', 'Foundation calendar view; drag/drop comes in a later release' );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:249:		$this->header( 'Queue', 'Idempotent background jobs with retained errors and retry history' );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:410:		$this->header( 'Audit Logs', 'Who changed, scheduled, published, retried or failed' );
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:483:		echo '<section class="jksh-card"><table class="widefat striped"><thead><tr><th>Job</th><th>Variant</th><th>Platform</th><th>Status</th><th>Attempts</th><th>Scheduled UTC</th><th>Error</th></tr></thead><tbody>';
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:485:			echo '<tr><td colspan="7">Queue is empty.</td></tr>';
+/tmp/jksh083/jk-social-hub/src/Admin/Pages.php:494:		echo '<table class="widefat striped"><thead><tr><th>Time UTC</th><th>User</th><th>Action</th><th>Content</th><th>Variant</th><th>Result</th><th>Message</th></tr></thead><tbody>';
+
+## Files
+jk-social-hub/assets/admin.css
+jk-social-hub/assets/admin.js
+jk-social-hub/index.php
+jk-social-hub/jk-social-hub.php
+jk-social-hub/src/Activator.php
+jk-social-hub/src/Admin/Menu.php
+jk-social-hub/src/Admin/MetaActions.php
+jk-social-hub/src/Admin/Pages.php
+jk-social-hub/src/Admin/YouTubeActions.php
+jk-social-hub/src/CLI/Commands.php
+jk-social-hub/src/DB/Migrator.php
+jk-social-hub/src/Deactivator.php
+jk-social-hub/src/Mcp/Abilities.php
+jk-social-hub/src/Plugin.php
+jk-social-hub/src/Queue/Dispatcher.php
+jk-social-hub/src/Repositories/AccountRepository.php
+jk-social-hub/src/Repositories/ContentRepository.php
+jk-social-hub/src/Repositories/JobRepository.php
+jk-social-hub/src/Repositories/LiveStreamRepository.php
+jk-social-hub/src/Repositories/LogRepository.php
+jk-social-hub/src/Repositories/TemplateRepository.php
+jk-social-hub/src/Repositories/VariantRepository.php
+jk-social-hub/src/Rest/Routes.php
+jk-social-hub/src/Security/Crypto.php
+jk-social-hub/src/Services/ContentOrchestrator.php
+jk-social-hub/src/Services/LiveSecretStore.php
+jk-social-hub/src/Services/LiveStreaming.php
+jk-social-hub/src/Services/LiveWorker.php
+jk-social-hub/src/Services/LiveWorkerClient.php
+jk-social-hub/src/Services/LiveWorkerSigner.php
+jk-social-hub/src/Services/MediaResolver.php
+jk-social-hub/src/Services/MetaClient.php
+jk-social-hub/src/Services/MetaConnector.php
+jk-social-hub/src/Services/MetaPublisher.php
+jk-social-hub/src/Services/PlatformSchema.php
+jk-social-hub/src/Services/PluginPackageUpdater.php
+jk-social-hub/src/Services/Settings.php
+jk-social-hub/src/Services/TemplateVariables.php
+jk-social-hub/src/Services/VariantBuilder.php
+jk-social-hub/src/Services/YouTubeClient.php
+jk-social-hub/src/Services/YouTubeConnector.php
+jk-social-hub/src/Services/YouTubeLive.php
+jk-social-hub/src/Services/YouTubePublisher.php
+jk-social-hub/uninstall.php
