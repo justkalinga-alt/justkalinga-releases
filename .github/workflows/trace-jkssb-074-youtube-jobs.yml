@@ -1,0 +1,30 @@
+name: Trace Bridge 0.7.4 YouTube job mapping
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/trace-jkssb-074-youtube-jobs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact Bridge and print target ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/recover-jksh-bridge-073/dist/jk-social-supabase-bridge-v0.7.4.zip' -o /tmp/b.zip
+          test "$(sha256sum /tmp/b.zip | awk '{print $1}')" = '36c51441fb4cdd7ef0ec210896bacbeb5f0bc50f35c21d4a89695fb346223f3a'
+          rm -rf /tmp/b && mkdir -p /tmp/b
+          unzip -q /tmp/b.zip -d /tmp/b
+          P=/tmp/b/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          php -l "$P"
+          sed -n '850,930p' "$P"
+          echo '===== UPLOAD UI ====='
+          sed -n '1420,1435p' "$P"
