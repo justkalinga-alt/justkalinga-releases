@@ -1,0 +1,1712 @@
+===== jk-social-hub.php =====
+<?php
+/**
+ * Plugin Name: JustKalinga Social Hub
+ * Plugin URI:  https://social.justkalinga.com/
+ * Description: Internal social-media operating system for JustKalinga. v0.8.3 adds a read-only signed relay-worker handshake to existing live readiness diagnostics while preserving Dry Run and live-publish safety gates.
+ * Version:     0.8.3
+ * Author:      JustKalinga
+ * Text Domain: jk-social-hub
+ * Requires at least: 6.5
+ * Requires PHP: 8.1
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+define( 'JKSH_VERSION', '0.8.3' );
+define( 'JKSH_DB_VERSION', '0.4.0' );
+define( 'JKSH_FILE', __FILE__ );
+define( 'JKSH_DIR', plugin_dir_path( __FILE__ ) );
+define( 'JKSH_URL', plugin_dir_url( __FILE__ ) );
+
+spl_autoload_register(
+	static function ( $class ) {
+		$prefix = 'JKSH\\';
+		if ( 0 !== strpos( $class, $prefix ) ) {
+			return;
+		}
+
+		$relative = substr( $class, strlen( $prefix ) );
+		$path     = JKSH_DIR . 'src/' . str_replace( '\\', '/', $relative ) . '.php';
+		if ( is_readable( $path ) ) {
+			require_once $path;
+		}
+	}
+);
+
+register_activation_hook( __FILE__, array( 'JKSH\\Activator', 'activate' ) );
+register_deactivation_hook( __FILE__, array( 'JKSH\Deactivator', 'deactivate' ) );
+
+// Register MCP Ability hooks as early as possible. WordPress requires abilities to be
+// registered from wp_abilities_api_* actions; waiting until plugins_loaded can be too late.
+( new JKSH\Mcp\Abilities() )->register();
+
+add_action(
+	'plugins_loaded',
+	static function () {
+		JKSH\Plugin::instance()->boot();
+	}
+);
+
+===== src/Admin/Pages.php =====
+<?php
+namespace JKSH\Admin;
+
+use JKSH\Queue\Dispatcher;
+use JKSH\Repositories\AccountRepository;
+use JKSH\Repositories\ContentRepository;
+use JKSH\Repositories\JobRepository;
+use JKSH\Repositories\LogRepository;
+use JKSH\Repositories\TemplateRepository;
+use JKSH\Repositories\VariantRepository;
+use JKSH\Services\MetaConnector;
+use JKSH\Services\MetaPublisher;
+use JKSH\Services\Settings;
+use JKSH\Services\VariantBuilder;
+use JKSH\Services\YouTubeConnector;
+
+final class Pages {
+	private function header( string $title, string $subtitle = '' ): void {
+		echo '<div class="wrap jksh-wrap"><div class="jksh-title-row"><div><h1>' . esc_html( $title ) . '</h1>';
+		if ( $subtitle ) {
+			echo '<p class="description">' . esc_html( $subtitle ) . '</p>';
+		}
+		echo '</div><span class="jksh-version">v' . esc_html( JKSH_VERSION ) . '</span></div>';
+		$this->notice_dry_run();
+	}
+
+	private function footer(): void {
+		echo '</div>';
+	}
+
+	private function notice_dry_run(): void {
+		$settings = new Settings();
+		if ( $settings->get( 'dry_run', 1 ) ) {
+			echo '<div class="notice notice-info inline jksh-notice"><p><strong>Dry Run mode is ON.</strong> v0.6.0 contains Meta plus guarded YouTube video/Short publishing, but jobs scheduled while Dry Run is ON remain dry-run only and cannot later turn live automatically.</p></div>';
+		} elseif ( ! $settings->get( 'meta_live_publish_enabled', 0 ) ) {
+			echo '<div class="notice notice-warning inline jksh-notice"><p><strong>Dry Run is OFF, but Meta live publishing is still locked.</strong> The separate Meta live-publish switch must also be enabled before a newly scheduled Facebook or Instagram job can publish.</p></div>';
+		} else {
+			echo '<div class="notice notice-error inline jksh-notice"><p><strong>LIVE META PUBLISHING IS ENABLED.</strong> Newly scheduled Facebook and Instagram jobs can modify external social accounts.</p></div>';
+		}
+	}
+
+	public function dashboard(): void {
+		$this->header( 'JK Social Hub', 'JustKalinga Social Media Command Center' );
+		$content  = new ContentRepository();
+		$jobs     = new JobRepository();
+		$logs     = new LogRepository();
+		$settings = new Settings();
+		$contents = $content->recent( 5 );
+		$job_rows = $jobs->recent( 5 );
+		$log_rows = $logs->recent( 5 );
+		?>
+		<div class="jksh-grid jksh-grid-4">
+			<?php $this->stat_card( 'Mode', $settings->get( 'dry_run', 1 ) ? 'Dry Run' : ( $settings->get( 'meta_live_publish_enabled', 0 ) ? 'Meta Live' : 'Live Locked' ), 'v0.6.0 captures mode per scheduled job' ); ?>
+			<?php $this->stat_card( 'Timezone', (string) $settings->get( 'timezone' ), 'Hub operational timezone' ); ?>
+			<?php $this->stat_card( 'Master Content', (string) count( $content->recent( 200 ) ), 'Recent records loaded' ); ?>
+			<?php $this->stat_card( 'Queue Jobs', (string) count( $jobs->recent( 200 ) ), 'Recent jobs loaded' ); ?>
+		</div>
+		<div class="jksh-grid jksh-grid-2">
+			<section class="jksh-card"><h2>Today's workflow</h2><ol class="jksh-steps"><li>Create master content</li><li>Generate platform variants</li><li>Preview and approve</li><li>Schedule</li><li>Queue with captured safety mode</li><li>Verify preflight / logs</li></ol><p><a class="button button-primary" href="<?php echo esc_url( admin_url( 'admin.php?page=jksh-composer' ) ); ?>">Create test content</a></p></section>
+			<section class="jksh-card"><h2>Connector roadmap</h2><div class="jksh-roadmap"><span>Tier 1</span><strong>Instagram · Facebook · YouTube</strong><span>Tier 2</span><strong>Google Business · Pinterest · Threads</strong><span>Future</span><strong>X · LinkedIn · TikTok</strong></div></section>
+		</div>
+		<div class="jksh-grid jksh-grid-2">
+			<section class="jksh-card"><h2>Recent content</h2><?php $this->content_table( $contents ); ?></section>
+			<section class="jksh-card"><h2>Recent queue</h2><?php $this->jobs_table( $job_rows ); ?></section>
+		</div>
+		<section class="jksh-card"><h2>Recent audit log</h2><?php $this->logs_table( $log_rows ); ?></section>
+		<?php
+		$this->footer();
+	}
+
+	public function composer(): void {
+		if ( isset( $_POST['jksh_create_content'] ) ) {
+			$this->handle_composer();
+		}
+		$this->header( 'Composer', 'One master content item → platform-specific variants' );
+		$types = $this->content_types();
+		$composer_settings = new Settings();
+		$composer_any_live = ! $composer_settings->get( 'dry_run', 1 ) && ( $composer_settings->get( 'meta_live_publish_enabled', 0 ) || $composer_settings->get( 'youtube_live_publish_enabled', 0 ) );
+		?>
+		<form method="post" class="jksh-card jksh-form">
+			<?php wp_nonce_field( 'jksh_create_content', 'jksh_nonce' ); ?>
+			<div class="jksh-form-grid">
+				<label><span>Master title</span><input name="title" type="text" required placeholder="Example: Why Jagannath is called Patitapavana"></label>
+				<label><span>Content type</span><select name="content_type"><?php foreach ( $types as $key => $label ) : ?><option value="<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></option><?php endforeach; ?></select></label>
+			</div>
+			<label><span>Source / master copy</span><textarea name="body" rows="8" placeholder="Paste the content, script, caption or core message here."></textarea></label>
+			<label><span>WordPress media attachment IDs (optional, comma-separated)</span><input name="media_ids" type="text" placeholder="123,124,125"></label>
+			<div class="jksh-form-grid">
+				<label><span>Schedule date/time (IST)</span><input name="publish_at" type="datetime-local" value="<?php echo esc_attr( wp_date( 'Y-m-d\TH:i', time() + HOUR_IN_SECONDS, new \DateTimeZone( 'Asia/Kolkata' ) ) ); ?>"></label>
+				<fieldset><legend>Platforms</legend><label class="jksh-check"><input type="checkbox" name="platforms[]" value="instagram" checked> Instagram</label><label class="jksh-check"><input type="checkbox" name="platforms[]" value="facebook" checked> Facebook</label><label class="jksh-check"><input type="checkbox" name="platforms[]" value="youtube" checked> YouTube</label></fieldset>
+			</div>
+			<p class="description"><strong>YouTube rule:</strong> image/carousel content becomes a YouTube Community Post variant, never a fake Short/slideshow unless explicitly requested later.</p>
+			<?php if ( $composer_any_live ) : ?><p class="description jksh-error-text"><strong>Live mode:</strong> each platform is armed independently. Facebook/Instagram require the Meta master switch; YouTube video/Short uploads require the YouTube master switch. Community Posts stay on the worker/manual path.</p><?php endif; ?>
+			<p><button class="button button-primary button-hero" name="jksh_create_content" value="1"><?php echo esc_html( $composer_any_live ? 'Create variants & schedule by platform safety switches' : 'Create variants & schedule Dry Run' ); ?></button></p>
+		</form>
+		<?php
+		$this->footer();
+	}
+
+	private function handle_composer(): void {
+		if ( ! current_user_can( 'jksh_create' ) ) {
+			wp_die( esc_html__( 'You do not have permission to create social content.', 'jk-social-hub' ) );
+		}
+		check_admin_referer( 'jksh_create_content', 'jksh_nonce' );
+
+		$title       = sanitize_text_field( wp_unslash( $_POST['title'] ?? '' ) );
+		$type        = sanitize_key( wp_unslash( $_POST['content_type'] ?? 'knowledge_reel' ) );
+		$body        = sanitize_textarea_field( wp_unslash( $_POST['body'] ?? '' ) );
+		$platforms   = array_map( 'sanitize_key', (array) ( $_POST['platforms'] ?? array() ) );
+		$media_ids   = array_values( array_filter( array_map( 'absint', preg_split( '/\s*,\s*/', (string) wp_unslash( $_POST['media_ids'] ?? '' ) ) ) ) );
+		$local_time  = sanitize_text_field( wp_unslash( $_POST['publish_at'] ?? '' ) );
+		$timezone    = new \DateTimeZone( 'Asia/Kolkata' );
+		$when        = \DateTimeImmutable::createFromFormat( 'Y-m-d\TH:i', $local_time, $timezone );
+		if ( ! $when ) {
+			$when = new \DateTimeImmutable( '+1 hour', $timezone );
+		}
+		$utc = $when->setTimezone( new \DateTimeZone( 'UTC' ) );
+		$scheduled_at = $utc->format( 'Y-m-d H:i:s' );
+
+		if ( '' === $title || empty( $platforms ) ) {
+			echo '<div class="notice notice-error"><p>Title and at least one platform are required.</p></div>';
+			return;
+		}
+
+		$settings = new Settings();
+		$global_dry_run = (bool) $settings->get( 'dry_run', 1 );
+		$any_live = ! $global_dry_run && ( $settings->get( 'meta_live_publish_enabled', 0 ) || $settings->get( 'youtube_live_publish_enabled', 0 ) );
+		if ( $any_live && ! current_user_can( 'jksh_publish' ) ) {
+			echo '<div class="notice notice-error"><p>You do not have permission to schedule live social publishing.</p></div>';
+			return;
+		}
+
+		$content_repo = new ContentRepository();
+		$variant_repo = new VariantRepository();
+		$job_repo     = new JobRepository();
+		$log_repo     = new LogRepository();
+		$builder      = new VariantBuilder();
+		$dispatcher   = new Dispatcher();
+
+		$content_id = $content_repo->create(
+			array(
+				'title'        => $title,
+				'content_type' => $type,
+				'body'         => $body,
+				'status'       => 'scheduled',
+				'media'        => $media_ids,
+			)
+		);
+
+		foreach ( $platforms as $platform ) {
+			if ( ! in_array( $platform, array( 'instagram', 'facebook', 'youtube' ), true ) ) {
+				continue;
+			}
+			if ( $global_dry_run ) {
+				$job_publish_mode = 'dry_run';
+			} elseif ( in_array( $platform, array( 'facebook', 'instagram' ), true ) ) {
+				$job_publish_mode = $settings->get( 'meta_live_publish_enabled', 0 ) ? 'live' : 'blocked';
+			} elseif ( 'youtube' === $platform ) {
+				$job_publish_mode = $settings->get( 'youtube_live_publish_enabled', 0 ) ? 'live' : 'blocked';
+			} else {
+				$job_publish_mode = 'blocked';
+			}
+			$variant = $builder->build(
+				$platform,
+				array(
+					'title'        => $title,
+					'content_type' => $type,
+					'body'         => $body,
+					'media'        => $media_ids,
+				)
+			);
+			$variant['content_id'] = $content_id;
+			$variant['publish_at'] = $scheduled_at;
+			$variant['status']     = 'scheduled';
+			$variant_id = $variant_repo->create( $variant );
+
+			$job_id = $job_repo->create(
+				array(
+					'content_id'      => $content_id,
+					'variant_id'      => $variant_id,
+					'platform'        => $platform,
+					'job_type'        => 'publish',
+					'status'          => 'queued',
+					'scheduled_at'    => $scheduled_at,
+					'idempotency_key' => hash( 'sha256', 'jksh|' . $variant_id . '|publish|' . $scheduled_at ),
+					'payload'         => array( 'variant_id' => $variant_id, 'publish_mode' => $job_publish_mode, 'dry_run' => 'dry_run' === $job_publish_mode ),
+				)
+			);
+			$dispatcher->schedule( $job_id, $utc->getTimestamp() );
+			$log_repo->add(
+				array(
+					'job_id'     => $job_id,
+					'content_id' => $content_id,
+					'variant_id' => $variant_id,
+					'action'     => 'schedule',
+					'result'     => 'success',
+					'message'    => 'live' === $job_publish_mode ? 'Platform variant scheduled for LIVE publishing.' : ( 'dry_run' === $job_publish_mode ? 'Platform variant scheduled in Dry Run mode.' : 'Platform variant scheduled but live publishing is locked.' ),
+					'context'    => array( 'platform' => $platform, 'scheduled_at_utc' => $scheduled_at, 'publish_mode' => $job_publish_mode ),
+				)
+			);
+		}
+		echo '<div class="notice notice-success"><p>Master content #' . esc_html( (string) $content_id ) . ' created with platform variants. Each queued job permanently captured its platform safety mode.</p></div>';
+	}
+
+	public function content_library(): void {
+		$this->header( 'Content Library', 'Master content records' );
+		$this->content_table( ( new ContentRepository() )->recent( 100 ) );
+		$this->footer();
+	}
+
+	public function variants(): void {
+		$this->header( 'Platform Variants', 'Each platform keeps its own native format and copy' );
+		$rows = ( new VariantRepository() )->recent( 150 );
+		echo '<section class="jksh-card"><table class="widefat striped"><thead><tr><th>ID</th><th>Content</th><th>Platform</th><th>Type</th><th>Status</th><th>Publish UTC</th><th>External</th></tr></thead><tbody>';
+		if ( ! $rows ) {
+			echo '<tr><td colspan="7">No variants yet.</td></tr>';
+		}
+		foreach ( $rows as $row ) {
+			echo '<tr><td>' . esc_html( (string) $row->id ) . '</td><td>#' . esc_html( (string) $row->content_id ) . '</td><td><strong>' . esc_html( ucfirst( $row->platform ) ) . '</strong></td><td>' . esc_html( str_replace( '_', ' ', $row->publication_type ) ) . '</td><td>' . $this->badge( $row->status ) . '</td><td>' . esc_html( (string) $row->publish_at ) . '</td><td>' . ( $row->external_url ? '<a href="' . esc_url( $row->external_url ) . '" target="_blank" rel="noopener">Open</a>' : '—' ) . '</td></tr>';
+		}
+		echo '</tbody></table></section>';
+		$this->footer();
+	}
+
+	public function calendar(): void {
+		$this->header( 'Calendar', 'Foundation calendar view; drag/drop comes in a later release' );
+		$rows = ( new VariantRepository() )->recent( 150 );
+		$by_date = array();
+		foreach ( $rows as $row ) {
+			$date = $row->publish_at ? substr( $row->publish_at, 0, 10 ) : 'Unscheduled';
+			$by_date[ $date ][] = $row;
+		}
+		echo '<div class="jksh-calendar">';
+		if ( ! $by_date ) {
+			echo '<section class="jksh-card">No scheduled variants yet.</section>';
+		}
+		foreach ( $by_date as $date => $items ) {
+			echo '<section class="jksh-card"><h2>' . esc_html( $date ) . '</h2>';
+			foreach ( $items as $item ) {
+				echo '<div class="jksh-calendar-item"><strong>' . esc_html( ucfirst( $item->platform ) ) . '</strong><span>' . esc_html( str_replace( '_', ' ', $item->publication_type ) ) . '</span>' . $this->badge( $item->status ) . '</div>';
+			}
+			echo '</section>';
+		}
+		echo '</div>';
+		$this->footer();
+	}
+
+	public function queue(): void {
+		$this->header( 'Queue', 'Idempotent background jobs with retained errors and retry history' );
+		$this->jobs_table( ( new JobRepository() )->recent( 150 ) );
+		$this->footer();
+	}
+
+	public function templates(): void {
+		if ( isset( $_POST['jksh_add_template'] ) ) {
+			check_admin_referer( 'jksh_add_template', 'jksh_nonce' );
+			if ( current_user_can( 'jksh_edit' ) ) {
+				( new TemplateRepository() )->create(
+					array(
+						'name'          => wp_unslash( $_POST['name'] ?? '' ),
+						'content_type'  => wp_unslash( $_POST['content_type'] ?? '' ),
+						'platform'      => wp_unslash( $_POST['platform'] ?? '' ),
+						'template_kind' => wp_unslash( $_POST['template_kind'] ?? 'caption' ),
+						'body'          => wp_unslash( $_POST['body'] ?? '' ),
+					)
+				);
+				echo '<div class="notice notice-success"><p>Template saved.</p></div>';
+			}
+		}
+		$this->header( 'Templates', 'Reusable captions, CTAs, hashtags and platform defaults' );
+		?>
+		<div class="jksh-grid jksh-grid-2">
+		<form method="post" class="jksh-card jksh-form"><?php wp_nonce_field( 'jksh_add_template', 'jksh_nonce' ); ?><h2>Add template</h2><label><span>Name</span><input name="name" required></label><div class="jksh-form-grid"><label><span>Content type</span><input name="content_type" placeholder="knowledge_carousel"></label><label><span>Platform</span><select name="platform"><option value="">Any</option><option>instagram</option><option>facebook</option><option>youtube</option></select></label></div><label><span>Kind</span><select name="template_kind"><option value="caption">Caption</option><option value="cta">CTA</option><option value="hashtags">Hashtags</option><option value="description">Description</option></select></label><label><span>Template</span><textarea name="body" rows="8" placeholder="Use variables like {{website}}, {{coupon}}, {{product_name}}"></textarea></label><p><button class="button button-primary" name="jksh_add_template" value="1">Save template</button></p></form>
+		<section class="jksh-card"><h2>Available variables</h2><code>{{product_name}}</code> <code>{{product_url}}</code> <code>{{website}}</code> <code>{{coupon}}</code> <code>{{phone_primary}}</code> <code>{{phone_secondary}}</code> <code>{{whatsapp}}</code> <code>{{today}}</code> <code>{{festival}}</code> <code>{{platform}}</code><hr><h2>Saved templates</h2><?php foreach ( ( new TemplateRepository() )->all() as $t ) : ?><div class="jksh-template"><strong><?php echo esc_html( $t->name ); ?></strong><span><?php echo esc_html( trim( $t->platform . ' · ' . $t->template_kind, ' ·' ) ); ?></span><pre><?php echo esc_html( $t->body ); ?></pre></div><?php endforeach; ?></section>
+		</div>
+		<?php
+		$this->footer();
+	}
+
+	public function accounts(): void {
+		$this->header( 'Accounts', 'Meta and YouTube connections, health and controlled publishing readiness' );
+		$connector = new MetaConnector();
+		$config    = $connector->config();
+		$account_repo = new AccountRepository();
+		$accounts  = array_values( array_filter( $account_repo->active(), static fn( $a ) => in_array( (string) $a->platform, array( 'facebook', 'instagram' ), true ) ) );
+		$youtube_connector = new YouTubeConnector();
+		$youtube_config = $youtube_connector->config();
+		$youtube_accounts = $account_repo->connected( 'youtube' );
+		$notice    = sanitize_key( wp_unslash( $_GET['jksh_notice'] ?? '' ) );
+		$message   = sanitize_text_field( rawurldecode( (string) wp_unslash( $_GET['jksh_msg'] ?? '' ) ) );
+		if ( $notice && $message ) {
+			$class = 'success' === $notice ? 'notice-success' : 'notice-error';
+			echo '<div class="notice ' . esc_attr( $class ) . ' inline"><p>' . esc_html( $message ) . '</p></div>';
+		}
+		?>
+		<div class="jksh-grid jksh-grid-2">
+			<section class="jksh-card">
+				<h2>Meta App configuration</h2>
+				<p>Use one Meta app for the JustKalinga Facebook Page and its linked Instagram Professional account. App secrets and access tokens are encrypted server-side and never exposed to JavaScript.</p>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="jksh-form">
+					<input type="hidden" name="action" value="jksh_save_meta_config">
+					<?php wp_nonce_field( 'jksh_meta_config' ); ?>
+					<label><span>Meta App ID</span><input type="text" name="app_id" value="<?php echo esc_attr( $config['app_id'] ); ?>" autocomplete="off"></label>
+					<label><span>Meta App Secret</span><input type="password" name="app_secret" value="" autocomplete="new-password" placeholder="<?php echo $connector->has_secret() ? esc_attr__( 'Saved securely — leave blank to keep it', 'jk-social-hub' ) : esc_attr__( 'Enter App Secret', 'jk-social-hub' ); ?>"></label>
+					<div class="jksh-form-grid"><label><span>Graph API version</span><input type="text" name="graph_version" value="<?php echo esc_attr( $config['graph_version'] ); ?>"></label><label><span>Facebook Login configuration ID (optional)</span><input type="text" name="login_config_id" value="<?php echo esc_attr( $config['login_config_id'] ); ?>" placeholder="Leave blank unless Meta gives you one"></label></div>
+					<label><span>Primary Facebook Page ID</span><input type="text" inputmode="numeric" name="preferred_page_id" value="<?php echo esc_attr( $connector->preferred_page_id() ); ?>" placeholder="Example: 123456789012345"><small>When set, reconnect imports only this Facebook Page and its linked Instagram Professional account. If blank and exactly one Facebook Page is already connected, v0.6.0 auto-locks to that Page.</small></label>
+					<p><button class="button button-primary">Save Meta settings</button></p>
+				</form>
+				<hr>
+				<h3>OAuth redirect URI</h3>
+				<p class="description">Add this exact URL to your Meta app's valid OAuth redirect URIs. If the site domain changes later, update Meta too.</p>
+				<code class="jksh-code-block"><?php echo esc_html( $connector->redirect_uri() ); ?></code>
+				<h3>Requested permissions</h3>
+				<p><code><?php echo esc_html( implode( ', ', $connector->scopes() ) ); ?></code></p>
+				<?php if ( ! empty( $config['login_config_id'] ) ) : ?>
+					<p class="description">Facebook Login for Business configuration mode is active. Meta takes permissions from the saved Configuration ID, so the connector intentionally does not send a separate <code>scope</code> query parameter.</p>
+				<?php endif; ?>
+			</section>
+			<section class="jksh-card">
+				<h2>Meta connection</h2>
+				<?php if ( $connector->is_configured() ) : ?>
+					<p>The app credentials are saved. Reconnect is restricted to the Primary Facebook Page when configured or auto-detected, then discovers its linked Instagram Professional account.</p>
+					<p><a class="button button-primary button-hero" href="<?php echo esc_url( $connector->auth_url() ); ?>">Connect / Reconnect Meta</a></p>
+				<?php else : ?>
+					<p><strong>Not ready yet.</strong> Save the Meta App ID and App Secret first.</p>
+					<button class="button button-primary" disabled>Connect Meta</button>
+				<?php endif; ?>
+				<hr>
+				<p><strong>Safety:</strong> v0.6.0 contains controlled Facebook, Instagram and YouTube video/Short publishing methods. Dry Run remains the default; Meta and YouTube each have their own additional live-publish switch.</p>
+			</section>
+		</div>
+		<div class="jksh-grid jksh-grid-2">
+			<section class="jksh-card">
+				<h2>YouTube OAuth configuration</h2>
+				<p>Connect the JustKalinga YouTube channel with a Google Cloud OAuth 2.0 Web application. Client secrets and tokens are encrypted server-side.</p>
+				<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="jksh-form">
+					<input type="hidden" name="action" value="jksh_save_youtube_config">
+					<?php wp_nonce_field( 'jksh_youtube_config' ); ?>
+					<label><span>Google OAuth Client ID</span><input type="text" name="client_id" value="<?php echo esc_attr( $youtube_config['client_id'] ); ?>" autocomplete="off"></label>
+					<label><span>Google OAuth Client Secret</span><input type="password" name="client_secret" value="" autocomplete="new-password" placeholder="<?php echo $youtube_connector->has_secret() ? esc_attr__( 'Saved securely — leave blank to keep it', 'jk-social-hub' ) : esc_attr__( 'Enter Client Secret', 'jk-social-hub' ); ?>"></label>
+					<p><button class="button button-primary">Save YouTube settings</button></p>
+				</form>
+				<hr><h3>Authorized redirect URI</h3><code class="jksh-code-block"><?php echo esc_html( $youtube_connector->redirect_uri() ); ?></code>
+				<h3>Requested OAuth scope</h3><p><code><?php echo esc_html( implode( ' ', $youtube_connector->scopes() ) ); ?></code></p>
+			</section>
+			<section class="jksh-card">
+				<h2>YouTube connection</h2>
+				<?php if ( $youtube_connector->is_configured() ) : ?>
+					<p><a class="button button-primary button-hero" href="<?php echo esc_url( $youtube_connector->auth_url() ); ?>">Connect / Reconnect YouTube</a></p>
+				<?php else : ?>
+					<p><strong>Not ready yet.</strong> Save the Google OAuth Client ID and Client Secret first.</p><button class="button button-primary" disabled>Connect YouTube</button>
+				<?php endif; ?>
+				<hr><p><strong>Stage:</strong> OAuth + channel discovery + encrypted refresh-token storage + guarded video/Short adapter. Live uploads remain locked unless Dry Run is OFF and the separate YouTube publishing switch is ON. YouTube Live provisioning is a later stage.</p>
+			</section>
+		</div>
+		<section class="jksh-card">
+			<h2>Connected YouTube channel</h2>
+			<table class="widefat striped"><thead><tr><th>Name</th><th>Channel ID</th><th>Status</th><th>Token expiry UTC</th><th>Last checked UTC</th><th>Actions</th></tr></thead><tbody>
+			<?php if ( ! $youtube_accounts ) : ?><tr><td colspan="6">No YouTube channel connected yet.</td></tr><?php endif; ?>
+			<?php foreach ( $youtube_accounts as $account ) : ?>
+			<tr><td><strong><?php echo esc_html( $account->account_name ); ?></strong></td><td><code><?php echo esc_html( $account->external_account_id ); ?></code></td><td><?php echo $this->badge( $account->status ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?></td><td><?php echo esc_html( (string) $account->token_expires_at ); ?></td><td><?php echo esc_html( (string) $account->last_checked_at ); ?><?php if ( $account->last_error ) : ?><br><small class="jksh-error-text"><?php echo esc_html( $account->last_error ); ?></small><?php endif; ?></td><td><div class="jksh-actions"><form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>"><input type="hidden" name="action" value="jksh_youtube_test_account"><input type="hidden" name="account_id" value="<?php echo esc_attr( (string) $account->id ); ?>"><?php wp_nonce_field( 'jksh_youtube_test_account' ); ?><button class="button">Test connection</button></form><form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('Disconnect this YouTube channel locally from JK Social Hub?');"><input type="hidden" name="action" value="jksh_youtube_disconnect_account"><input type="hidden" name="account_id" value="<?php echo esc_attr( (string) $account->id ); ?>"><?php wp_nonce_field( 'jksh_youtube_disconnect_account' ); ?><button class="button button-link-delete">Disconnect</button></form></div></td></tr>
+			<?php endforeach; ?>
+			</tbody></table>
+		</section>
+		<?php $publishing_readiness = ( new MetaPublisher() )->readiness(); ?>
+		<section class="jksh-card">
+			<h2>Publishing readiness</h2>
+			<p><strong>Current state:</strong> <?php echo esc_html( $publishing_readiness['live_publish_possible'] ? 'LIVE publishing is armed' : ( $publishing_readiness['dry_run'] ? 'Dry Run protection is active' : 'Live publishing remains locked' ) ); ?></p>
+			<p class="description">Supported in v0.6.0: Facebook text/single/multi-image/Reels; Instagram single-image/carousels/Reels; YouTube video and Short uploads with metadata, custom thumbnail and playlist follow-ups. YouTube Community Posts remain on the worker/manual path.</p>
+			<p class="description"><strong>Two-key safety:</strong> live Meta writes require Dry Run OFF plus the Meta live-publish switch ON, and each queued job permanently records whether it was scheduled as dry-run or live.</p>
+		</section>
+		<section class="jksh-card">
+			<h2>Connected accounts</h2><p class="description">Disconnected local records are hidden here. Reconnect is limited to the Primary Facebook Page when configured or auto-detected.</p>
+			<table class="widefat striped"><thead><tr><th>Platform</th><th>Name</th><th>External ID</th><th>Status</th><th>Token expiry UTC</th><th>Last checked UTC</th><th>Actions</th></tr></thead><tbody>
+			<?php if ( ! $accounts ) : ?><tr><td colspan="7">No Meta accounts connected yet.</td></tr><?php endif; ?>
+			<?php foreach ( $accounts as $account ) : ?>
+				<tr>
+					<td><strong><?php echo esc_html( ucfirst( $account->platform ) ); ?></strong></td>
+					<td><?php echo esc_html( $account->account_name ); ?></td>
+					<td><code><?php echo esc_html( $account->external_account_id ); ?></code></td>
+					<td><?php echo $this->badge( $account->status ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?></td>
+					<td><?php echo esc_html( (string) $account->token_expires_at ); ?></td>
+					<td><?php echo esc_html( (string) $account->last_checked_at ); ?><?php if ( $account->last_error ) : ?><br><small class="jksh-error-text"><?php echo esc_html( $account->last_error ); ?></small><?php endif; ?></td>
+					<td><div class="jksh-actions"><form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>"><input type="hidden" name="action" value="jksh_meta_test_account"><input type="hidden" name="account_id" value="<?php echo esc_attr( (string) $account->id ); ?>"><?php wp_nonce_field( 'jksh_meta_test_account' ); ?><button class="button">Test connection</button></form><form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('Disconnect this account locally from JK Social Hub?');"><input type="hidden" name="action" value="jksh_meta_disconnect_account"><input type="hidden" name="account_id" value="<?php echo esc_attr( (string) $account->id ); ?>"><?php wp_nonce_field( 'jksh_meta_disconnect_account' ); ?><button class="button button-link-delete">Disconnect</button></form></div></td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody></table>
+		</section>
+		<div class="jksh-grid jksh-grid-2">
+			<section class="jksh-card"><h2>Google Business Profile</h2><p>Tier 2 · planned after Tier 1 is stable.</p><span class="jksh-badge status-not_connected">Not connected</span></section>
+			<section class="jksh-card"><h2>Pinterest / Threads</h2><p>Tier 2 · planned after Tier 1 is stable.</p><span class="jksh-badge status-not_connected">Not connected</span></section>
+		</div>
+		<?php
+		$this->footer();
+	}
+
+	public function analytics(): void {
+		$this->header( 'Analytics', 'Foundation schema is ready for historical platform metrics' );
+		?>
+		<div class="jksh-grid jksh-grid-3">
+			<section class="jksh-card"><h2>JK Content Score</h2><p>Not calculated yet. We will wait for enough historical data before defining weights.</p></section>
+			<section class="jksh-card"><h2>Priority metrics</h2><p>Shares · Saves · Followers gained · Profile visits · Link clicks · Retention · Skip rate · Orders / revenue.</p></section>
+			<section class="jksh-card"><h2>Attribution</h2><p>UTM campaign model is reserved for linking social content to sessions and WooCommerce orders later.</p></section>
+		</div>
+		<?php
+		$this->footer();
+	}
+
+	public function logs(): void {
+		$this->header( 'Audit Logs', 'Who changed, scheduled, published, retried or failed' );
+		$this->logs_table( ( new LogRepository() )->recent( 200 ) );
+		$this->footer();
+	}
+
+	public function settings(): void {
+		$this->header( 'Settings', 'Brand variables and safety defaults' );
+		$settings = ( new Settings() )->all();
+		?>
+		<form method="post" action="options.php" class="jksh-card jksh-form">
+			<?php settings_fields( 'jksh_settings_group' ); ?>
+			<div class="jksh-form-grid"><label><span>Brand name</span><input name="jksh_settings[brand_name]" value="<?php echo esc_attr( $settings['brand_name'] ); ?>"></label><label><span>Operational timezone</span><input name="jksh_settings[timezone]" value="<?php echo esc_attr( $settings['timezone'] ); ?>"></label></div>
+			<label><span>Main website</span><input name="jksh_settings[website]" type="url" value="<?php echo esc_attr( $settings['website'] ); ?>"></label>
+			<div class="jksh-form-grid"><label><span>Primary phone</span><input name="jksh_settings[phone_primary]" value="<?php echo esc_attr( $settings['phone_primary'] ); ?>"></label><label><span>Secondary phone</span><input name="jksh_settings[phone_secondary]" value="<?php echo esc_attr( $settings['phone_secondary'] ); ?>"></label></div>
+			<div class="jksh-form-grid"><label><span>WhatsApp</span><input name="jksh_settings[whatsapp]" value="<?php echo esc_attr( $settings['whatsapp'] ); ?>"></label><label><span>Email</span><input type="email" name="jksh_settings[email]" value="<?php echo esc_attr( $settings['email'] ); ?>"></label></div>
+			<div class="jksh-form-grid"><label><span>Coupon code</span><input name="jksh_settings[coupon_code]" value="<?php echo esc_attr( $settings['coupon_code'] ); ?>"></label><label><span>Coupon label</span><input name="jksh_settings[coupon_label]" value="<?php echo esc_attr( $settings['coupon_label'] ); ?>"></label></div>
+			<label class="jksh-check"><input type="checkbox" name="jksh_settings[dry_run]" value="1" <?php checked( $settings['dry_run'], 1 ); ?>> <strong>Dry Run mode</strong> — keep enabled until publishing preflight is verified</label>
+			<label class="jksh-check"><input type="checkbox" name="jksh_settings[meta_live_publish_enabled]" value="1" <?php checked( $settings['meta_live_publish_enabled'], 1 ); ?>> <strong>Enable Meta live publishing master switch</strong> — this alone does nothing while Dry Run remains ON</label>
+			<label class="jksh-check"><input type="checkbox" name="jksh_settings[youtube_live_publish_enabled]" value="1" <?php checked( $settings['youtube_live_publish_enabled'], 1 ); ?>> <strong>Enable YouTube video/Short publishing master switch</strong> — controls normal video and Short uploads only</label>
+			<label class="jksh-check"><input type="checkbox" name="jksh_settings[youtube_live_stream_enabled]" value="1" <?php checked( $settings['youtube_live_stream_enabled'], 1 ); ?>> <strong>Enable YouTube Live provisioning master switch</strong> — creates YouTube broadcast + RTMP stream resources only when Dry Run is also OFF</label>
+			<p class="description">Two-key safety: each platform write requires Dry Run OFF plus its dedicated master switch ON. YouTube Live provisioning uses a separate switch from normal video uploads.</p>
+			<label class="jksh-check"><input type="checkbox" name="jksh_settings[utm_enabled]" value="1" <?php checked( $settings['utm_enabled'], 1 ); ?>> Enable clean UTM tracking when connector layer is added</label>
+			<hr><h2>External live relay worker</h2>
+			<label class="jksh-check"><input type="checkbox" name="jksh_settings[live_worker_enabled]" value="1" <?php checked( $settings['live_worker_enabled'], 1 ); ?>> <strong>Enable live relay-worker dispatch</strong> — still blocked while Dry Run remains ON</label>
+			<label><span>Worker HTTPS endpoint</span><input name="jksh_settings[live_worker_endpoint]" type="url" value="<?php echo esc_attr( $settings['live_worker_endpoint'] ); ?>" placeholder="https://relay.example.com"></label>
+			<label><span>Worker public RTMP/RTMPS ingest base</span><input name="jksh_settings[live_worker_ingest_base]" value="<?php echo esc_attr( $settings['live_worker_ingest_base'] ); ?>" placeholder="rtmp://relay.example.com:1935/jksh"></label>
+			<label><span>Worker internal ingest base</span><input name="jksh_settings[live_worker_internal_ingest_base]" value="<?php echo esc_attr( $settings['live_worker_internal_ingest_base'] ); ?>" placeholder="rtmp://mediamtx:1935/jksh"></label>
+			<p class="description">v0.8.0 uses RSA-SHA256 signed worker requests. The worker receives destination ingest URLs only over the configured HTTPS control endpoint. Stream keys are never returned through MCP.</p>
+			<?php submit_button(); ?>
+		</form>
+		<?php
+		$this->footer();
+	}
+
+	private function content_types(): array {
+		return array(
+			'mangal_arati'         => 'Mangal Arati',
+			'sell_reel'            => 'Sell Reel',
+			'knowledge_reel'       => 'Knowledge Reel',
+			'knowledge_carousel'   => 'Knowledge Carousel',
+			'product_carousel'     => 'Product Carousel',
+			'festival'             => 'Festival',
+			'ritual'               => 'Ritual',
+			'besha'                => 'Besha',
+			'murti'                => 'Murti',
+			'dress_vastra'         => 'Dress / Vastra',
+			'jagannath_knowledge'  => 'Jagannath Knowledge',
+			'puri'                 => 'Puri',
+			'customer_review'      => 'Customer Review',
+			'customer_ugc'         => 'Customer UGC',
+			'order_dispatch'       => 'Order / Dispatch',
+			'long_knowledge_video' => 'Long Knowledge Video',
+			'youtube_community'    => 'YouTube Community',
+			'story'                => 'Story',
+		);
+	}
+
+	private function stat_card( string $label, string $value, string $note ): void {
+		echo '<section class="jksh-card jksh-stat"><span>' . esc_html( $label ) . '</span><strong>' . esc_html( $value ) . '</strong><small>' . esc_html( $note ) . '</small></section>';
+	}
+
+	private function content_table( array $rows ): void {
+		echo '<table class="widefat striped"><thead><tr><th>ID</th><th>Title</th><th>Type</th><th>Status</th><th>Created UTC</th></tr></thead><tbody>';
+		if ( ! $rows ) {
+			echo '<tr><td colspan="5">No content yet.</td></tr>';
+		}
+		foreach ( $rows as $row ) {
+			echo '<tr><td>' . esc_html( (string) $row->id ) . '</td><td><strong>' . esc_html( $row->title ) . '</strong></td><td>' . esc_html( str_replace( '_', ' ', $row->content_type ) ) . '</td><td>' . $this->badge( $row->status ) . '</td><td>' . esc_html( $row->created_at ) . '</td></tr>';
+		}
+		echo '</tbody></table>';
+	}
+
+	private function jobs_table( array $rows ): void {
+		echo '<section class="jksh-card"><table class="widefat striped"><thead><tr><th>Job</th><th>Variant</th><th>Platform</th><th>Status</th><th>Attempts</th><th>Scheduled UTC</th><th>Error</th></tr></thead><tbody>';
+		if ( ! $rows ) {
+			echo '<tr><td colspan="7">Queue is empty.</td></tr>';
+		}
+		foreach ( $rows as $row ) {
+			echo '<tr><td>#' . esc_html( (string) $row->id ) . '</td><td>#' . esc_html( (string) $row->variant_id ) . '</td><td>' . esc_html( ucfirst( $row->platform ) ) . '</td><td>' . $this->badge( $row->status ) . '</td><td>' . esc_html( $row->attempts . '/' . $row->max_attempts ) . '</td><td>' . esc_html( (string) $row->scheduled_at ) . '</td><td>' . esc_html( (string) $row->last_error ) . '</td></tr>';
+		}
+		echo '</tbody></table></section>';
+	}
+
+	private function logs_table( array $rows ): void {
+		echo '<table class="widefat striped"><thead><tr><th>Time UTC</th><th>User</th><th>Action</th><th>Content</th><th>Variant</th><th>Result</th><th>Message</th></tr></thead><tbody>';
+		if ( ! $rows ) {
+			echo '<tr><td colspan="7">No logs yet.</td></tr>';
+		}
+		foreach ( $rows as $row ) {
+			$user = $row->user_id ? get_userdata( (int) $row->user_id ) : null;
+			echo '<tr><td>' . esc_html( $row->created_at ) . '</td><td>' . esc_html( $user ? $user->display_name : 'System' ) . '</td><td>' . esc_html( str_replace( '_', ' ', $row->action ) ) . '</td><td>#' . esc_html( (string) $row->content_id ) . '</td><td>#' . esc_html( (string) $row->variant_id ) . '</td><td>' . $this->badge( $row->result ) . '</td><td>' . esc_html( (string) $row->message ) . '</td></tr>';
+		}
+		echo '</tbody></table>';
+	}
+
+	private function badge( string $status ): string {
+		return '<span class="jksh-badge status-' . esc_attr( sanitize_html_class( $status ) ) . '">' . esc_html( str_replace( '_', ' ', ucfirst( $status ) ) ) . '</span>';
+	}
+}
+
+===== src/Mcp/Abilities.php 1-220 =====
+<?php
+namespace JKSH\Mcp;
+
+use JKSH\Repositories\AccountRepository;
+use JKSH\Repositories\LogRepository;
+use JKSH\Services\MetaConnector;
+use JKSH\Services\MetaPublisher;
+use JKSH\Services\PluginPackageUpdater;
+use JKSH\Services\ContentOrchestrator;
+use JKSH\Services\LiveStreaming;
+use JKSH\Services\LiveWorker;
+use JKSH\Services\PlatformSchema;
+use JKSH\Services\YouTubeConnector;
+use JKSH\Services\YouTubePublisher;
+use JKSH\Services\YouTubeLive;
+
+final class Abilities {
+	private const CATEGORY = 'jk-social';
+
+	public function register(): void {
+		// Hook early and let WordPress call us when the Abilities API registries exist.
+		// Do not require wp_register_ability() to exist at plugin load time.
+		add_action( 'wp_abilities_api_categories_init', array( $this, 'register_category' ) );
+		add_action( 'wp_abilities_api_init', array( $this, 'register_abilities' ) );
+	}
+
+	public function register_category(): void {
+		wp_register_ability_category(
+			self::CATEGORY,
+			array(
+				'label'       => __( 'JK Social Hub', 'jk-social-hub' ),
+				'description' => __( 'Diagnostics, publishing readiness, and tightly scoped maintenance abilities for the JustKalinga Social Hub.', 'jk-social-hub' ),
+			)
+		);
+	}
+
+	public function register_abilities(): void {
+		$this->register_ability(
+			'jk-social/get-connected-accounts',
+			__( 'Get connected social accounts', 'jk-social-hub' ),
+			__( 'Returns the connected Facebook, Instagram and YouTube accounts in JK Social Hub without exposing access tokens, app secrets, encrypted credentials, refresh tokens or other authentication material.', 'jk-social-hub' ),
+			array( $this, 'get_connected_accounts' ),
+			'jksh_manage_accounts'
+		);
+
+		$this->register_ability(
+			'jk-social/get-meta-health',
+			__( 'Get Meta connection health', 'jk-social-hub' ),
+			__( 'Returns a read-only health summary for the configured Meta connection, including Facebook and Instagram account states, token-expiry timestamps, last checks, and latest stored connection-test results. It does not call Meta or modify account state.', 'jk-social-hub' ),
+			array( $this, 'get_meta_health' ),
+			'jksh_manage_accounts'
+		);
+
+		$this->register_ability(
+			'jk-social/get-latest-meta-log',
+			__( 'Get latest Meta diagnostics', 'jk-social-hub' ),
+			__( 'Returns recent sanitized Meta connection, discovery, test, and disconnect audit events from JK Social Hub. Secrets and token-like values are removed from diagnostic context.', 'jk-social-hub' ),
+			array( $this, 'get_latest_meta_log' ),
+			'jksh_view'
+		);
+
+		$this->register_ability(
+			'jk-social/get-youtube-health',
+			__( 'Get YouTube connection health', 'jk-social-hub' ),
+			__( 'Returns read-only YouTube OAuth/channel health without exposing client secrets, access tokens or refresh tokens.', 'jk-social-hub' ),
+			array( $this, 'get_youtube_health' ),
+			'jksh_manage_accounts'
+		);
+
+		$this->register_ability(
+			'jk-social/get-instagram-diagnostics',
+			__( 'Get Instagram diagnostics', 'jk-social-hub' ),
+			__( 'Returns the connected Instagram account records plus the latest sanitized Instagram discovery diagnostics from the Meta connection flow.', 'jk-social-hub' ),
+			array( $this, 'get_instagram_diagnostics' ),
+			'jksh_manage_accounts'
+		);
+
+		$this->register_ability(
+			'jk-social/get-publishing-readiness',
+			__( 'Get omnichannel publishing readiness', 'jk-social-hub' ),
+			__( 'Returns local Dry Run and platform master switches plus Facebook, Instagram and YouTube publishing readiness. Read-only; it never publishes content.', 'jk-social-hub' ),
+			array( $this, 'get_publishing_readiness' ),
+			'jksh_publish'
+		);
+
+		$this->register_ability(
+			'jk-social/get-publish-logs',
+			__( 'Get publish logs', 'jk-social-hub' ),
+			__( 'Returns recent sanitized publishing, retry, pending, blocked, and dry-run events without exposing access tokens or secrets.', 'jk-social-hub' ),
+			array( $this, 'get_publish_logs' ),
+			'jksh_view'
+		);
+
+
+
+		$this->register_ability(
+			'jk-social/get-platform-field-schema',
+			__( 'Get platform field schema', 'jk-social-hub' ),
+			__( 'Returns the omnichannel field catalog used by ChatGPT/MCP to prepare native Instagram, Facebook and YouTube variants, including which fields are API-backed or require a manual fallback.', 'jk-social-hub' ),
+			array( $this, 'get_platform_field_schema' ),
+			'jksh_view'
+		);
+		$this->register_ability(
+			'jk-social/create-dry-run-content',
+			__( 'Create omnichannel Dry Run content', 'jk-social-hub' ),
+			__( 'Creates one master content item, native platform variants and queued jobs captured permanently as Dry Run. It cannot create live publishing jobs.', 'jk-social-hub' ),
+			array( $this, 'create_dry_run_content' ),
+			'jksh_create',
+			array(
+				'type' => 'object',
+				'properties' => array(
+					'title' => array( 'type' => 'string', 'minLength' => 1, 'maxLength' => 255 ),
+					'content_type' => array( 'type' => 'string' ),
+					'body' => array( 'type' => 'string' ),
+					'media_attachment_ids' => array( 'type' => 'array', 'items' => array( 'type' => 'integer', 'minimum' => 1 ) ),
+					'platforms' => array( 'type' => 'array', 'items' => array( 'type' => 'string', 'enum' => array( 'instagram', 'facebook', 'youtube' ) ) ),
+					'scheduled_at_utc' => array( 'type' => 'string' ),
+					'location' => array( 'type' => 'object', 'additionalProperties' => true ),
+					'products' => array( 'type' => 'array', 'items' => array( 'type' => 'object', 'additionalProperties' => true ) ),
+					'platform_fields' => array( 'type' => 'object', 'additionalProperties' => true ),
+				),
+				'required' => array( 'title', 'platforms' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => false, 'destructive' => false, 'idempotent' => false )
+		);
+		$this->register_ability(
+			'jk-social/get-content-package',
+			__( 'Get omnichannel content package', 'jk-social-hub' ),
+			__( 'Returns a master content record with its platform-specific variants and platform field packs.', 'jk-social-hub' ),
+			array( $this, 'get_content_package' ),
+			'jksh_view',
+			array( 'type' => 'object', 'properties' => array( 'content_id' => array( 'type' => 'integer', 'minimum' => 1 ) ), 'required' => array( 'content_id' ), 'additionalProperties' => false )
+		);
+		$this->register_ability(
+			'jk-social/process-dry-run-jobs',
+			__( 'Process Dry Run jobs now', 'jk-social-hub' ),
+			__( 'Processes only explicitly captured Dry Run jobs while the global Dry Run safety switch is ON. Live or ambiguous jobs are refused.', 'jk-social-hub' ),
+			array( $this, 'process_dry_run_jobs' ),
+			'jksh_publish',
+			array( 'type' => 'object', 'properties' => array( 'job_ids' => array( 'type' => 'array', 'minItems' => 1, 'items' => array( 'type' => 'integer', 'minimum' => 1 ) ) ), 'required' => array( 'job_ids' ), 'additionalProperties' => false ),
+			array( 'readonly' => false, 'destructive' => false, 'idempotent' => true )
+		);
+
+		$this->register_ability(
+			'jk-social/get-youtube-live-readiness',
+			__( 'Get YouTube Live readiness', 'jk-social-hub' ),
+			__( 'Returns local YouTube Live provisioning safety state without creating or changing YouTube resources.', 'jk-social-hub' ),
+			array( $this, 'get_youtube_live_readiness' ),
+			'jksh_publish'
+		);
+
+		$this->register_ability(
+			'jk-social/probe-youtube-live-api',
+			__( 'Probe YouTube Live API', 'jk-social-hub' ),
+			__( 'Performs read-only liveBroadcasts.list and liveStreams.list calls for the connected YouTube channel. It does not create, bind, transition or delete any live resource.', 'jk-social-hub' ),
+			array( $this, 'probe_youtube_live_api' ),
+			'jksh_publish'
+		);
+
+		$this->register_ability(
+			'jk-social/preflight-youtube-live-draft',
+			__( 'Preflight YouTube Live draft', 'jk-social-hub' ),
+			__( 'Validates one local live-stream draft for YouTube provisioning without contacting YouTube.', 'jk-social-hub' ),
+			array( $this, 'preflight_youtube_live_draft' ),
+			'jksh_publish',
+			array(
+				'type' => 'object',
+				'properties' => array(
+					'live_stream_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+				),
+				'required' => array( 'live_stream_id' ),
+				'additionalProperties' => false,
+			)
+		);
+
+		$this->register_ability(
+			'jk-social/provision-youtube-live',
+			__( 'Provision YouTube Live broadcast and stream', 'jk-social-hub' ),
+			__( 'Creates a YouTube liveBroadcast and RTMP liveStream and binds them for a preflighted local draft. Requires confirm=true, global Dry Run OFF and the dedicated YouTube Live provisioning switch ON. Stream keys are encrypted and never returned.', 'jk-social-hub' ),
+			array( $this, 'provision_youtube_live' ),
+			'jksh_publish',
+			array(
+				'type' => 'object',
+				'properties' => array(
+					'live_stream_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+					'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ),
+				),
+				'required' => array( 'live_stream_id', 'confirm' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => false, 'destructive' => true, 'idempotent' => false )
+		);
+
+		$this->register_ability(
+			'jk-social/get-live-worker-readiness',
+			__( 'Get live relay-worker readiness', 'jk-social-hub' ),
+			__( 'Returns the external relay-worker configuration, signed-transport readiness and optional health state without exposing stream keys or destination URLs.', 'jk-social-hub' ),
+			array( $this, 'get_live_worker_readiness' ),
+			'jksh_view'
+		);
+		$this->register_ability(
+			'jk-social/get-live-worker-pairing',
+			__( 'Get live relay-worker pairing data', 'jk-social-hub' ),
+			__( 'Returns the JK Social Hub public verification key and relay-worker API contract. The private signing key never leaves WordPress.', 'jk-social-hub' ),
+			array( $this, 'get_live_worker_pairing' ),
+			'jksh_manage_settings'
+		);
+		$this->register_ability(
+			'jk-social/probe-live-worker',
+			__( 'Probe live relay worker', 'jk-social-hub' ),
+			__( 'Performs a read-only HTTPS health check against the configured relay worker. It does not start or stop a stream.', 'jk-social-hub' ),
+			array( $this, 'probe_live_worker' ),
+			'jksh_publish'
+		);
+		$this->register_ability(
+			'jk-social/preflight-live-worker-draft',
+			__( 'Preflight live relay-worker draft', 'jk-social-hub' ),
+			__( 'Validates one live draft for external relay-worker dispatch without exposing or transmitting source/destination stream secrets.', 'jk-social-hub' ),
+			array( $this, 'preflight_live_worker_draft' ),
+
+===== src/Mcp/Abilities.php 220-520 =====
+			array( $this, 'preflight_live_worker_draft' ),
+			'jksh_publish',
+			array(
+				'type' => 'object',
+				'properties' => array( 'live_stream_id' => array( 'type' => 'integer', 'minimum' => 1 ) ),
+				'required' => array( 'live_stream_id' ),
+				'additionalProperties' => false,
+			)
+		);
+		$this->register_ability(
+			'jk-social/dispatch-live-worker',
+			__( 'Start live relay-worker job', 'jk-social-hub' ),
+			__( 'Sends a signed relay job to the configured external worker. Requires confirm=true, global Dry Run OFF and the live-worker master switch ON. Stream keys are never returned.', 'jk-social-hub' ),
+			array( $this, 'dispatch_live_worker' ),
+			'jksh_publish',
+			array(
+				'type' => 'object',
+				'properties' => array(
+					'live_stream_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+					'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ),
+				),
+				'required' => array( 'live_stream_id', 'confirm' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => false, 'destructive' => true, 'idempotent' => false )
+		);
+		$this->register_ability(
+			'jk-social/stop-live-worker',
+			__( 'Stop live relay-worker job', 'jk-social-hub' ),
+			__( 'Stops the external relay-worker job recorded for a local live stream. Requires confirm=true.', 'jk-social-hub' ),
+			array( $this, 'stop_live_worker' ),
+			'jksh_publish',
+			array(
+				'type' => 'object',
+				'properties' => array(
+					'live_stream_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+					'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ),
+				),
+				'required' => array( 'live_stream_id', 'confirm' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => false, 'destructive' => true, 'idempotent' => true )
+		);
+
+		$this->register_ability(
+			'jk-social/get-live-streaming-readiness',
+			__( 'Get live streaming readiness', 'jk-social-hub' ),
+			__( 'Returns the Facebook, Instagram, YouTube and worker prerequisites for multi-destination live streaming. It does not reveal stream keys or tokens.', 'jk-social-hub' ),
+			array( $this, 'get_live_streaming_readiness' ),
+			'jksh_view'
+		);
+		$this->register_ability(
+			'jk-social/create-live-stream-draft',
+			__( 'Create live stream draft', 'jk-social-hub' ),
+			__( 'Creates a control-plane live stream draft with destination metadata. It does not contact Facebook, Instagram, YouTube or a streaming worker.', 'jk-social-hub' ),
+			array( $this, 'create_live_stream_draft' ),
+			'jksh_create',
+			array(
+				'type' => 'object',
+				'properties' => array(
+					'title' => array( 'type' => 'string', 'minLength' => 1, 'maxLength' => 255 ),
+					'description' => array( 'type' => 'string' ),
+					'source_type' => array( 'type' => 'string', 'enum' => array( 'rtmp_input', 'camera', 'prerecorded', 'playlist' ) ),
+					'source_reference' => array( 'type' => 'string' ),
+					'destinations' => array( 'type' => 'array', 'items' => array( 'type' => 'string', 'enum' => array( 'facebook', 'instagram', 'youtube' ) ) ),
+					'scheduled_start_at_utc' => array( 'type' => 'string' ),
+					'orientation' => array( 'type' => 'string', 'enum' => array( 'adaptive', 'portrait', 'landscape' ) ),
+					'location' => array( 'type' => 'object', 'additionalProperties' => true ),
+					'products' => array( 'type' => 'array', 'items' => array( 'type' => 'object', 'additionalProperties' => true ) ),
+					'platform_fields' => array( 'type' => 'object', 'additionalProperties' => true ),
+				),
+				'required' => array( 'title', 'destinations' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => false, 'destructive' => false, 'idempotent' => false )
+		);
+		$this->register_ability(
+			'jk-social/list-live-stream-drafts',
+			__( 'List live stream drafts', 'jk-social-hub' ),
+			__( 'Returns recent live-stream control-plane records without stream keys or authentication secrets.', 'jk-social-hub' ),
+			array( $this, 'list_live_stream_drafts' ),
+			'jksh_view'
+		);
+
+		$this->register_ability(
+			'jk-social/get-plugin-update-readiness',
+			__( 'Get JK Social Hub plugin update readiness', 'jk-social-hub' ),
+			__( 'Returns read-only self-update readiness for JK Social Hub, including current version, filesystem mode, permissions, and package limits. It cannot install arbitrary plugins.', 'jk-social-hub' ),
+			array( $this, 'get_plugin_update_readiness' ),
+			'update_plugins'
+		);
+
+		$this->register_ability(
+			'jk-social/preflight-plugin-package',
+			__( 'Preflight JK Social Hub update package', 'jk-social-hub' ),
+			__( 'Validates a JK Social Hub ZIP already stored as a WordPress media attachment. Verifies SHA-256, ZIP integrity, safe paths, plugin identity, version and platform requirements without changing installed plugin files.', 'jk-social-hub' ),
+			array( $this, 'preflight_plugin_package' ),
+			'update_plugins',
+			array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'attachment_id' => array( 'type' => 'integer', 'minimum' => 1, 'description' => 'Media attachment ID of the JK Social Hub ZIP package.' ),
+					'expected_sha256' => array( 'type' => 'string', 'minLength' => 64, 'maxLength' => 64, 'description' => 'Expected SHA-256 checksum of the exact ZIP bytes.' ),
+				),
+				'required'             => array( 'attachment_id', 'expected_sha256' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => true, 'destructive' => false, 'idempotent' => true )
+		);
+
+		$this->register_ability(
+			'jk-social/install-update-plugin-package',
+			__( 'Install or update JK Social Hub package', 'jk-social-hub' ),
+			__( 'Replaces only the JK Social Hub plugin from a verified media-library ZIP. Requires exact SHA-256, expected installed version and confirm=true. Creates a temporary rollback copy, verifies the installed version after replacement, and restores the previous copy if installation or verification fails. Arbitrary plugin slugs are refused.', 'jk-social-hub' ),
+			array( $this, 'install_update_plugin_package' ),
+			'update_plugins',
+			array(
+				'type'                 => 'object',
+				'properties'           => array(
+					'attachment_id' => array( 'type' => 'integer', 'minimum' => 1, 'description' => 'Media attachment ID of the verified JK Social Hub ZIP package.' ),
+					'expected_sha256' => array( 'type' => 'string', 'minLength' => 64, 'maxLength' => 64, 'description' => 'Expected SHA-256 checksum of the exact ZIP bytes.' ),
+					'expected_current_version' => array( 'type' => 'string', 'minLength' => 1, 'maxLength' => 40, 'description' => 'Installed JK Social Hub version observed immediately before this update.' ),
+					'confirm' => array( 'type' => 'boolean', 'enum' => array( true ), 'description' => 'Must be true because this operation replaces active plugin files.' ),
+					'allow_reinstall' => array( 'type' => 'boolean', 'description' => 'Allow replacing the plugin with the same version. Defaults false.' ),
+					'allow_downgrade' => array( 'type' => 'boolean', 'description' => 'Allow installing an older version. Defaults false.' ),
+					'delete_package_after' => array( 'type' => 'boolean', 'description' => 'Delete the media ZIP after successful verification. Defaults true.' ),
+				),
+				'required'             => array( 'attachment_id', 'expected_sha256', 'expected_current_version', 'confirm' ),
+				'additionalProperties' => false,
+			),
+			array( 'readonly' => false, 'destructive' => true, 'idempotent' => false )
+		);
+	}
+
+	private function register_ability( string $name, string $label, string $description, callable $callback, string $capability, ?array $input_schema = null, ?array $annotations = null ): void {
+		$args = array(
+			'label'               => $label,
+			'description'         => $description,
+			'category'            => self::CATEGORY,
+			'execute_callback'    => $callback,
+			'permission_callback' => static function () use ( $capability ): bool {
+				return current_user_can( $capability );
+			},
+			'meta'                => array(
+				'public'       => true,
+				'show_in_rest' => true,
+				'annotations' => $annotations ?? array(
+					'readonly'    => true,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+			),
+		);
+		if ( null !== $input_schema ) {
+			$args['input_schema'] = $input_schema;
+		}
+		wp_register_ability( $name, $args );
+	}
+
+	public function get_connected_accounts( mixed $input = null ): array {
+		$accounts = ( new AccountRepository() )->connected();
+		$items    = array();
+		foreach ( $accounts as $account ) {
+			if ( ! in_array( (string) $account->platform, array( 'facebook', 'instagram', 'youtube' ), true ) ) {
+				continue;
+			}
+			$items[] = $this->safe_account( $account );
+		}
+
+		return array(
+			'site'     => home_url( '/' ),
+			'count'    => count( $items ),
+			'accounts' => $items,
+		);
+	}
+
+	public function get_meta_health( mixed $input = null ): array {
+		$repo     = new AccountRepository();
+		$accounts = array_values(
+			array_filter(
+				$repo->active(),
+				static fn( $account ): bool => in_array( (string) $account->platform, array( 'facebook', 'instagram' ), true )
+			)
+		);
+		$logs = $this->meta_logs( 100 );
+
+		$tests_by_account = array();
+		$last_connect     = null;
+		foreach ( $logs as $log ) {
+			$context = $this->decode_context( (string) ( $log->context_json ?? '' ) );
+			if ( 'account_test' === (string) $log->action ) {
+				$account_id = (int) ( $context['account_id'] ?? 0 );
+				if ( $account_id > 0 && ! isset( $tests_by_account[ $account_id ] ) ) {
+					$tests_by_account[ $account_id ] = $this->safe_log( $log );
+				}
+			}
+			if ( null === $last_connect && 'meta_connect' === (string) $log->action ) {
+				$last_connect = $this->safe_log( $log );
+			}
+		}
+
+		$now     = time();
+		$healthy = 0;
+		$items   = array();
+		foreach ( $accounts as $account ) {
+			$item = $this->safe_account( $account );
+			$token_expired = false;
+			if ( ! empty( $account->token_expires_at ) ) {
+				$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+				$token_expired = false !== $expiry && $expiry <= $now;
+			}
+			$item['token_expired'] = $token_expired;
+			$item['latest_test']    = $tests_by_account[ (int) $account->id ] ?? null;
+			$item['healthy']        = 'connected' === (string) $account->status && ! $token_expired && ( null === $item['latest_test'] || 'success' === (string) ( $item['latest_test']['result'] ?? '' ) );
+			if ( $item['healthy'] ) {
+				$healthy++;
+			}
+			$items[] = $item;
+		}
+
+		$overall = 'not_connected';
+		if ( $items ) {
+			$overall = $healthy === count( $items ) ? 'healthy' : 'attention';
+		}
+
+		$connector = new MetaConnector();
+		return array(
+			'overall_status'  => $overall,
+			'configured'      => $connector->is_configured(),
+			'primary_page_id' => $connector->preferred_page_id(),
+			'account_count'   => count( $items ),
+			'healthy_count'   => $healthy,
+			'accounts'        => $items,
+			'last_connect'    => $last_connect,
+			'note'            => 'Read-only stored health. This ability does not call Meta or refresh tokens.',
+		);
+	}
+
+	public function get_youtube_health( mixed $input = null ): array {
+		$connector = new YouTubeConnector();
+		$accounts = ( new AccountRepository() )->connected( 'youtube' );
+		$logs = ( new LogRepository() )->recent_by_actions( array( 'youtube_connect', 'youtube_account_test', 'youtube_disconnect' ), 25 );
+		$items = array_map( array( $this, 'safe_account' ), $accounts );
+		$latest_test = null;
+		$last_connect = null;
+		foreach ( $logs as $log ) {
+			if ( null === $latest_test && 'youtube_account_test' === (string) $log->action ) {
+				$latest_test = $this->safe_log( $log );
+			}
+			if ( null === $last_connect && 'youtube_connect' === (string) $log->action ) {
+				$last_connect = $this->safe_log( $log );
+			}
+		}
+		return array(
+			'configured' => $connector->is_configured(),
+			'redirect_uri' => $connector->redirect_uri(),
+			'scopes' => $connector->scopes(),
+			'connected' => ! empty( $items ),
+			'accounts' => $items,
+			'latest_test' => $latest_test,
+			'last_connect' => $last_connect,
+			'note' => 'Read-only stored YouTube connection health. Tokens and OAuth client secrets are never returned.',
+		);
+	}
+
+	public function get_latest_meta_log( mixed $input = null ): array {
+		$logs = $this->meta_logs( 25 );
+		return array(
+			'count' => count( $logs ),
+			'logs'  => array_map( array( $this, 'safe_log' ), $logs ),
+		);
+	}
+
+	public function get_publishing_readiness( mixed $input = null ): array {
+		$meta = ( new MetaPublisher() )->readiness();
+		$meta['youtube'] = ( new YouTubePublisher() )->readiness();
+		return $meta;
+	}
+
+	public function get_publish_logs( mixed $input = null ): array {
+		$logs = ( new LogRepository() )->recent_by_actions(
+			array( 'publish', 'publish_pending', 'publish_retry', 'publish_blocked', 'dry_run_publish' ),
+			50
+		);
+		return array(
+			'count' => count( $logs ),
+			'logs'  => array_map( array( $this, 'safe_log' ), $logs ),
+		);
+	}
+
+
+	public function get_platform_field_schema( mixed $input = null ): array {
+		return array( 'version' => PlatformSchema::VERSION, 'platforms' => ( new PlatformSchema() )->catalog() );
+	}
+
+	public function create_dry_run_content( mixed $input ): array|\WP_Error {
+		return ( new ContentOrchestrator() )->create_dry_run( is_array( $input ) ? $input : array() );
+	}
+
+	public function get_content_package( mixed $input ): array|\WP_Error {
+		$input = is_array( $input ) ? $input : array();
+
+===== src/Services/ContentOrchestrator.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Queue\Dispatcher;
+use JKSH\Repositories\ContentRepository;
+use JKSH\Repositories\JobRepository;
+use JKSH\Repositories\LogRepository;
+use JKSH\Repositories\VariantRepository;
+
+final class ContentOrchestrator {
+	public function create_dry_run( array $input ): array|\WP_Error {
+		$title = sanitize_text_field( (string) ( $input['title'] ?? '' ) );
+		if ( '' === $title ) {
+			return new \WP_Error( 'jksh_missing_title', 'A master title is required.' );
+		}
+		$platforms = array_values( array_intersect( array( 'instagram', 'facebook', 'youtube' ), array_map( 'sanitize_key', (array) ( $input['platforms'] ?? array( 'instagram', 'facebook', 'youtube' ) ) ) ) );
+		if ( ! $platforms ) {
+			return new \WP_Error( 'jksh_missing_platform', 'At least one supported platform is required.' );
+		}
+		$media = array_values( array_unique( array_filter( array_map( 'absint', (array) ( $input['media_attachment_ids'] ?? array() ) ) ) ) );
+		foreach ( $media as $attachment_id ) {
+			if ( ! wp_attachment_is_image( $attachment_id ) ) {
+				$mime = (string) get_post_mime_type( $attachment_id );
+				if ( ! str_starts_with( $mime, 'video/' ) ) {
+					return new \WP_Error( 'jksh_bad_media', 'Attachment ' . $attachment_id . ' is not a supported image or video.' );
+				}
+			}
+		}
+
+		$scheduled_at = $this->scheduled_at( (string) ( $input['scheduled_at_utc'] ?? '' ) );
+		$content_meta = array(
+			'location' => $this->sanitize_nested( (array) ( $input['location'] ?? array() ) ),
+			'products' => $this->sanitize_nested( (array) ( $input['products'] ?? array() ) ),
+			'source' => 'mcp',
+			'workflow' => 'omnichannel_v1',
+		);
+		$content_repo = new ContentRepository();
+		$variant_repo = new VariantRepository();
+		$job_repo = new JobRepository();
+		$log_repo = new LogRepository();
+		$builder = new VariantBuilder();
+		$schema = new PlatformSchema();
+		$dispatcher = new Dispatcher();
+		$content_id = $content_repo->create(
+			array(
+				'title' => $title,
+				'content_type' => sanitize_key( (string) ( $input['content_type'] ?? 'knowledge' ) ),
+				'body' => wp_kses_post( (string) ( $input['body'] ?? '' ) ),
+				'status' => 'scheduled',
+				'media' => $media,
+				'meta' => $content_meta,
+			)
+		);
+		$created = array();
+		foreach ( $platforms as $platform ) {
+			$variant = $builder->build(
+				$platform,
+				array(
+					'title' => $title,
+					'content_type' => sanitize_key( (string) ( $input['content_type'] ?? 'knowledge' ) ),
+					'body' => (string) ( $input['body'] ?? '' ),
+					'media' => $media,
+				)
+			);
+			$fields = $schema->sanitize_fields( $platform, (array) ( $input['platform_fields'][ $platform ] ?? array() ) );
+			$this->apply_copy_overrides( $platform, $variant, $fields );
+			$variant['fields'] = $fields;
+			$variant['content_id'] = $content_id;
+			$variant['publish_at'] = $scheduled_at;
+			$variant['status'] = 'scheduled';
+			$variant_id = $variant_repo->create( $variant );
+			$job_id = $job_repo->create(
+				array(
+					'content_id' => $content_id,
+					'variant_id' => $variant_id,
+					'platform' => $platform,
+					'job_type' => 'publish',
+					'status' => 'queued',
+					'scheduled_at' => $scheduled_at,
+					'idempotency_key' => hash( 'sha256', 'jksh|mcp|' . $variant_id . '|publish|' . $scheduled_at ),
+					'payload' => array( 'variant_id' => $variant_id, 'publish_mode' => 'dry_run', 'dry_run' => true, 'source' => 'mcp' ),
+				)
+			);
+			$dispatcher->schedule( $job_id, strtotime( $scheduled_at . ' UTC' ) ?: time() + 10 );
+			$log_repo->add(
+				array(
+					'job_id' => $job_id,
+					'content_id' => $content_id,
+					'variant_id' => $variant_id,
+					'action' => 'schedule',
+					'result' => 'success',
+					'message' => 'MCP omnichannel variant scheduled in Dry Run mode.',
+					'context' => array( 'platform' => $platform, 'scheduled_at_utc' => $scheduled_at, 'publish_mode' => 'dry_run' ),
+				)
+			);
+			$created[] = array( 'platform' => $platform, 'variant_id' => $variant_id, 'job_id' => $job_id, 'fields' => $fields );
+		}
+		return array( 'content_id' => $content_id, 'publish_mode' => 'dry_run', 'scheduled_at_utc' => $scheduled_at, 'variants' => $created );
+	}
+
+	public function package( int $content_id ): array|\WP_Error {
+		$content = ( new ContentRepository() )->get( $content_id );
+		if ( ! $content ) {
+			return new \WP_Error( 'jksh_not_found', 'Master content was not found.' );
+		}
+		$variants = ( new VariantRepository() )->by_content( $content_id );
+		$jobs = ( new JobRepository() )->by_content( $content_id );
+		return array(
+			'content' => $this->safe_content( $content ),
+			'variants' => array_map( array( $this, 'safe_variant' ), $variants ),
+			'jobs' => array_map( array( $this, 'safe_job' ), $jobs ),
+		);
+	}
+
+	public function process_dry_run_jobs( array $job_ids ): array|\WP_Error {
+		$settings = new Settings();
+		if ( ! $settings->get( 'dry_run', 1 ) ) {
+			return new \WP_Error( 'jksh_dry_run_required', 'Dry Run must be ON to execute this MCP ability.' );
+		}
+		$repo = new JobRepository();
+		$dispatcher = new Dispatcher();
+		$results = array();
+		foreach ( array_values( array_unique( array_filter( array_map( 'absint', $job_ids ) ) ) ) as $job_id ) {
+			$job = $repo->get( $job_id );
+			if ( ! $job ) {
+				$results[] = array( 'job_id' => $job_id, 'status' => 'not_found' );
+				continue;
+			}
+			$payload = json_decode( (string) $job->payload_json, true );
+			if ( ! is_array( $payload ) || 'dry_run' !== sanitize_key( (string) ( $payload['publish_mode'] ?? '' ) ) ) {
+				$results[] = array( 'job_id' => $job_id, 'status' => 'refused', 'message' => 'Only jobs captured as dry_run can be processed by this ability.' );
+				continue;
+			}
+			$dispatcher->process( $job_id );
+			$after = $repo->get( $job_id );
+			$results[] = array( 'job_id' => $job_id, 'status' => sanitize_key( (string) ( $after->status ?? 'unknown' ) ), 'last_error' => sanitize_textarea_field( (string) ( $after->last_error ?? '' ) ) );
+		}
+		return array( 'results' => $results );
+	}
+
+	private function scheduled_at( string $value ): string {
+		if ( $value ) {
+			$ts = strtotime( $value . ( str_contains( $value, 'UTC' ) || str_contains( $value, 'Z' ) ? '' : ' UTC' ) );
+			if ( $ts ) {
+				return gmdate( 'Y-m-d H:i:s', max( time(), $ts ) );
+			}
+		}
+		return gmdate( 'Y-m-d H:i:s', time() );
+	}
+
+	private function apply_copy_overrides( string $platform, array &$variant, array $fields ): void {
+		if ( isset( $fields['title'] ) ) {
+			$variant['title'] = sanitize_text_field( (string) $fields['title'] );
+		}
+		if ( 'facebook' === $platform && isset( $fields['message'] ) ) {
+			$variant['caption'] = sanitize_textarea_field( (string) $fields['message'] );
+		} elseif ( isset( $fields['caption'] ) ) {
+			$variant['caption'] = sanitize_textarea_field( (string) $fields['caption'] );
+		}
+		if ( isset( $fields['description'] ) ) {
+			$variant['description'] = sanitize_textarea_field( (string) $fields['description'] );
+		}
+		if ( isset( $fields['hashtags'] ) ) {
+			$variant['hashtags'] = is_array( $fields['hashtags'] ) ? sanitize_text_field( implode( ' ', $fields['hashtags'] ) ) : sanitize_text_field( (string) $fields['hashtags'] );
+		}
+		if ( isset( $fields['cta'] ) ) {
+			$variant['cta'] = sanitize_textarea_field( (string) $fields['cta'] );
+		}
+	}
+
+	private function sanitize_nested( array $value ): array {
+		$out = array();
+		foreach ( $value as $key => $item ) {
+			$key = is_string( $key ) ? sanitize_key( $key ) : $key;
+			$out[ $key ] = is_array( $item ) ? $this->sanitize_nested( $item ) : ( is_bool( $item ) || is_int( $item ) || is_float( $item ) || null === $item ? $item : sanitize_textarea_field( (string) $item ) );
+		}
+		return $out;
+	}
+
+	private function safe_content( object $row ): array {
+		return array(
+			'id' => (int) $row->id,
+			'title' => sanitize_text_field( (string) $row->title ),
+			'content_type' => sanitize_key( (string) $row->content_type ),
+			'body' => wp_kses_post( (string) $row->body ),
+			'status' => sanitize_key( (string) $row->status ),
+			'media' => json_decode( (string) $row->media_json, true ) ?: array(),
+			'meta' => json_decode( (string) ( $row->meta_json ?? '' ), true ) ?: array(),
+		);
+	}
+	private function safe_variant( object $row ): array {
+		return array(
+			'id' => (int) $row->id,
+			'platform' => sanitize_key( (string) $row->platform ),
+			'publication_type' => sanitize_key( (string) $row->publication_type ),
+			'title' => sanitize_text_field( (string) $row->title ),
+			'caption' => sanitize_textarea_field( (string) $row->caption ),
+			'description' => sanitize_textarea_field( (string) $row->description ),
+			'hashtags' => sanitize_text_field( (string) $row->hashtags ),
+			'cta' => sanitize_textarea_field( (string) $row->cta ),
+			'media' => json_decode( (string) $row->media_json, true ) ?: array(),
+			'fields' => json_decode( (string) ( $row->fields_json ?? '' ), true ) ?: array(),
+			'field_mapping' => ( new PlatformSchema() )->summarize_fields( (string) $row->platform, json_decode( (string) ( $row->fields_json ?? '' ), true ) ?: array() ),
+			'publish_at' => sanitize_text_field( (string) $row->publish_at ),
+			'status' => sanitize_key( (string) $row->status ),
+		);
+	}
+
+	private function safe_job( object $row ): array {
+		return array(
+			'id' => (int) $row->id,
+			'variant_id' => (int) $row->variant_id,
+			'platform' => sanitize_key( (string) $row->platform ),
+			'job_type' => sanitize_key( (string) $row->job_type ),
+			'status' => sanitize_key( (string) $row->status ),
+			'attempts' => (int) $row->attempts,
+			'scheduled_at' => sanitize_text_field( (string) $row->scheduled_at ),
+			'last_error' => sanitize_textarea_field( (string) $row->last_error ),
+			'publish_mode' => sanitize_key( (string) ( ( json_decode( (string) $row->payload_json, true ) ?: array() )['publish_mode'] ?? '' ) ),
+		);
+	}
+
+}
+
+===== src/Services/LiveStreaming.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+use JKSH\Repositories\LiveStreamRepository;
+use JKSH\Repositories\LogRepository;
+
+final class LiveStreaming {
+	public function readiness(): array {
+		$settings = new Settings();
+		$accounts = new AccountRepository();
+		$facebook = $accounts->connected( 'facebook' );
+		$instagram = $accounts->connected( 'instagram' );
+		$youtube   = $accounts->connected( 'youtube' );
+		$youtube_live = ( new YouTubeLive() )->readiness();
+		$granted = $this->latest_granted_permissions();
+		$fb_required = array( 'publish_video', 'pages_manage_posts', 'pages_show_list', 'pages_read_engagement' );
+		$fb_missing = array_values( array_diff( $fb_required, $granted ) );
+		$youtube_probe = ! empty( $youtube ) ? ( new YouTubeLive() )->probe() : array( 'ok' => false, 'message' => 'YouTube is not connected.' );
+		$worker = ( new LiveWorker() )->readiness( true );
+		return array(
+			'control_plane_ready' => true,
+			'worker' => $worker,
+			'destinations' => array(
+				'facebook' => array(
+					'account_connected' => ! empty( $facebook ),
+					'api_path' => 'Facebook Live Video API',
+					'additional_permissions_required' => $fb_missing,
+					'api_prerequisites_present' => ! empty( $facebook ) && ! $fb_missing,
+					'ready' => false,
+					'note' => ! empty( $facebook ) && ! $fb_missing ? 'OAuth prerequisites are present. A non-publishing API eligibility/provisioning check is still required before the first Facebook Live.' : 'Connection or required permissions are incomplete.',
+				),
+				'instagram' => array(
+					'account_connected' => ! empty( $instagram ),
+					'api_path' => 'Instagram Live Producer / RTMP destination',
+					'per_session_stream_key_required' => true,
+					'ready' => false,
+					'note' => 'The current connector can publish Instagram media, but the live RTMP key is a separate per-broadcast credential and must be supplied when Instagram Live Producer issues it.',
+				),
+				'youtube' => array(
+					'account_connected' => ! empty( $youtube ),
+					'api_probe' => $youtube_probe,
+					'api_path' => 'YouTube Live Streaming API',
+					'oauth_connector_installed' => true,
+					'provisioning_adapter_installed' => true,
+					'dry_run' => (bool) ( $youtube_live['dry_run'] ?? true ),
+					'provisioning_switch_enabled' => (bool) ( $youtube_live['youtube_live_stream_enabled'] ?? false ),
+					'provisioning_possible' => (bool) ( $youtube_live['provisioning_possible'] ?? false ),
+					'ready' => ! empty( $youtube ) && ! empty( $youtube_live['provisioning_possible'] ),
+					'note' => ! empty( $youtube ) ? 'YouTube OAuth and live provisioning adapter are installed. External provisioning remains guarded by Dry Run plus the dedicated YouTube Live switch.' : 'YouTube OAuth connector is installed, but no channel is connected yet.',
+				),
+			),
+		);
+	}
+
+	public function create_draft( array $input ): array|\WP_Error {
+		$title = sanitize_text_field( (string) ( $input['title'] ?? '' ) );
+		if ( '' === $title ) {
+			return new \WP_Error( 'jksh_live_title', 'A live stream title is required.' );
+		}
+		$destinations = array_values( array_intersect( array( 'facebook', 'instagram', 'youtube' ), array_map( 'sanitize_key', (array) ( $input['destinations'] ?? array( 'facebook', 'instagram', 'youtube' ) ) ) ) );
+		if ( ! $destinations ) {
+			return new \WP_Error( 'jksh_live_destination', 'At least one live destination is required.' );
+		}
+		$scheduled = sanitize_text_field( (string) ( $input['scheduled_start_at_utc'] ?? '' ) );
+		if ( $scheduled && ! strtotime( $scheduled . ' UTC' ) ) {
+			return new \WP_Error( 'jksh_live_schedule', 'scheduled_start_at_utc is invalid.' );
+		}
+		$metadata = array(
+			'platform_fields' => $this->sanitize_nested( (array) ( $input['platform_fields'] ?? array() ) ),
+			'orientation' => sanitize_key( (string) ( $input['orientation'] ?? 'adaptive' ) ),
+			'products' => $this->sanitize_nested( (array) ( $input['products'] ?? array() ) ),
+			'location' => $this->sanitize_nested( (array) ( $input['location'] ?? array() ) ),
+			'publish_mode' => 'draft_only',
+		);
+		$id = ( new LiveStreamRepository() )->create(
+			array(
+				'title' => $title,
+				'description' => sanitize_textarea_field( (string) ( $input['description'] ?? '' ) ),
+				'source_type' => sanitize_key( (string) ( $input['source_type'] ?? 'rtmp_input' ) ),
+				'source' => array( 'reference' => sanitize_text_field( (string) ( $input['source_reference'] ?? '' ) ) ),
+				'destinations' => $destinations,
+				'metadata' => $metadata,
+				'status' => 'draft',
+				'scheduled_start_at' => $scheduled ?: null,
+			)
+		);
+		$youtube_preflight = null;
+		if ( in_array( 'youtube', $destinations, true ) ) {
+			$preflight = ( new YouTubeLive() )->preflight( $id );
+			$youtube_preflight = is_wp_error( $preflight ) ? array( 'ok' => false, 'message' => $preflight->get_error_message() ) : $preflight;
+		}
+		return array( 'live_stream_id' => $id, 'status' => 'draft', 'destinations' => $destinations, 'youtube_preflight' => $youtube_preflight, 'readiness' => $this->readiness(), 'note' => 'No live platform was created or modified. Read-only YouTube Live API checks may run in readiness diagnostics.' );
+	}
+
+	public function recent( int $limit = 25 ): array {
+		$rows = ( new LiveStreamRepository() )->recent( $limit );
+		return array( 'count' => count( $rows ), 'streams' => array_map( array( $this, 'safe_stream' ), $rows ) );
+	}
+
+	private function latest_granted_permissions(): array {
+		$logs = ( new LogRepository() )->recent_by_actions( array( 'meta_connect' ), 10 );
+		foreach ( $logs as $log ) {
+			$context = json_decode( (string) $log->context_json, true );
+			if ( is_array( $context ) && ! empty( $context['granted_permissions'] ) && is_array( $context['granted_permissions'] ) ) {
+				return array_values( array_map( 'sanitize_key', $context['granted_permissions'] ) );
+			}
+		}
+		return array();
+	}
+	private function sanitize_nested( array $value ): array {
+		$out = array();
+		foreach ( $value as $key => $item ) {
+			$key = is_string( $key ) ? sanitize_key( $key ) : $key;
+			$out[ $key ] = is_array( $item ) ? $this->sanitize_nested( $item ) : ( is_bool( $item ) || is_int( $item ) || is_float( $item ) || null === $item ? $item : sanitize_textarea_field( (string) $item ) );
+		}
+		return $out;
+	}
+	private function safe_stream( object $row ): array {
+		return array(
+			'id' => (int) $row->id,
+			'title' => sanitize_text_field( (string) $row->title ),
+			'description' => sanitize_textarea_field( (string) $row->description ),
+			'source_type' => sanitize_key( (string) $row->source_type ),
+			'destinations' => json_decode( (string) $row->destinations_json, true ) ?: array(),
+			'metadata' => json_decode( (string) $row->metadata_json, true ) ?: array(),
+			'status' => sanitize_key( (string) $row->status ),
+			'scheduled_start_at' => $row->scheduled_start_at ? sanitize_text_field( (string) $row->scheduled_start_at ) : null,
+			'worker_job_id' => sanitize_text_field( (string) $row->worker_job_id ),
+			'last_error' => sanitize_textarea_field( (string) $row->last_error ),
+		);
+	}
+}
+
+===== src/Services/YouTubeLive.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+use JKSH\Repositories\LiveStreamRepository;
+use JKSH\Repositories\LogRepository;
+
+final class YouTubeLive {
+	private AccountRepository $accounts;
+	private LiveStreamRepository $streams;
+	private YouTubeClient $client;
+	private Settings $settings;
+	private LiveSecretStore $secrets;
+
+	public function __construct() {
+		$this->accounts = new AccountRepository();
+		$this->streams  = new LiveStreamRepository();
+		$this->client   = new YouTubeClient();
+		$this->settings = new Settings();
+		$this->secrets  = new LiveSecretStore();
+	}
+
+	public function readiness(): array {
+		$account = $this->primary_account();
+		return array(
+			'connected' => (bool) $account,
+			'channel' => $account ? array(
+				'name' => sanitize_text_field( (string) $account->account_name ),
+				'external_account_id' => sanitize_text_field( (string) $account->external_account_id ),
+			) : null,
+			'dry_run' => (bool) $this->settings->get( 'dry_run', 1 ),
+			'youtube_live_stream_enabled' => (bool) $this->settings->get( 'youtube_live_stream_enabled', 0 ),
+			'provisioning_possible' => (bool) $account && ! $this->settings->get( 'dry_run', 1 ) && $this->settings->get( 'youtube_live_stream_enabled', 0 ),
+			'api' => array(
+				'broadcast_create' => 'liveBroadcasts.insert',
+				'stream_create' => 'liveStreams.insert',
+				'bind' => 'liveBroadcasts.bind',
+				'transitions' => array( 'testing', 'live', 'complete' ),
+			),
+			'safety' => 'Provisioning is blocked while global Dry Run is ON or the separate YouTube Live Stream switch is OFF. Stream keys are encrypted and never returned by MCP.',
+		);
+	}
+
+	public function probe(): array {
+		$account = $this->primary_account();
+		if ( ! $account ) {
+			return array( 'ok' => false, 'message' => 'No connected YouTube channel.', 'readiness' => $this->readiness() );
+		}
+		$broadcasts = $this->client->list_live_broadcasts( $account, 1 );
+		$streams = $this->client->list_live_streams( $account, 1 );
+		$ok = ! empty( $broadcasts['ok'] ) && ! empty( $streams['ok'] );
+		$result = array(
+			'ok' => $ok,
+			'broadcasts_list' => array(
+				'ok' => ! empty( $broadcasts['ok'] ),
+				'status' => (int) ( $broadcasts['status'] ?? 0 ),
+				'count' => is_array( $broadcasts['data']['items'] ?? null ) ? count( $broadcasts['data']['items'] ) : 0,
+				'message' => sanitize_textarea_field( (string) ( $broadcasts['message'] ?? '' ) ),
+			),
+			'streams_list' => array(
+				'ok' => ! empty( $streams['ok'] ),
+				'status' => (int) ( $streams['status'] ?? 0 ),
+				'count' => is_array( $streams['data']['items'] ?? null ) ? count( $streams['data']['items'] ) : 0,
+				'message' => sanitize_textarea_field( (string) ( $streams['message'] ?? '' ) ),
+			),
+			'note' => 'Read-only YouTube Live API probe. No broadcast or stream was created or modified.',
+		);
+		( new LogRepository() )->add( array(
+			'action' => 'youtube_live_probe',
+			'result' => $ok ? 'success' : 'failed',
+			'message' => $ok ? 'YouTube Live API read probe succeeded.' : 'YouTube Live API read probe failed.',
+			'context' => array( 'broadcast_status' => (int) ( $broadcasts['status'] ?? 0 ), 'stream_status' => (int) ( $streams['status'] ?? 0 ) ),
+		) );
+		return $result;
+	}
+
+	public function preflight( int $live_stream_id ): array|\WP_Error {
+		$row = $this->streams->get( $live_stream_id );
+		if ( ! $row ) {
+			return new \WP_Error( 'jksh_live_missing', 'Live stream draft not found.' );
+		}
+		$destinations = json_decode( (string) $row->destinations_json, true );
+		if ( ! is_array( $destinations ) || ! in_array( 'youtube', $destinations, true ) ) {
+			return new \WP_Error( 'jksh_live_youtube_missing', 'This live stream draft does not target YouTube.' );
+		}
+		$metadata = json_decode( (string) $row->metadata_json, true );
+		$metadata = is_array( $metadata ) ? $metadata : array();
+		if ( ! empty( $metadata['youtube']['broadcast_id'] ) || ! empty( $metadata['youtube']['stream_id'] ) ) {
+			return new \WP_Error( 'jksh_live_already_provisioned', 'This draft already contains YouTube provisioning IDs.' );
+		}
+		$title = sanitize_text_field( (string) $row->title );
+		if ( '' === $title || $this->strlen( $title ) > 100 ) {
+			return new \WP_Error( 'jksh_live_title', 'YouTube Live title must be between 1 and 100 characters.' );
+		}
+		$scheduled = (string) $row->scheduled_start_at;
+		$scheduled_ts = $scheduled ? strtotime( $scheduled . ' UTC' ) : false;
+		if ( false === $scheduled_ts || $scheduled_ts <= time() + 60 ) {
+			return new \WP_Error( 'jksh_live_schedule', 'YouTube Live scheduled start must be at least one minute in the future.' );
+		}
+		$fields = $this->youtube_fields( $metadata );
+		$privacy = sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) );
+		if ( ! in_array( $privacy, array( 'private', 'unlisted', 'public' ), true ) ) {
+			return new \WP_Error( 'jksh_live_privacy', 'YouTube Live privacy_status must be private, unlisted or public.' );
+		}
+		$resolution = sanitize_key( (string) ( $fields['resolution'] ?? '1080p' ) );
+		$frame_rate = sanitize_key( (string) ( $fields['frame_rate'] ?? '30fps' ) );
+		if ( ! in_array( $resolution, array( '240p', '360p', '480p', '720p', '1080p', '1440p', '2160p', 'variable' ), true ) ) {
+			return new \WP_Error( 'jksh_live_resolution', 'Unsupported YouTube Live resolution.' );
+		}
+		if ( ! in_array( $frame_rate, array( '30fps', '60fps', 'variable' ), true ) ) {
+			return new \WP_Error( 'jksh_live_framerate', 'Unsupported YouTube Live frame rate.' );
+		}
+		return array(
+			'ok' => true,
+			'live_stream_id' => (int) $row->id,
+			'platform' => 'youtube',
+			'title' => $title,
+			'scheduled_start_at_utc' => gmdate( 'c', $scheduled_ts ),
+			'privacy_status' => $privacy,
+			'resolution' => $resolution,
+			'frame_rate' => $frame_rate,
+			'ingestion_type' => 'rtmp',
+			'made_for_kids' => (bool) ( $fields['made_for_kids'] ?? false ),
+			'note' => 'Local preflight only. No YouTube resource was created.',
+		);
+	}
+
+	public function provision( array $input ): array|\WP_Error {
+		$id = absint( $input['live_stream_id'] ?? 0 );
+		if ( empty( $input['confirm'] ) ) {
+			return new \WP_Error( 'jksh_live_confirm', 'confirm=true is required before provisioning YouTube Live resources.' );
+		}
+		if ( $this->settings->get( 'dry_run', 1 ) ) {
+			return new \WP_Error( 'jksh_live_dry_run', 'YouTube Live provisioning is blocked while global Dry Run is ON.' );
+		}
+		if ( ! $this->settings->get( 'youtube_live_stream_enabled', 0 ) ) {
+			return new \WP_Error( 'jksh_live_switch', 'YouTube Live Stream provisioning master switch is OFF.' );
+		}
+		$preflight = $this->preflight( $id );
+		if ( is_wp_error( $preflight ) ) {
+			return $preflight;
+		}
+		$row = $this->streams->get( $id );
+		$metadata = json_decode( (string) $row->metadata_json, true );
+		$metadata = is_array( $metadata ) ? $metadata : array();
+		$fields = $this->youtube_fields( $metadata );
+		$account = $this->primary_account();
+		if ( ! $account ) {
+			return new \WP_Error( 'jksh_live_account', 'No connected YouTube channel.' );
+		}
+
+		$broadcast_body = array(
+			'snippet' => array(
+				'title' => sanitize_text_field( (string) $row->title ),
+				'description' => sanitize_textarea_field( (string) $row->description ),
+				'scheduledStartTime' => (string) $preflight['scheduled_start_at_utc'],
+			),
+			'status' => array(
+				'privacyStatus' => (string) $preflight['privacy_status'],
+				'selfDeclaredMadeForKids' => (bool) $preflight['made_for_kids'],
+			),
+			'contentDetails' => array(
+				'enableAutoStart' => false,
+				'enableAutoStop' => false,
+				'enableDvr' => true,
+				'enableEmbed' => true,
+				'recordFromStart' => true,
+				'monitorStream' => array( 'enableMonitorStream' => true, 'broadcastStreamDelayMs' => 0 ),
+			),
+		);
+		if ( ! empty( $fields['category_id'] ) ) {
+			$broadcast_body['snippet']['categoryId'] = sanitize_text_field( (string) $fields['category_id'] );
+		}
+		$broadcast = $this->client->create_live_broadcast( $account, $broadcast_body );
+		if ( empty( $broadcast['ok'] ) || empty( $broadcast['data']['id'] ) ) {
+			return $this->provision_failure( 'YouTube liveBroadcasts.insert failed.', $broadcast );
+		}
+		$broadcast_id = sanitize_text_field( (string) $broadcast['data']['id'] );
+
+		$stream = $this->client->create_live_stream(
+			$account,
+			array(
+				'snippet' => array(
+					'title' => sanitize_text_field( (string) $row->title ) . ' ingest',
+					'description' => 'JK Social Hub managed RTMP ingest stream.',
+				),
+				'cdn' => array(
+					'frameRate' => (string) $preflight['frame_rate'],
+					'ingestionType' => 'rtmp',
+					'resolution' => (string) $preflight['resolution'],
+				),
+				'contentDetails' => array( 'isReusable' => false ),
+			)
+		);
+		if ( empty( $stream['ok'] ) || empty( $stream['data']['id'] ) ) {
+			$this->client->delete_live_broadcast( $account, $broadcast_id );
+			return $this->provision_failure( 'YouTube liveStreams.insert failed. Broadcast creation was rolled back.', $stream );
+		}
+		$stream_id = sanitize_text_field( (string) $stream['data']['id'] );
+		$bind = $this->client->bind_live_broadcast( $account, $broadcast_id, $stream_id );
+		if ( empty( $bind['ok'] ) ) {
+			$this->client->delete_live_stream( $account, $stream_id );
+			$this->client->delete_live_broadcast( $account, $broadcast_id );
+			return $this->provision_failure( 'YouTube liveBroadcasts.bind failed. Created resources were rolled back.', $bind );
+		}
+
+		$ingestion = (array) ( $stream['data']['cdn']['ingestionInfo'] ?? array() );
+		$stream_name = sanitize_text_field( (string) ( $ingestion['streamName'] ?? '' ) );
+		if ( '' === $stream_name ) {
+			$this->client->delete_live_stream( $account, $stream_id );
+			$this->client->delete_live_broadcast( $account, $broadcast_id );
+			return new \WP_Error( 'jksh_live_no_stream_key', 'YouTube did not return a stream name/key. Created resources were rolled back.' );
+		}
+		$this->secrets->put( $id, 'youtube', array( 'stream_name' => $stream_name ) );
+		$metadata['youtube'] = array(
+			'broadcast_id' => $broadcast_id,
+			'stream_id' => $stream_id,
+			'watch_url' => 'https://www.youtube.com/watch?v=' . rawurlencode( $broadcast_id ),
+			'ingestion_address' => sanitize_text_field( (string) ( $ingestion['ingestionAddress'] ?? '' ) ),
+			'backup_ingestion_address' => sanitize_text_field( (string) ( $ingestion['backupIngestionAddress'] ?? '' ) ),
+			'rtmps_ingestion_address' => sanitize_text_field( (string) ( $ingestion['rtmpsIngestionAddress'] ?? '' ) ),
+			'rtmps_backup_ingestion_address' => sanitize_text_field( (string) ( $ingestion['rtmpsBackupIngestionAddress'] ?? '' ) ),
+			'life_cycle_status' => sanitize_key( (string) ( $bind['data']['status']['lifeCycleStatus'] ?? 'ready' ) ),
+			'stream_status' => sanitize_key( (string) ( $stream['data']['status']['streamStatus'] ?? 'inactive' ) ),
+			'provisioned_at_utc' => gmdate( 'c' ),
+			'stream_key_encrypted' => true,
+		);
+		$this->streams->update( $id, array( 'metadata' => $metadata, 'status' => 'provisioned', 'last_error' => '' ) );
+		( new LogRepository() )->add( array(
+			'action' => 'youtube_live_provision',
+			'result' => 'success',
+			'external_id' => $broadcast_id,
+			'external_url' => 'https://www.youtube.com/watch?v=' . rawurlencode( $broadcast_id ),
+			'message' => 'YouTube live broadcast and RTMP stream were created and bound.',
+			'context' => array( 'live_stream_id' => $id, 'broadcast_id' => $broadcast_id, 'stream_id' => $stream_id, 'stream_key_encrypted' => true ),
+		) );
+		return array(
+			'ok' => true,
+			'live_stream_id' => $id,
+			'broadcast_id' => $broadcast_id,
+			'stream_id' => $stream_id,
+			'watch_url' => 'https://www.youtube.com/watch?v=' . rawurlencode( $broadcast_id ),
+			'status' => 'provisioned',
+			'stream_key_returned' => false,
+			'note' => 'YouTube resources were provisioned and bound. The RTMP stream key is encrypted for the future worker and is never returned by MCP.',
+		);
+	}
+
+	private function youtube_fields( array $metadata ): array {
+		$fields = (array) ( $metadata['platform_fields']['youtube'] ?? array() );
+		return $fields;
+	}
+	private function primary_account(): ?object {
+		$items = $this->accounts->connected( 'youtube' );
+		return $items ? $items[0] : null;
+	}
+	private function strlen( string $value ): int {
+		return function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value );
+	}
+	private function provision_failure( string $prefix, array $response ): \WP_Error {
+		$message = sanitize_textarea_field( (string) ( $response['message'] ?? 'Unknown YouTube Live API error.' ) );
+		return new \WP_Error( 'jksh_youtube_live_api', $prefix . ' ' . $message, array( 'status' => (int) ( $response['status'] ?? 0 ) ) );
+	}
+}
