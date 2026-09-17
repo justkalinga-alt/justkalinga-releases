@@ -1,0 +1,49 @@
+name: Assemble Bridge 0.8.2 exact package
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/assemble-jkssb-082.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Assemble and verify exact Bridge ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat staging/jkssb082full/part{00,01,02,03,04,05,06}.b64 | base64 -d > /tmp/jkssb082.zip
+          EXPECT='a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd'
+          ACTUAL="$(sha256sum /tmp/jkssb082.zip | awk '{print $1}')"
+          test "$ACTUAL" = "$EXPECT"
+          test "$(stat -c%s /tmp/jkssb082.zip)" = '40201'
+          unzip -t /tmp/jkssb082.zip
+          unzip -p /tmp/jkssb082.zip jk-social-supabase-bridge/jk-social-supabase-bridge.php > /tmp/jkssb082.php
+          php -l /tmp/jkssb082.php
+          grep -q 'Version: 0.8.2' /tmp/jkssb082.php
+          grep -q "add_shortcode( 'jk_social_upload'" /tmp/jkssb082.php
+          mkdir -p dist reports
+          cp /tmp/jkssb082.zip dist/jk-social-supabase-bridge-v0.8.2.zip
+          printf '%s\n' 'JK Social Supabase Bridge v0.8.2' "sha256=$ACTUAL" 'bytes=40201' 'shortcode=[jk_social_upload]' > reports/jkssb-082-manifest.txt
+      - name: Commit distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-supabase-bridge-v0.8.2.zip reports/jkssb-082-manifest.txt
+          if git diff --cached --quiet; then
+            echo 'Bridge 0.8.2 dist already current.'
+          else
+            git commit -m 'Publish Bridge 0.8.2 exact package'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
