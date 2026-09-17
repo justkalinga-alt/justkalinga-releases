@@ -1,0 +1,13 @@
+{
+  "name": "jksh-live-relay-worker-back4app",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node worker.mjs",
+    "check": "node --check worker.mjs"
+  }
+}
