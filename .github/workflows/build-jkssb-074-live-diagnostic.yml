@@ -1,0 +1,106 @@
+name: Build Bridge 0.7.4 live diagnostic
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/build-jkssb-074-live-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact live Bridge 0.7.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/source.zip
+          rm -rf /tmp/work
+          mkdir -p /tmp/work
+          unzip -q /tmp/source.zip -d /tmp/work
+          test -f /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+
+      - name: Patch one read-only diagnostic ability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php')
+          s=p.read_text()
+          s=s.replace(' * Version: 0.7.3', ' * Version: 0.7.4', 1)
+          s=s.replace("const VERSION  = '0.7.3';", "const VERSION  = '0.7.4';", 1)
+          marker="""        wp_register_ability( 'jk-social-supabase/get-readiness', array("""
+          if marker not in s:
+              raise SystemExit('registration marker missing')
+          registration="""
+        wp_register_ability( 'jk-social-supabase/diagnose-mosmcp-admin-bootstrap', array(
+            'label'               => 'Diagnose miniOrange Admin Bootstrap',
+            'description'         => 'Read-only diagnostic that invokes the miniOrange admin bootstrap builder and returns only a sanitized exception summary if it fails.',
+            'category'            => 'jk-social-supabase',
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_diagnose_mosmcp_admin_bootstrap' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+"""
+          s=s.replace(marker, registration+marker, 1)
+          method_marker="""    public function ability_update_readiness() {"""
+          if method_marker not in s:
+              raise SystemExit('method marker missing')
+          method=r'''    public function ability_diagnose_mosmcp_admin_bootstrap( $input = array() ) {
+        $class = '\\MoSMCP\\Common\\Views\\Admin\\Admin_App';
+        if ( ! class_exists( $class ) ) {
+            return array( 'ok' => false, 'stage' => 'class_lookup', 'message' => 'miniOrange Admin_App class is not loaded.' );
+        }
+        try {
+            $ref = new ReflectionClass( $class );
+            if ( ! $ref->hasMethod( 'build_bootstrap' ) ) {
+                return array( 'ok' => false, 'stage' => 'method_lookup', 'message' => 'build_bootstrap method is unavailable.' );
+            }
+            $m = $ref->getMethod( 'build_bootstrap' );
+            $m->setAccessible( true );
+            $data = $m->invoke( null );
+            $keys = is_array( $data ) ? array_values( array_map( 'strval', array_keys( $data ) ) ) : array();
+            $count = ( is_array( $data ) && isset( $data['abilities'] ) && is_array( $data['abilities'] ) ) ? count( $data['abilities'] ) : 0;
+            return array( 'ok' => true, 'stage' => 'build_bootstrap', 'bootstrap_keys' => $keys, 'abilities_count' => $count );
+        } catch ( Throwable $e ) {
+            $file = (string) $e->getFile();
+            if ( defined( 'ABSPATH' ) && 0 === strpos( $file, ABSPATH ) ) {
+                $file = ltrim( substr( $file, strlen( ABSPATH ) ), '/\\' );
+            }
+            return array(
+                'ok' => false,
+                'stage' => 'build_bootstrap',
+                'exception_class' => get_class( $e ),
+                'message' => sanitize_text_field( $e->getMessage() ),
+                'file' => sanitize_text_field( $file ),
+                'line' => (int) $e->getLine(),
+            );
+        }
+    }
+
+'''
+          s=s.replace(method_marker, method+method_marker, 1)
+          p.write_text(s)
+          PY
+
+      - name: Lint and build exact ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -l /tmp/work/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          cd /tmp/work
+          zip -qr /tmp/jk-social-supabase-bridge-v0.7.4-diagnostic.zip jk-social-supabase-bridge
+          echo "SHA256=$(sha256sum /tmp/jk-social-supabase-bridge-v0.7.4-diagnostic.zip | awk '{print $1}')"
+          echo "SIZE=$(stat -c%s /tmp/jk-social-supabase-bridge-v0.7.4-diagnostic.zip)"
+          echo 'BASE64_BEGIN'
+          base64 -w0 /tmp/jk-social-supabase-bridge-v0.7.4-diagnostic.zip
+          echo
+          echo 'BASE64_END'
