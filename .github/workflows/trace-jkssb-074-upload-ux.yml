@@ -1,0 +1,60 @@
+name: Trace live Bridge 0.7.4 upload UX
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/trace-jkssb-074-upload-ux.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact live Bridge 0.7.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --connect-timeout 15 \
+            'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/recover-jksh-bridge-073/dist/jk-social-supabase-bridge-v0.7.4.zip' \
+            -o /tmp/bridge.zip
+          test "$(sha256sum /tmp/bridge.zip | awk '{print $1}')" = '36c51441fb4cdd7ef0ec210896bacbeb5f0bc50f35c21d4a89695fb346223f3a'
+          rm -rf /tmp/bridge && mkdir -p /tmp/bridge
+          unzip -q /tmp/bridge.zip -d /tmp/bridge
+          php -l /tmp/bridge/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+
+      - name: Print upload and bundle code neighborhoods
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/bridge/jk-social-supabase-bridge/jk-social-supabase-bridge.php')
+          lines=p.read_text(errors='replace').splitlines()
+          terms=[
+            'Social Upload','render_upload','upload page','bundle_id','attachment_ids','asset_ids',
+            'instructions','add_to_story','highlight_name','product_refs','queue_upload_draft',
+            'begin_direct_upload','finalize_direct_upload','return=compose','Use in Composer',
+            'Master title','Content idea','platforms','content_type','duration_ms','width','height',
+            'admin_menu','add_menu_page','add_submenu_page'
+          ]
+          hits=[]
+          for i,line in enumerate(lines,1):
+            low=line.lower()
+            if any(t.lower() in low for t in terms): hits.append(i)
+          print('TOTAL_LINES',len(lines))
+          print('HITS',hits)
+          covered=set()
+          for i in hits:
+            a=max(1,i-10); b=min(len(lines),i+28)
+            if sum(1 for n in range(a,b+1) if n in covered) > (b-a)//2:
+              continue
+            print(f'===== {a}-{b} =====')
+            for n in range(a,b+1):
+              print(f'{n}: {lines[n-1]}')
+              covered.add(n)
+          PY
