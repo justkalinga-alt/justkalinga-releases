@@ -10,10 +10,39 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      -
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+
+      - name: Download exact verified artifact bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://sdmntprindiasocentral.oaiusercontent.com/files/00000000-f460-8211-8a7e-196f04acba50/raw?se=2026-09-17T17%3A51%3A54Z&sp=r&sv=2026-02-06&sr=b&scid=149b0ab0-d89c-5c83-8fd5-699ebde0ec5c&skoid=3cb6de21-012a-49c9-9402-a1ebf8d0bd06&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-17T00%3A35%3A18Z&ske=2026-09-18T00%3A35%3A18Z&sks=b&skv=2026-02-06&sig=AwY9MAZi/BaC3yrsIJx2VtHGjThDkW2kzwqJAThaTGM%3D' -o /tmp/artifact.zip
+          rm -rf /tmp/art && mkdir -p /tmp/art
+          unzip -q /tmp/artifact.zip -d /tmp/art
+          ZIP=/tmp/art/jk-social-supabase-bridge-v0.7.4.zip
+          test -f "$ZIP"
+          test "$(sha256sum "$ZIP" | awk '{print $1}')" = '36c51441fb4cdd7ef0ec210896bacbeb5f0bc50f35c21d4a89695fb346223f3a'
+          unzip -t "$ZIP"
+          mkdir -p dist
+          cp "$ZIP" dist/jk-social-supabase-bridge-v0.7.4.zip
+
+      - name: Commit exact dist ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Repair Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-supabase-bridge-v0.7.4.zip
+          if git diff --cached --quiet; then
+            echo 'dist ZIP already current'
+          else
+            git commit -m 'Add exact verified Bridge 0.7.4 repair ZIP'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
