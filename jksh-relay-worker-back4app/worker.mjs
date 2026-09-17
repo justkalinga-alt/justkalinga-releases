@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { URL } from 'node:url';
 
-const VERSION = '0.1.2-back4app';
+const VERSION = '0.1.3-back4app';
 const CONTRACT = 'jksh-relay-v1';
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC_KEY_B64 = process.env.JKSH_PUBLIC_KEY_B64 || '';
@@ -89,7 +89,7 @@ function validStreamUrl(value, source = false) {
   if (typeof value !== 'string' || value.length < 8 || value.length > 4096) return false;
   let url;
   try { url = new URL(value); } catch { return false; }
-  const protocols = source ? new Set(['http:', 'https:', 'rtmp:', 'rtmps:', 'srt:']) : new Set(['rtmp:', 'rtmps:']);
+  const protocols = source ? new Set(['rtmp:', 'rtmps:', 'srt:', 'http:', 'https:']) : new Set(['rtmp:', 'rtmps:']);
   if (!protocols.has(url.protocol)) return false;
   if (source && ALLOWED_SOURCE_HOSTS.size && !ALLOWED_SOURCE_HOSTS.has(url.hostname.toLowerCase())) return false;
   return true;
@@ -119,14 +119,6 @@ function ffmpegArgs(sourceUrl, outputUrl, mode) {
   }
   base.push('-f', 'flv', outputUrl);
   return base;
-}
-
-function maybeFinalizeStopped(job) {
-  const alive = [...job.outputs.values()].some(v => v.child || v.timer);
-  if (!alive) {
-    job.state = 'stopped';
-    job.stoppedAt = new Date().toISOString();
-  }
 }
 
 function spawnDestination(job, platform, url) {
@@ -162,6 +154,14 @@ function spawnDestination(job, platform, url) {
       job.state = [...job.outputs.values()].some(v => ['running', 'restarting'].includes(v.state)) ? 'degraded' : 'failed';
     }
   });
+}
+
+function maybeFinalizeStopped(job) {
+  const alive = [...job.outputs.values()].some(v => v.child || v.timer);
+  if (!alive) {
+    job.state = 'stopped';
+    job.stoppedAt = new Date().toISOString();
+  }
 }
 
 function startJob(payload) {
@@ -224,13 +224,25 @@ async function handler(req, res) {
       limitation: 'Back4App public ingress is HTTP(S); this container does not provide a public RTMP ingest listener.'
     });
   }
-  if (req.method !== 'POST' || !['/v1/jobs/start', '/v1/jobs/stop', '/v1/jobs/status'].includes(path)) return json(res, 404, { error: 'not_found' });
+  if (req.method !== 'POST' || !['/v1/ping', '/v1/jobs/start', '/v1/jobs/stop', '/v1/jobs/status'].includes(path)) return json(res, 404, { error: 'not_found' });
   let raw;
   try { raw = await readBody(req); } catch { return json(res, 413, { error: 'request_too_large' }); }
   const auth = verifySignedRequest(req, raw);
   if (!auth.ok) return json(res, 401, { error: auth.message });
   const payload = parseJson(raw);
   if (!payload) return json(res, 400, { error: 'invalid_json' });
+  if (path === '/v1/ping') {
+    return json(res, 200, {
+      ok: true,
+      message: 'signed_handshake_ok',
+      service: 'jksh-live-relay-worker',
+      runtime: 'back4app-container',
+      version: VERSION,
+      contract: CONTRACT,
+      paired: Boolean(PUBLIC_KEY_PEM),
+      active_jobs: [...jobs.values()].filter(j => !['stopped', 'failed'].includes(j.state)).length
+    });
+  }
   if (path === '/v1/jobs/start') {
     const out = startJob(payload);
     if (out.error) return json(res, out.error === 'job_already_active' ? 409 : 400, { error: out.error });
