@@ -1,0 +1,58 @@
+name: Scan JK Social Hub 0.8.3 time handling
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/scan-jksh-083-time.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Fetch exact live export
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-hub-live-v0.8.3-export.zip'
+          EXPECT='89ebebfa96a169d5ee8d46ee1456255da880f7aea0f93ff1dd9abe6ce9f4e202'
+          curl -fL --retry 4 --retry-all-errors "$URL" -o /tmp/jksh083.zip
+          test "$(sha256sum /tmp/jksh083.zip | awk '{print $1}')" = "$EXPECT"
+          rm -rf /tmp/jksh083 && mkdir -p /tmp/jksh083
+          unzip -q /tmp/jksh083.zip -d /tmp/jksh083
+          test -f /tmp/jksh083/jk-social-hub/jk-social-hub.php
+      - name: Build time scan report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          {
+            echo '# JK Social Hub 0.8.3 time scan'
+            echo
+            echo '## UTC / scheduling references'
+            grep -RInE 'UTC|scheduled_at_utc|publish_at_utc|gmdate|current_time\(|wp_date\(|DateTimeZone|timezone' /tmp/jksh083/jk-social-hub --include='*.php' --include='*.js' --include='*.css' || true
+            echo
+            echo '## User-facing time labels'
+            grep -RInE 'Time UTC|Publish UTC|UTC time|Schedule|Scheduled|Calendar|Logs|Queue' /tmp/jksh083/jk-social-hub --include='*.php' --include='*.js' || true
+            echo
+            echo '## Files'
+            find /tmp/jksh083/jk-social-hub -type f | sed 's#/tmp/jksh083/##' | sort
+          } > reports/jksh-083-time-scan.txt
+      - name: Commit report
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add reports/jksh-083-time-scan.txt
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add JK Social Hub 0.8.3 time scan'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
