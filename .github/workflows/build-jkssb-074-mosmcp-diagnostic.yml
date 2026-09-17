@@ -1,0 +1,117 @@
+name: Build JKSSB 0.7.4 miniOrange diagnostic
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/build-jkssb-074-mosmcp-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Download exact live Bridge 0.7.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-supabase-bridge-v0.7.3.zip' -o /tmp/base.zip
+          rm -rf /tmp/jkssb && mkdir -p /tmp/jkssb
+          unzip -q /tmp/base.zip -d /tmp/jkssb
+      - name: Patch diagnostic ability
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/jkssb/jk-social-supabase-bridge/jk-social-supabase-bridge.php')
+          s=p.read_text()
+          s=s.replace('Version: 0.7.3','Version: 0.7.4',1)
+          s=s.replace("const VERSION  = '0.7.3';","const VERSION  = '0.7.4';",1)
+          marker="        wp_register_ability( 'jk-social-supabase/get-readiness', array("
+          reg="""        wp_register_ability( 'jk-social-supabase/diagnose-mosmcp-admin', array(
+            'label'               => 'Diagnose miniOrange Admin Bootstrap',
+            'description'         => 'Runs the miniOrange admin bootstrap builder inside a read-only Throwable guard and returns only sanitized diagnostic information.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array( 'type' => 'object', 'properties' => array(), 'additionalProperties' => false ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_diagnose_mosmcp_admin' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true, 'destructive' => false, 'idempotent' => true ) ) ),
+        ) );
+
+"""
+          if marker not in s: raise SystemExit('registration marker not found')
+          s=s.replace(marker,reg+marker,1)
+          endmarker="\n}\n\nregister_activation_hook( __FILE__, array( 'JKSSB_Bridge', 'activate' ) );"
+          method="""
+
+    public function ability_diagnose_mosmcp_admin( $input = array() ) {
+        $class = '\\MoSMCP\\Common\\Views\\Admin\\Admin_App';
+        if ( ! class_exists( $class ) ) {
+            return array( 'ok' => false, 'stage' => 'class_lookup', 'message' => 'miniOrange Admin_App class is not loaded.' );
+        }
+        try {
+            $ref = new ReflectionClass( $class );
+            if ( ! $ref->hasMethod( 'build_bootstrap' ) ) {
+                return array( 'ok' => false, 'stage' => 'method_lookup', 'message' => 'build_bootstrap method is unavailable.' );
+            }
+            $method = $ref->getMethod( 'build_bootstrap' );
+            if ( method_exists( $method, 'setAccessible' ) ) {
+                $method->setAccessible( true );
+            }
+            $bootstrap = $method->invoke( null );
+            $json = wp_json_encode( $bootstrap );
+            return array(
+                'ok' => true,
+                'stage' => 'bootstrap_complete',
+                'bootstrap_type' => gettype( $bootstrap ),
+                'bootstrap_keys' => is_array( $bootstrap ) ? array_values( array_map( 'strval', array_keys( $bootstrap ) ) ) : array(),
+                'json_encode_ok' => false !== $json,
+                'json_last_error' => json_last_error_msg(),
+            );
+        } catch ( Throwable $e ) {
+            return array(
+                'ok' => false,
+                'stage' => 'bootstrap_exception',
+                'exception_class' => get_class( $e ),
+                'message' => sanitize_text_field( $e->getMessage() ),
+                'file' => basename( $e->getFile() ),
+                'line' => (int) $e->getLine(),
+            );
+        }
+    }
+"""
+          if endmarker not in s: raise SystemExit('class end marker not found')
+          s=s.replace(endmarker,method+endmarker,1)
+          p.write_text(s)
+          PY
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -l /tmp/jkssb/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          cd /tmp/jkssb
+          zip -qr /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip jk-social-supabase-bridge
+          unzip -t /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip
+          sha256sum /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip | tee /tmp/sha.txt
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics"
+          base64 -w 0 /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip > "$GITHUB_WORKSPACE/diagnostics/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip.b64"
+          cp /tmp/sha.txt "$GITHUB_WORKSPACE/diagnostics/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.sha256.txt"
+      - name: Commit temporary transport files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'justkalinga-alt'
+          git config user.email 'justkalinga@gmail.com'
+          git add diagnostics/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip.b64 diagnostics/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.sha256.txt
+          git commit -m 'Stage temporary Bridge 0.7.4 diagnostic package' || exit 0
+          git push origin HEAD:recover-jksh-bridge-073
