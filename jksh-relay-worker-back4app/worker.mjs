@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { URL } from 'node:url';
 
-const VERSION = '0.1.3-back4app';
+const VERSION = '0.1.4-back4app';
 const CONTRACT = 'jksh-relay-v1';
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC_KEY_B64 = process.env.JKSH_PUBLIC_KEY_B64 || '';
@@ -210,6 +210,8 @@ function stopJob(jobId) {
 
 async function handler(req, res) {
   const path = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;
+  const routeHeader = String(req.headers['x-jksh-route'] || '');
+  const route = (req.method === 'POST' && path === '/' && routeHeader) ? routeHeader : path;
   if (req.method === 'GET' && ['/', '/health', '/v1/health'].includes(path)) {
     return json(res, 200, {
       ok: true,
@@ -220,18 +222,18 @@ async function handler(req, res) {
       paired: Boolean(PUBLIC_KEY_PEM),
       key_id: KEY_ID || null,
       active_jobs: [...jobs.values()].filter(j => !['stopped', 'failed'].includes(j.state)).length,
-      capabilities: ['http-source', 'https-source', 'rtmp-pull', 'rtmps-pull', 'srt-pull', 'copy', 'transcode', 'multi-destination'],
+      capabilities: ['http-source', 'https-source', 'rtmp-pull', 'rtmps-pull', 'srt-pull', 'copy', 'transcode', 'multi-destination', 'root-route-fallback'],
       limitation: 'Back4App public ingress is HTTP(S); this container does not provide a public RTMP ingest listener.'
     });
   }
-  if (req.method !== 'POST' || !['/v1/ping', '/v1/jobs/start', '/v1/jobs/stop', '/v1/jobs/status'].includes(path)) return json(res, 404, { error: 'not_found' });
+  if (req.method !== 'POST' || !['/v1/ping', '/v1/jobs/start', '/v1/jobs/stop', '/v1/jobs/status'].includes(route)) return json(res, 404, { error: 'not_found' });
   let raw;
   try { raw = await readBody(req); } catch { return json(res, 413, { error: 'request_too_large' }); }
   const auth = verifySignedRequest(req, raw);
   if (!auth.ok) return json(res, 401, { error: auth.message });
   const payload = parseJson(raw);
   if (!payload) return json(res, 400, { error: 'invalid_json' });
-  if (path === '/v1/ping') {
+  if (route === '/v1/ping') {
     return json(res, 200, {
       ok: true,
       message: 'signed_handshake_ok',
@@ -243,13 +245,13 @@ async function handler(req, res) {
       active_jobs: [...jobs.values()].filter(j => !['stopped', 'failed'].includes(j.state)).length
     });
   }
-  if (path === '/v1/jobs/start') {
+  if (route === '/v1/jobs/start') {
     const out = startJob(payload);
     if (out.error) return json(res, out.error === 'job_already_active' ? 409 : 400, { error: out.error });
     return json(res, 202, { ok: true, message: 'relay_job_started', job: safeJob(out.job) });
   }
   const jobId = String(payload.job_id || '');
-  if (path === '/v1/jobs/stop') {
+  if (route === '/v1/jobs/stop') {
     const out = stopJob(jobId);
     if (out.error) return json(res, 404, { error: out.error });
     return json(res, 200, { ok: true, message: 'relay_job_stopping', job: safeJob(out.job) });
