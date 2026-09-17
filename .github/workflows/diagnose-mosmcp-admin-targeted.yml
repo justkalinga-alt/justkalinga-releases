@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   inspect:
@@ -84,23 +84,18 @@ jobs:
           s=s.replace(endmarker,method+endmarker,1)
           p.write_text(s)
           PY
-      - name: Validate and package
+      - name: Validate package and output transport
         shell: bash
         run: |
           set -euo pipefail
           php -l /tmp/jkssb/jk-social-supabase-bridge/jk-social-supabase-bridge.php
           cd /tmp/jkssb
           zip -qr /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip jk-social-supabase-bridge
-          unzip -t /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip
-          sha256sum /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip
-      - name: Stage binary package on recovery branch
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          CONTENT=$(base64 -w 0 /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip)
-          API='https://api.github.com/repos/${{ github.repository }}/contents/diagnostics/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip'
-          PAYLOAD=$(jq -n --arg message 'Stage temporary Bridge 0.7.4 diagnostic ZIP' --arg content "$CONTENT" --arg branch '${{ github.ref_name }}' '{message:$message,content:$content,branch:$branch}')
-          curl -fsS -X PUT -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$API" -d "$PAYLOAD" >/tmp/put.json
-          jq -r '.content.sha' /tmp/put.json
+          unzip -t /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip >/dev/null
+          echo SHA256_START
+          sha256sum /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip | cut -d' ' -f1
+          echo SHA256_END
+          echo BASE64_START
+          base64 -w 0 /tmp/jk-social-supabase-bridge-v0.7.4-mosmcp-diagnostic.zip
+          echo
+          echo BASE64_END
