@@ -1,0 +1,55 @@
+name: Inspect miniOrange admin ability payload
+
+on:
+  push:
+    branches:
+      - recover-jksh-bridge-073
+    paths:
+      - .github/workflows/diagnose-mosmcp-admin-renderer2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download miniOrange
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL 'https://downloads.wordpress.org/plugin/miniorange-secure-mcp-server.1.4.12.zip' -o /tmp/mosmcp.zip
+          mkdir -p /tmp/mosmcp
+          unzip -q /tmp/mosmcp.zip -d /tmp/mosmcp
+      - name: Print admin payload path
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('/tmp/mosmcp/miniorange-secure-mcp-server')
+          p=root/'includes/common/views/admin/class-admin-app.php'
+          lines=p.read_text(errors='replace').splitlines()
+          for a,b in [(1,180),(180,390),(390,620)]:
+              print(f'===== {p.relative_to(root)} {a}-{b} =====')
+              for n in range(a,min(b,len(lines))+1):
+                  print(f'{n}: {lines[n-1]}')
+          print('===== CALL SITES get_abilities_payload =====')
+          for q in root.rglob('*.php'):
+              try: qlines=q.read_text(errors='replace').splitlines()
+              except: continue
+              for i,line in enumerate(qlines,1):
+                  if 'get_abilities_payload' in line:
+                      print(f'{q.relative_to(root)}:{i}: {line.strip()}')
+          print('===== ADMIN BOOTSTRAP / JSON =====')
+          for q in root.rglob('*.php'):
+              try: qlines=q.read_text(errors='replace').splitlines()
+              except: continue
+              for i,line in enumerate(qlines,1):
+                  low=line.lower()
+                  if any(x in low for x in ['wp_localize_script','wp_add_inline_script','wp_json_encode','json_encode']) and ('admin' in str(q).lower() or 'ability' in low or 'bootstrap' in low):
+                      a=max(1,i-5); b=min(len(qlines),i+10)
+                      print(f'--- {q.relative_to(root)} {a}-{b} ---')
+                      for n in range(a,b+1): print(f'{n}: {qlines[n-1]}')
+          PY
