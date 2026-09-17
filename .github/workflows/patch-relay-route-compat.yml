@@ -1,0 +1,52 @@
+name: Patch relay route compatibility
+
+on:
+  push:
+    branches:
+      - jksh-back4app-relay
+    paths:
+      - .github/workflows/patch-relay-route-compat.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-back4app-relay
+      - name: Patch route normalization safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('jksh-relay-worker-back4app/worker.mjs')
+          s=p.read_text()
+          s=s.replace("const VERSION = '0.1.4-back4app';", "const VERSION = '0.1.5-back4app';", 1)
+          old="""async function handler(req, res) {\n  const path = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;\n  const routeHeader = String(req.headers['x-jksh-route'] || '');\n  const route = (req.method === 'POST' && path === '/' && routeHeader) ? routeHeader : path;\n  if (req.method === 'GET' && ['/', '/health', '/v1/health'].includes(path)) {\n"""
+          new="""function normalizeRoute(method, path, routeHeader) {\n  if (method === 'POST' && routeHeader) return routeHeader;\n  if (path === '/') return '/';\n  const aliases = [\n    ['/v1/health', '/v1/health'], ['/health', '/v1/health'],\n    ['/v1/ping', '/v1/ping'], ['/ping', '/v1/ping'],\n    ['/v1/jobs/start', '/v1/jobs/start'], ['/jobs/start', '/v1/jobs/start'],\n    ['/v1/jobs/stop', '/v1/jobs/stop'], ['/jobs/stop', '/v1/jobs/stop'],\n    ['/v1/jobs/status', '/v1/jobs/status'], ['/jobs/status', '/v1/jobs/status']\n  ];\n  for (const [suffix, canonical] of aliases) {\n    if (path === suffix || path.endsWith(suffix)) return canonical;\n  }\n  return path;\n}\n\nasync function handler(req, res) {\n  const path = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname;\n  const routeHeader = String(req.headers['x-jksh-route'] || '');\n  const route = normalizeRoute(req.method, path, routeHeader);\n  if (req.method === 'GET' && ['/', '/v1/health'].includes(route)) {\n"""
+          if old not in s:
+              raise SystemExit('Expected handler block not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          node --check jksh-relay-worker-back4app/worker.mjs
+          grep -q "0.1.5-back4app" jksh-relay-worker-back4app/worker.mjs
+          grep -q "function normalizeRoute" jksh-relay-worker-back4app/worker.mjs
+      - name: Commit worker patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Repair Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add jksh-relay-worker-back4app/worker.mjs
+          if git diff --cached --quiet; then
+            echo 'No changes'
+          else
+            git commit -m 'Relay 0.1.5 route compatibility for Hub probes'
+            git push origin HEAD:jksh-back4app-relay
+          fi
