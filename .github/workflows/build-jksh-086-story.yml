@@ -1,0 +1,70 @@
+name: Build JK Social Hub 0.8.6 Story companion
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/build-jksh-086-story.yml
+      - scripts/build_jksh_086_story.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Verify exact JK Social Hub 0.8.5 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=dist/jk-social-hub-v0.8.5-autopilot.zip
+          test -f "$ZIP"
+          test "$(sha256sum "$ZIP" | awk '{print $1}')" = 'd0dc2aa52293bdd80626dd2a01d24dd484452c522faafd78cc126ab923ed4482'
+          rm -rf /tmp/jksh086
+          mkdir -p /tmp/jksh086
+          unzip -q "$ZIP" -d /tmp/jksh086
+          grep -q 'Version:     0.8.5' /tmp/jksh086/jk-social-hub/jk-social-hub.php
+      - name: Apply Story companion patch
+        run: python3 scripts/build_jksh_086_story.py /tmp/jksh086/jk-social-hub
+      - name: Validate Hub 0.8.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=/tmp/jksh086/jk-social-hub
+          find "$ROOT" -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+          grep -q 'Version:     0.8.6' "$ROOT/jk-social-hub.php"
+          grep -q "omnichannel_v6_2026-09-18" "$ROOT/src/Services/PlatformSchema.php"
+          grep -q "media_type' => 'STORIES'" "$ROOT/src/Services/MetaPublisher.php"
+          grep -q "instagram_story_when_ready" "$ROOT/src/Services/MetaPublisher.php"
+          grep -q "instagram_story_finish" "$ROOT/src/Services/MetaPublisher.php"
+          grep -q "Single-image and carousel posts only" "$ROOT/src/Services/PlatformSchema.php"
+      - name: Package Hub 0.8.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/jksh086
+          zip -qr /tmp/jk-social-hub-v0.8.6-story.zip jk-social-hub
+          unzip -t /tmp/jk-social-hub-v0.8.6-story.zip
+          mkdir -p "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/reports"
+          cp /tmp/jk-social-hub-v0.8.6-story.zip "$GITHUB_WORKSPACE/dist/"
+          SHA="$(sha256sum /tmp/jk-social-hub-v0.8.6-story.zip | awk '{print $1}')"
+          SIZE="$(stat -c%s /tmp/jk-social-hub-v0.8.6-story.zip)"
+          printf '%s\n'             'JK Social Hub v0.8.6 Story companion'             "sha256=$SHA"             "bytes=$SIZE"             'base_version=0.8.5'             'base_sha256=d0dc2aa52293bdd80626dd2a01d24dd484452c522faafd78cc126ab923ed4482'             'features=Instagram companion Story state machine; image/carousel/Reel support; music suggestion schema restricted to image posts'             > "$GITHUB_WORKSPACE/reports/jksh-086-story-manifest.txt"
+      - name: Commit distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-hub-v0.8.6-story.zip reports/jksh-086-story-manifest.txt
+          if git diff --cached --quiet; then
+            echo 'Hub 0.8.6 package already current.'
+          else
+            git commit -m 'Build JK Social Hub 0.8.6 Story companion'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
