@@ -26,3 +26,4 @@ one(
 )
 p.write_text(s)
 print("Bridge 0.8.4 one-click Community handoff patch applied")
+# build trigger
