@@ -167,7 +167,7 @@ req(
 """            'instructions' => sanitize_textarea_field( $payload['instructions'] ?? '' ), 'title' => sanitize_text_field( $payload['title'] ?? '' ),
             'add_to_story' => ! empty( $payload['add_to_story'] ), 'highlight_name' => sanitize_text_field( $payload['highlight_name'] ?? '' ),
             'location' => sanitize_text_field( $payload['location'] ?? '' ),
-            'product_refs' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $payload['product_refs'] ?? array() ) ) ),
+            'product_refs' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $payload['product_refs'] ?? array() ) ) ) ),
             'created_at_utc' => gmdate( 'c' ), 'status' => 'uploaded',""",
 """            'instructions' => sanitize_textarea_field( $payload['instructions'] ?? '' ), 'title' => sanitize_text_field( $payload['title'] ?? '' ),
             'add_to_story' => ! empty( $payload['add_to_story'] ), 'highlight_name' => sanitize_text_field( $payload['highlight_name'] ?? '' ),
