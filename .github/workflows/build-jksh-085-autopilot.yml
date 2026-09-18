@@ -1,0 +1,79 @@
+name: Build JK Social Hub 0.8.5 posting autopilot
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/build-jksh-085-autopilot.yml
+      - scripts/build_jksh_085_autopilot.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+
+      - name: Verify exact JK Social Hub 0.8.4 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=dist/jk-social-hub-v0.8.4-ist.zip
+          test -f "$ZIP"
+          test "$(sha256sum "$ZIP" | awk '{print $1}')" = '857eb0a071351355e7da63a9891b08da5afd80df050c04fb3f96c9fa088eec46'
+          test "$(stat -c%s "$ZIP")" = '91968'
+          rm -rf /tmp/jksh085
+          mkdir -p /tmp/jksh085
+          unzip -q "$ZIP" -d /tmp/jksh085
+          test -f /tmp/jksh085/jk-social-hub/jk-social-hub.php
+
+      - name: Apply native posting autopilot patch
+        run: python3 scripts/build_jksh_085_autopilot.py /tmp/jksh085/jk-social-hub
+
+      - name: Validate JK Social Hub 0.8.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=/tmp/jksh085/jk-social-hub
+          find "$ROOT" -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+          grep -q 'Version:     0.8.5' "$ROOT/jk-social-hub.php"
+          grep -q "define( 'JKSH_VERSION', '0.8.5' );" "$ROOT/jk-social-hub.php"
+          grep -q "omnichannel_v5_2026-09-18" "$ROOT/src/Services/PlatformSchema.php"
+          grep -q "location_query" "$ROOT/src/Services/PlatformSchema.php"
+          grep -q "music_suggestion" "$ROOT/src/Services/PlatformSchema.php"
+          grep -q "product_url" "$ROOT/src/Services/PlatformSchema.php"
+          grep -q "resolve_instagram_location" "$ROOT/src/Services/MetaPublisher.php"
+          grep -q "thumbnails.set" "$ROOT/src/Services/YouTubePublisher.php"
+          grep -q "location_text" "$ROOT/src/Services/YouTubePublisher.php"
+
+      - name: Package JK Social Hub 0.8.5
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/jksh085
+          zip -qr /tmp/jk-social-hub-v0.8.5-autopilot.zip jk-social-hub
+          unzip -t /tmp/jk-social-hub-v0.8.5-autopilot.zip
+          mkdir -p "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/reports"
+          cp /tmp/jk-social-hub-v0.8.5-autopilot.zip "$GITHUB_WORKSPACE/dist/"
+          SHA="$(sha256sum /tmp/jk-social-hub-v0.8.5-autopilot.zip | awk '{print $1}')"
+          SIZE="$(stat -c%s /tmp/jk-social-hub-v0.8.5-autopilot.zip)"
+          printf '%s\n'             'JK Social Hub v0.8.5 native posting autopilot'             "sha256=$SHA"             "bytes=$SIZE"             'base_version=0.8.4'             'base_sha256=857eb0a071351355e7da63a9891b08da5afd80df050c04fb3f96c9fa088eec46'             'features=Instagram location resolver, product URL fallback, YouTube location/product description fallback, thumbnail receipts, schema v5'             > "$GITHUB_WORKSPACE/reports/jksh-085-autopilot-manifest.txt"
+
+      - name: Commit distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-hub-v0.8.5-autopilot.zip reports/jksh-085-autopilot-manifest.txt
+          if git diff --cached --quiet; then
+            echo 'JK Social Hub 0.8.5 package already current.'
+          else
+            git commit -m 'Build JK Social Hub 0.8.5 posting autopilot'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
