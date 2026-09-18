@@ -1,0 +1,80 @@
+name: Build Bridge 0.8.3 posting autopilot
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/build-jkssb-083-autopilot.yml
+      - scripts/build_jkssb_083_autopilot.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+
+      - name: Verify exact Bridge 0.8.2 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=dist/jk-social-supabase-bridge-v0.8.2.zip
+          test -f "$ZIP"
+          test "$(sha256sum "$ZIP" | awk '{print $1}')" = 'a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd'
+          test "$(stat -c%s "$ZIP")" = '40201'
+          rm -rf /tmp/jkssb083
+          mkdir -p /tmp/jkssb083
+          unzip -q "$ZIP" -d /tmp/jkssb083
+          test -f /tmp/jkssb083/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+
+      - name: Apply posting autopilot patch
+        run: python3 scripts/build_jkssb_083_autopilot.py /tmp/jkssb083/jk-social-supabase-bridge
+
+      - name: Validate Bridge 0.8.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          PHP=/tmp/jkssb083/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          php -l "$PHP"
+          grep -q 'Version: 0.8.3' "$PHP"
+          grep -q "const VERSION  = '0.8.3';" "$PHP"
+          grep -q 'Autopilot native fields' "$PHP"
+          grep -q 'music_suggestion' "$PHP"
+          grep -q 'product_url' "$PHP"
+          grep -q 'location_query' "$PHP"
+          grep -q 'media_fields' "$PHP"
+          grep -q 'Preparing automatic video cover' "$PHP"
+          grep -q 'Prepare + open YouTube' "$PHP"
+          grep -q 'jkssb_apply_autopilot_fields' "$PHP"
+
+      - name: Package Bridge 0.8.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/jkssb083
+          zip -qr /tmp/jk-social-supabase-bridge-v0.8.3.zip jk-social-supabase-bridge
+          unzip -t /tmp/jk-social-supabase-bridge-v0.8.3.zip
+          mkdir -p "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/reports"
+          cp /tmp/jk-social-supabase-bridge-v0.8.3.zip "$GITHUB_WORKSPACE/dist/"
+          SHA="$(sha256sum /tmp/jk-social-supabase-bridge-v0.8.3.zip | awk '{print $1}')"
+          SIZE="$(stat -c%s /tmp/jk-social-supabase-bridge-v0.8.3.zip)"
+          printf '%s\n'             'JK Social Supabase Bridge v0.8.3 posting autopilot'             "sha256=$SHA"             "bytes=$SIZE"             'base_version=0.8.2'             'base_sha256=a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd'             'features=media previews, delete, per-image alt, auto cover, product URL, location query, devotional audio suggestion, improved Community handoff'             > "$GITHUB_WORKSPACE/reports/jkssb-083-autopilot-manifest.txt"
+
+      - name: Commit distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-supabase-bridge-v0.8.3.zip reports/jkssb-083-autopilot-manifest.txt
+          if git diff --cached --quiet; then
+            echo 'Bridge 0.8.3 package already current.'
+          else
+            git commit -m 'Build Bridge 0.8.3 posting autopilot'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
