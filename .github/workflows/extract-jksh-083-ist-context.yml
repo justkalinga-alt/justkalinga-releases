@@ -52,6 +52,18 @@ jobs:
             echo '===== src/Services/LiveStreaming.php ====='
             cat "$BASE/src/Services/LiveStreaming.php"
             echo
+            echo '===== src/Services/LiveWorker.php ====='
+            cat "$BASE/src/Services/LiveWorker.php"
+            echo
+            echo '===== src/Services/MetaPublisher.php ====='
+            cat "$BASE/src/Services/MetaPublisher.php"
+            echo
+            echo '===== src/Services/YouTubePublisher.php ====='
+            cat "$BASE/src/Services/YouTubePublisher.php"
+            echo
+            echo '===== src/Services/PlatformSchema.php ====='
+            cat "$BASE/src/Services/PlatformSchema.php"
+            echo
             echo '===== src/Services/YouTubeLive.php ====='
             sed -n '1,300p' "$BASE/src/Services/YouTubeLive.php"
           } > reports/jksh-083-ist-context.txt
