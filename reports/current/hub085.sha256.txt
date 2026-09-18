@@ -1,0 +1,1 @@
+d0dc2aa52293bdd80626dd2a01d24dd484452c522faafd78cc126ab923ed4482  dist/jk-social-hub-v0.8.5-autopilot.zip

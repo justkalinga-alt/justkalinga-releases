@@ -1,0 +1,1 @@
+1c19bc1f280874015ff3a7628e9dee7a1a7552df022f662212e694f3bfdb7845  dist/jk-social-supabase-bridge-v0.8.3.zip

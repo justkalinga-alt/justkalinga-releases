@@ -1,0 +1,684 @@
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+
+final class MetaPublisher {
+	private AccountRepository $accounts;
+	private MediaResolver $media;
+
+	public function __construct() {
+		$this->accounts = new AccountRepository();
+		$this->media    = new MediaResolver();
+	}
+
+	public function publish( object $variant, array $payload = array() ): array {
+		$platform = sanitize_key( (string) $variant->platform );
+		if ( ! in_array( $platform, array( 'facebook', 'instagram' ), true ) ) {
+			return $this->failure( 'Live publishing for ' . $platform . ' is not implemented in this release.', false );
+		}
+
+		$account = $this->primary_account( $platform );
+		if ( ! $account ) {
+			return $this->failure( ucfirst( $platform ) . ' is not connected.', false );
+		}
+		if ( 'connected' !== (string) $account->status ) {
+			return $this->failure( ucfirst( $platform ) . ' account is not healthy: ' . sanitize_text_field( (string) $account->status ) . '.', false );
+		}
+		if ( ! empty( $account->token_expires_at ) ) {
+			$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+			if ( false !== $expiry && $expiry <= time() ) {
+				return $this->failure( ucfirst( $platform ) . ' access token has expired. Reconnect Meta.', false );
+			}
+		}
+
+		$credentials = $this->accounts->credentials( $account );
+		$token = (string) ( $credentials['access_token'] ?? '' );
+		if ( '' === $token ) {
+			return $this->failure( ucfirst( $platform ) . ' access token is unavailable. Reconnect Meta.', false );
+		}
+
+		$settings = $this->accounts->settings( $account );
+		$client = new MetaClient( (string) ( $settings['graph_version'] ?? 'v25.0' ) );
+		$media_ids = json_decode( (string) ( $variant->media_json ?? '[]' ), true );
+		$media_ids = is_array( $media_ids ) ? $media_ids : array();
+		$resolved = $this->media->resolve_ids( $media_ids );
+		if ( ! $resolved['ok'] ) {
+			return $this->failure( implode( ' ', $resolved['errors'] ), false );
+		}
+
+		$caption = $this->compose_caption( $variant );
+		if ( 'instagram' === $platform && function_exists( 'mb_strlen' ) && mb_strlen( $caption ) > 2200 ) {
+			return $this->failure( 'Instagram caption exceeds 2,200 characters. Edit the Instagram variant before publishing.', false );
+		}
+
+		if ( 'facebook' === $platform ) {
+			return $this->publish_facebook( $client, $account, $token, $variant, $caption, $resolved['items'], $payload );
+		}
+		return $this->publish_instagram( $client, $account, $token, $variant, $caption, $resolved['items'], $payload );
+	}
+
+	public function preflight( object $variant ): array {
+		$platform = sanitize_key( (string) $variant->platform );
+		if ( ! in_array( $platform, array( 'facebook', 'instagram' ), true ) ) {
+			return array( 'ok' => true, 'message' => 'No Meta preflight required for ' . $platform . '.', 'details' => array( 'platform' => $platform ) );
+		}
+
+		$account = $this->primary_account( $platform );
+		if ( ! $account || 'connected' !== (string) $account->status ) {
+			return array( 'ok' => false, 'message' => ucfirst( $platform ) . ' is not connected and healthy.', 'details' => array( 'platform' => $platform ) );
+		}
+		$credentials = $this->accounts->credentials( $account );
+		if ( empty( $credentials['access_token'] ) ) {
+			return array( 'ok' => false, 'message' => ucfirst( $platform ) . ' access token is missing.', 'details' => array( 'platform' => $platform ) );
+		}
+		if ( ! empty( $account->token_expires_at ) ) {
+			$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+			if ( false !== $expiry && $expiry <= time() ) {
+				return array( 'ok' => false, 'message' => ucfirst( $platform ) . ' access token is expired.', 'details' => array( 'platform' => $platform ) );
+			}
+		}
+
+		$media_ids = json_decode( (string) ( $variant->media_json ?? '[]' ), true );
+		$media_ids = is_array( $media_ids ) ? $media_ids : array();
+		$resolved = $this->media->resolve_ids( $media_ids );
+		if ( ! $resolved['ok'] ) {
+			return array( 'ok' => false, 'message' => implode( ' ', $resolved['errors'] ), 'details' => array( 'platform' => $platform ) );
+		}
+
+		$media = $resolved['items'];
+		$type = sanitize_key( (string) $variant->publication_type );
+		$caption = $this->compose_caption( $variant );
+		if ( 'instagram' === $platform && function_exists( 'mb_strlen' ) && mb_strlen( $caption ) > 2200 ) {
+			return array( 'ok' => false, 'message' => 'Instagram caption exceeds 2,200 characters.', 'details' => array( 'platform' => $platform, 'caption_length' => mb_strlen( $caption ) ) );
+		}
+
+		if ( 'facebook' === $platform ) {
+			if ( 'reel' === $type ) {
+				$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+				if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+					return array( 'ok' => false, 'message' => 'Facebook Reel requires exactly one video attachment.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			} elseif ( $media ) {
+				$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+				if ( count( $images ) !== count( $media ) || count( $images ) > 10 ) {
+					return array( 'ok' => false, 'message' => 'Facebook image post must contain 1-10 image attachments only.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			}
+		} else {
+			if ( 'reel' === $type ) {
+				$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+				if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+					return array( 'ok' => false, 'message' => 'Instagram Reel requires exactly one video attachment.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			} else {
+				$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+				if ( ! $media || count( $images ) !== count( $media ) || count( $images ) > 10 ) {
+					return array( 'ok' => false, 'message' => 'Instagram image post/carousel must contain 1-10 image attachments.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			}
+		}
+
+		return array(
+			'ok'      => true,
+			'message' => ucfirst( $platform ) . ' variant passed local publishing preflight.',
+			'details' => array(
+				'platform'         => $platform,
+				'publication_type' => $type,
+				'media_count'      => count( $media ),
+				'media_types'      => array_values( array_unique( array_map( static fn( array $item ): string => $item['type'], $media ) ) ),
+				'field_mapping'     => ( new PlatformSchema() )->summarize_fields( $platform, $this->platform_fields( $variant ) ),
+			),
+		);
+	}
+
+	public function readiness(): array {
+		$settings = new Settings();
+		$items = array();
+		foreach ( array( 'facebook', 'instagram' ) as $platform ) {
+			$account = $this->primary_account( $platform );
+			$row = array(
+				'platform'  => $platform,
+				'connected' => false,
+				'healthy'   => false,
+				'name'      => '',
+				'external_account_id' => '',
+				'token_expires_at' => null,
+				'issues'    => array(),
+			);
+			if ( ! $account ) {
+				$row['issues'][] = 'No connected account.';
+				$items[] = $row;
+				continue;
+			}
+			$row['connected'] = true;
+			$row['name'] = sanitize_text_field( (string) $account->account_name );
+			$row['external_account_id'] = sanitize_text_field( (string) $account->external_account_id );
+			$row['token_expires_at'] = $account->token_expires_at ? sanitize_text_field( (string) $account->token_expires_at ) : null;
+			if ( 'connected' !== (string) $account->status ) {
+				$row['issues'][] = 'Stored account status is ' . sanitize_key( (string) $account->status ) . '.';
+			}
+			if ( ! empty( $account->token_expires_at ) ) {
+				$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+				if ( false !== $expiry && $expiry <= time() ) {
+					$row['issues'][] = 'Token is expired.';
+				}
+			}
+			$credentials = $this->accounts->credentials( $account );
+			if ( empty( $credentials['access_token'] ) ) {
+				$row['issues'][] = 'Encrypted access token is missing.';
+			}
+			$row['healthy'] = empty( $row['issues'] );
+			$items[] = $row;
+		}
+
+		$all_healthy = 2 === count( array_filter( $items, static fn( array $item ): bool => ! empty( $item['healthy'] ) ) );
+		return array(
+			'dry_run'                   => (bool) $settings->get( 'dry_run', 1 ),
+			'meta_live_publish_enabled' => (bool) $settings->get( 'meta_live_publish_enabled', 0 ),
+			'live_publish_possible'     => $all_healthy && ! $settings->get( 'dry_run', 1 ) && $settings->get( 'meta_live_publish_enabled', 0 ),
+			'accounts'                  => $items,
+			'supported'                 => array(
+				'facebook'  => array( 'text_post', 'single_image', 'multi_image_post', 'reel' ),
+				'instagram' => array( 'single_image', 'image_carousel', 'reel' ),
+			),
+			'safety'                    => 'Jobs capture publish_mode when scheduled. A dry-run job cannot become live later merely because settings change.',
+		);
+	}
+
+	private function publish_facebook( MetaClient $client, object $account, string $token, object $variant, string $caption, array $media, array $payload ): array {
+		$page_id = sanitize_text_field( (string) $account->external_account_id );
+		$type = sanitize_key( (string) $variant->publication_type );
+
+		if ( 'reel' === $type ) {
+			$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+			if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+				return $this->failure( 'Facebook Reel publishing requires exactly one video attachment.', false );
+			}
+			return $this->facebook_reel( $client, $token, $variant, $caption, $videos[0], $payload );
+		}
+
+		if ( empty( $media ) ) {
+			$result = $client->post( $page_id . '/feed', $token, array( 'message' => $caption ) );
+			return $this->finish_graph_publish( $client, $result, $token, 'Facebook post published.', $payload );
+		}
+
+		$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+		if ( count( $images ) !== count( $media ) ) {
+			return $this->failure( 'Facebook non-Reel publishing currently supports image attachments only.', false );
+		}
+		if ( count( $images ) > 10 ) {
+			return $this->failure( 'Facebook multi-image publishing is limited to 10 images per JK Social Hub post.', false );
+		}
+
+		if ( 1 === count( $images ) ) {
+			$result = $client->post(
+				$page_id . '/photos',
+				$token,
+				array(
+					'url'     => $images[0]['url'],
+					'caption' => $caption,
+				)
+			);
+			return $this->finish_graph_publish( $client, $result, $token, 'Facebook photo published.', $payload );
+		}
+
+		$photo_ids = array();
+		foreach ( $images as $image ) {
+			$upload = $client->post(
+				$page_id . '/photos',
+				$token,
+				array(
+					'url'       => $image['url'],
+					'published' => 'false',
+				)
+			);
+			if ( ! $upload['ok'] || empty( $upload['data']['id'] ) ) {
+				return $this->from_api_error( $upload, 'Facebook image staging failed.' );
+			}
+			$photo_ids[] = sanitize_text_field( (string) $upload['data']['id'] );
+		}
+
+		$params = array( 'message' => $caption );
+		foreach ( $photo_ids as $index => $photo_id ) {
+			$params[ 'attached_media[' . $index . ']' ] = wp_json_encode( array( 'media_fbid' => $photo_id ) );
+		}
+		$result = $client->post( $page_id . '/feed', $token, $params );
+		return $this->finish_graph_publish( $client, $result, $token, 'Facebook multi-image post published.', $payload );
+	}
+
+	private function facebook_reel( MetaClient $client, string $token, object $variant, string $caption, array $video, array $payload ): array {
+		$start = $client->post( 'me/video_reels', $token, array( 'upload_phase' => 'start' ) );
+		if ( ! $start['ok'] || empty( $start['data']['video_id'] ) || empty( $start['data']['upload_url'] ) ) {
+			return $this->from_api_error( $start, 'Facebook Reel upload session could not be created.' );
+		}
+		$video_id  = sanitize_text_field( (string) $start['data']['video_id'] );
+		$upload_url = esc_url_raw( (string) $start['data']['upload_url'] );
+		$upload = $client->post_absolute(
+			$upload_url,
+			array(
+				'Authorization' => 'OAuth ' . $token,
+				'file_url'      => $video['url'],
+				'Accept'        => 'application/json',
+			)
+		);
+		if ( ! $upload['ok'] ) {
+			return $this->from_api_error( $upload, 'Facebook Reel video transfer failed.' );
+		}
+
+		$finish = $client->post(
+			'me/video_reels',
+			$token,
+			array(
+				'video_id'     => $video_id,
+				'upload_phase' => 'finish',
+				'video_state'  => 'PUBLISHED',
+				'description'  => $caption,
+				'title'        => sanitize_text_field( (string) $variant->title ),
+			)
+		);
+		if ( ! $finish['ok'] || empty( $finish['data']['success'] ) ) {
+			return $this->from_api_error( $finish, 'Facebook Reel publish step failed.' );
+		}
+		$permalink = $this->permalink( $client, $video_id, $token );
+		return $this->success( $video_id, $permalink, 'Facebook Reel accepted for publishing.', $finish['data'], $payload );
+	}
+
+	private function publish_instagram( MetaClient $client, object $account, string $token, object $variant, string $caption, array $media, array $payload ): array {
+		$ig_id = sanitize_text_field( (string) $account->external_account_id );
+		$type  = sanitize_key( (string) $variant->publication_type );
+		$fields = $this->platform_fields( $variant );
+		$fields = $this->resolve_instagram_location( $client, $token, $fields );
+		$state = isset( $payload['meta_state'] ) && is_array( $payload['meta_state'] ) ? $payload['meta_state'] : array();
+		$poll_count = (int) ( $state['poll_count'] ?? 0 );
+		if ( $poll_count > 20 ) {
+			return $this->failure( 'Instagram media processing did not finish within the JK Social Hub wait window.', false );
+		}
+
+		if ( 'reel' === $type ) {
+			$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+			if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+				return $this->failure( 'Instagram Reel publishing requires exactly one video attachment.', false );
+			}
+			if ( empty( $state['container_id'] ) ) {
+				$params = array(
+					'media_type'    => 'REELS',
+					'video_url'     => $videos[0]['url'],
+					'caption'       => $caption,
+					'share_to_feed' => array_key_exists( 'share_to_feed', $fields ) ? ( ! empty( $fields['share_to_feed'] ) ? 'true' : 'false' ) : 'true',
+				);
+				$params = array_merge( $params, $this->instagram_common_params( $fields, false ) );
+				if ( ! empty( $fields['cover_attachment_id'] ) ) {
+					$cover = wp_get_attachment_url( absint( $fields['cover_attachment_id'] ) );
+					if ( $cover ) {
+						$params['cover_url'] = esc_url_raw( $cover );
+					}
+				}
+				if ( isset( $fields['thumb_offset_ms'] ) ) {
+					$params['thumb_offset'] = max( 0, (int) $fields['thumb_offset_ms'] );
+				}
+				$create = $client->post( $ig_id . '/media', $token, $params );
+				if ( ! $create['ok'] || empty( $create['data']['id'] ) ) {
+					return $this->from_api_error( $create, 'Instagram Reel container creation failed.' );
+				}
+				$state = array( 'phase' => 'reel_wait', 'container_id' => sanitize_text_field( (string) $create['data']['id'] ), 'poll_count' => 0 );
+				return $this->pending( $payload, $state, 30, 'Instagram Reel uploaded. Waiting for Meta processing.' );
+			}
+			return $this->instagram_publish_when_ready( $client, $ig_id, $token, $payload, $state, 'Instagram Reel published.' );
+		}
+
+		if ( empty( $media ) ) {
+			return $this->failure( 'Instagram publishing requires at least one media attachment.', false );
+		}
+		$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+		if ( count( $images ) !== count( $media ) ) {
+			return $this->failure( 'Instagram v0.4.0 supports image posts/carousels or one-video Reels. Mixed image/video carousels are blocked.', false );
+		}
+		if ( count( $images ) > 10 ) {
+			return $this->failure( 'Instagram carousels are limited to 10 media items.', false );
+		}
+
+		if ( 1 === count( $images ) ) {
+			if ( empty( $state['container_id'] ) ) {
+				$params = array(
+					'image_url' => $images[0]['url'],
+					'caption'   => $caption,
+				);
+				$params = array_merge( $params, $this->instagram_common_params( $fields, true, $images[0], 0 ) );
+				$create = $client->post( $ig_id . '/media', $token, $params );
+				if ( ! $create['ok'] || empty( $create['data']['id'] ) ) {
+					return $this->from_api_error( $create, 'Instagram image container creation failed.' );
+				}
+				$state = array( 'phase' => 'image_wait', 'container_id' => sanitize_text_field( (string) $create['data']['id'] ), 'poll_count' => 0 );
+				return $this->pending( $payload, $state, 10, 'Instagram image container created. Waiting for Meta processing.' );
+			}
+			return $this->instagram_publish_when_ready( $client, $ig_id, $token, $payload, $state, 'Instagram image published.' );
+		}
+
+		if ( empty( $state['child_ids'] ) ) {
+			$child_ids = array();
+			foreach ( $images as $index => $image ) {
+				$item_fields = $this->instagram_media_fields( $fields, $image, $index );
+				$params = array(
+					'image_url'        => $image['url'],
+					'is_carousel_item' => 'true',
+				);
+				$params = array_merge( $params, $this->instagram_common_params( $item_fields, true, $image, $index, false ) );
+				$child = $client->post( $ig_id . '/media', $token, $params );
+				if ( ! $child['ok'] || empty( $child['data']['id'] ) ) {
+					return $this->from_api_error( $child, 'Instagram carousel item creation failed.' );
+				}
+				$child_ids[] = sanitize_text_field( (string) $child['data']['id'] );
+			}
+			$state = array( 'phase' => 'carousel_children_wait', 'child_ids' => $child_ids, 'poll_count' => 0 );
+			return $this->pending( $payload, $state, 10, 'Instagram carousel items created. Waiting for Meta processing.' );
+		}
+
+		if ( 'carousel_children_wait' === (string) ( $state['phase'] ?? '' ) ) {
+			$readiness = $this->containers_ready( $client, (array) $state['child_ids'], $token );
+			if ( ! $readiness['ok'] ) {
+				return $readiness;
+			}
+			if ( ! $readiness['ready'] ) {
+				$state['poll_count'] = $poll_count + 1;
+				return $this->pending( $payload, $state, 20, 'Instagram carousel items are still processing.' );
+			}
+			$params = array(
+				'media_type' => 'CAROUSEL',
+				'children'   => implode( ',', array_map( 'sanitize_text_field', (array) $state['child_ids'] ) ),
+				'caption'    => $caption,
+			);
+			$params = array_merge( $params, $this->instagram_common_params( $fields, false ) );
+			$parent = $client->post( $ig_id . '/media', $token, $params );
+			if ( ! $parent['ok'] || empty( $parent['data']['id'] ) ) {
+				return $this->from_api_error( $parent, 'Instagram carousel container creation failed.' );
+			}
+			$state = array(
+				'phase'        => 'carousel_parent_wait',
+				'container_id' => sanitize_text_field( (string) $parent['data']['id'] ),
+				'child_ids'    => array_values( array_map( 'sanitize_text_field', (array) $state['child_ids'] ) ),
+				'poll_count'   => 0,
+			);
+			return $this->pending( $payload, $state, 10, 'Instagram carousel container created. Waiting for final processing.' );
+		}
+
+		return $this->instagram_publish_when_ready( $client, $ig_id, $token, $payload, $state, 'Instagram carousel published.' );
+	}
+
+	private function resolve_instagram_location( MetaClient $client, string $token, array $fields ): array {
+		if ( ! empty( $fields['location_id'] ) ) {
+			return $fields;
+		}
+		$query = trim( sanitize_text_field( (string) ( $fields['location_query'] ?? '' ) ) );
+		if ( '' === $query ) {
+			return $fields;
+		}
+		$result = $client->get(
+			'search',
+			$token,
+			array(
+				'type'   => 'place',
+				'q'      => $query,
+				'limit'  => 5,
+				'fields' => 'id,name,location',
+			)
+		);
+		if ( empty( $result['ok'] ) || empty( $result['data']['data'] ) || ! is_array( $result['data']['data'] ) ) {
+			$fields['location_resolution'] = array( 'query' => $query, 'resolved' => false );
+			return $fields;
+		}
+		foreach ( $result['data']['data'] as $row ) {
+			$id = sanitize_text_field( (string) ( $row['id'] ?? '' ) );
+			if ( '' === $id ) {
+				continue;
+			}
+			$fields['location_id'] = $id;
+			$fields['location_resolution'] = array(
+				'query'    => $query,
+				'resolved' => true,
+				'id'       => $id,
+				'name'     => sanitize_text_field( (string) ( $row['name'] ?? '' ) ),
+			);
+			break;
+		}
+		return $fields;
+	}
+
+	private function instagram_common_params( array $fields, bool $allow_alt, ?array $media = null, int $index = 0, bool $allow_parent_fields = true ): array {
+		$params = array();
+		if ( $allow_parent_fields && ! empty( $fields['location_id'] ) ) {
+			$params['location_id'] = sanitize_text_field( (string) $fields['location_id'] );
+		}
+		if ( ! empty( $fields['user_tags'] ) && is_array( $fields['user_tags'] ) ) {
+			$params['user_tags'] = wp_json_encode( $this->sanitize_tag_rows( $fields['user_tags'] ) );
+		}
+		if ( $allow_parent_fields && ! empty( $fields['collaborators'] ) && is_array( $fields['collaborators'] ) ) {
+			$params['collaborators'] = wp_json_encode( array_values( array_filter( array_map( static fn( $v ): string => ltrim( sanitize_text_field( (string) $v ), '@' ), $fields['collaborators'] ) ) ) );
+		}
+		if ( $allow_alt && isset( $fields['alt_text'] ) && '' !== trim( (string) $fields['alt_text'] ) ) {
+			$params['alt_text'] = sanitize_textarea_field( (string) $fields['alt_text'] );
+		}
+		return $params;
+	}
+
+	private function instagram_media_fields( array $fields, array $media, int $index ): array {
+		$per = isset( $fields['media_fields'] ) && is_array( $fields['media_fields'] ) ? $fields['media_fields'] : array();
+		$candidates = array( (string) ( $media['id'] ?? '' ), (string) $index );
+		foreach ( $candidates as $key ) {
+			if ( '' !== $key && isset( $per[ $key ] ) && is_array( $per[ $key ] ) ) {
+				return $per[ $key ];
+			}
+		}
+		return array();
+	}
+
+	private function sanitize_tag_rows( array $rows ): array {
+		$out = array();
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) || empty( $row['username'] ) ) {
+				continue;
+			}
+			$item = array( 'username' => ltrim( sanitize_text_field( (string) $row['username'] ), '@' ) );
+			if ( isset( $row['x'] ) ) {
+				$item['x'] = max( 0, min( 1, (float) $row['x'] ) );
+			}
+			if ( isset( $row['y'] ) ) {
+				$item['y'] = max( 0, min( 1, (float) $row['y'] ) );
+			}
+			$out[] = $item;
+		}
+		return $out;
+	}
+
+	private function instagram_publish_when_ready( MetaClient $client, string $ig_id, string $token, array $payload, array $state, string $message ): array {
+		$container_id = sanitize_text_field( (string) ( $state['container_id'] ?? '' ) );
+		if ( '' === $container_id ) {
+			return $this->failure( 'Instagram publish state is missing the media container ID.', false );
+		}
+		$status = $this->container_status( $client, $container_id, $token );
+		if ( ! $status['ok'] ) {
+			return $status;
+		}
+		if ( ! $status['ready'] ) {
+			$state['poll_count'] = (int) ( $state['poll_count'] ?? 0 ) + 1;
+			return $this->pending( $payload, $state, 20, 'Instagram media is still processing.' );
+		}
+		$publish = $client->post( $ig_id . '/media_publish', $token, array( 'creation_id' => $container_id ) );
+		if ( ! $publish['ok'] || empty( $publish['data']['id'] ) ) {
+			return $this->from_api_error( $publish, 'Instagram media publish step failed.' );
+		}
+		$media_id = sanitize_text_field( (string) $publish['data']['id'] );
+		$permalink = $this->permalink( $client, $media_id, $token );
+		return $this->success( $media_id, $permalink, $message, $publish['data'], $payload );
+	}
+
+	private function containers_ready( MetaClient $client, array $ids, string $token ): array {
+		foreach ( $ids as $id ) {
+			$status = $this->container_status( $client, sanitize_text_field( (string) $id ), $token );
+			if ( ! $status['ok'] ) {
+				return $status;
+			}
+			if ( ! $status['ready'] ) {
+				return array( 'ok' => true, 'ready' => false );
+			}
+		}
+		return array( 'ok' => true, 'ready' => true );
+	}
+
+	private function container_status( MetaClient $client, string $container_id, string $token ): array {
+		$result = $client->get( $container_id, $token, array( 'fields' => 'status_code,status' ) );
+		if ( ! $result['ok'] ) {
+			return $this->from_api_error( $result, 'Instagram container status check failed.' );
+		}
+		$status = strtoupper( sanitize_text_field( (string) ( $result['data']['status_code'] ?? '' ) ) );
+		if ( in_array( $status, array( 'ERROR', 'EXPIRED' ), true ) ) {
+			return $this->failure( 'Instagram media container failed: ' . sanitize_text_field( (string) ( $result['data']['status'] ?? $status ) ), false );
+		}
+		return array( 'ok' => true, 'ready' => 'FINISHED' === $status );
+	}
+
+	private function finish_graph_publish( MetaClient $client, array $result, string $token, string $message, array $payload ): array {
+		if ( ! $result['ok'] ) {
+			return $this->from_api_error( $result, $message . ' Meta returned an error.' );
+		}
+		$id = sanitize_text_field( (string) ( $result['data']['post_id'] ?? $result['data']['id'] ?? '' ) );
+		if ( '' === $id ) {
+			return $this->failure( $message . ' Meta did not return an external ID.', true );
+		}
+		return $this->success( $id, $this->permalink( $client, $id, $token ), $message, $result['data'], $payload );
+	}
+
+	private function permalink( MetaClient $client, string $external_id, string $token ): string {
+		$result = $client->get( $external_id, $token, array( 'fields' => 'permalink_url,permalink' ) );
+		if ( ! $result['ok'] ) {
+			return '';
+		}
+		return esc_url_raw( (string) ( $result['data']['permalink_url'] ?? $result['data']['permalink'] ?? '' ) );
+	}
+
+	private function primary_account( string $platform ): ?object {
+		$rows = $this->accounts->connected( $platform );
+		if ( ! $rows ) {
+			return null;
+		}
+		if ( 'facebook' === $platform ) {
+			$preferred = ( new MetaConnector() )->preferred_page_id();
+			if ( '' !== $preferred ) {
+				foreach ( $rows as $row ) {
+					if ( $preferred === (string) $row->external_account_id ) {
+						return $row;
+					}
+				}
+			}
+		}
+		if ( 'instagram' === $platform ) {
+			$facebook = $this->primary_account( 'facebook' );
+			if ( $facebook ) {
+				foreach ( $rows as $row ) {
+					if ( (int) $row->parent_account_id === (int) $facebook->id ) {
+						return $row;
+					}
+				}
+			}
+		}
+		return $rows[0];
+	}
+
+
+	private function platform_fields( object $variant ): array {
+		$fields = json_decode( (string) ( $variant->fields_json ?? '{}' ), true );
+		return is_array( $fields ) ? $fields : array();
+	}
+
+
+    private function compose_caption( object $variant ): string {
+        $fields = $this->platform_fields( $variant );
+        $parts = array_filter(
+            array(
+                trim( (string) $variant->caption ),
+                trim( (string) $variant->hashtags ),
+                trim( (string) $variant->cta ),
+            ),
+            static fn( string $value ): bool => '' !== $value
+        );
+        $caption = implode( "\n\n", $parts );
+        $product_url = esc_url_raw( (string) ( $fields['product_url'] ?? $fields['link'] ?? '' ) );
+        if ( $product_url && false === strpos( $caption, $product_url ) ) {
+            $caption .= ( '' !== $caption ? "\n\n" : '' ) . '🔗 ' . $product_url;
+        }
+        return sanitize_textarea_field( $caption );
+    }
+
+	private function pending( array $payload, array $state, int $delay, string $message ): array {
+		$payload['meta_state'] = $state;
+		return array(
+			'ok'         => true,
+			'pending'    => true,
+			'delay'      => max( 10, $delay ),
+			'message'    => $message,
+			'payload'    => $payload,
+			'external_id'=> sanitize_text_field( (string) ( $state['container_id'] ?? '' ) ),
+			'external_url' => '',
+			'response'   => array( 'state' => $state ),
+		);
+	}
+
+	private function success( string $external_id, string $external_url, string $message, array $response, array $payload ): array {
+		unset( $payload['meta_state'] );
+		return array(
+			'ok'           => true,
+			'pending'      => false,
+			'message'      => $message,
+			'external_id'  => sanitize_text_field( $external_id ),
+			'external_url' => esc_url_raw( $external_url ),
+			'response'     => $this->sanitize_response( $response ),
+			'payload'      => $payload,
+		);
+	}
+
+	private function from_api_error( array $result, string $prefix ): array {
+		$code = (int) ( $result['code'] ?? 0 );
+		$message = trim( $prefix . ' ' . sanitize_text_field( (string) ( $result['message'] ?? 'Unknown Meta API error.' ) ) );
+		return array(
+			'ok'         => false,
+			'pending'    => false,
+			'message'    => $message,
+			'api_code'   => $code,
+			'retryable'  => $this->retryable_code( $code ),
+			'response'   => array( 'api_code' => $code, 'error_subcode' => (int) ( $result['error_subcode'] ?? 0 ) ),
+		);
+	}
+
+	private function failure( string $message, bool $retryable ): array {
+		return array(
+			'ok'        => false,
+			'pending'   => false,
+			'message'   => sanitize_textarea_field( $message ),
+			'api_code'  => 0,
+			'retryable' => $retryable,
+			'response'  => array(),
+		);
+	}
+
+	private function retryable_code( int $code ): bool {
+		return in_array( $code, array( 1, 2, 4, 17, 32, 341, 613 ), true ) || $code >= 500;
+	}
+
+	private function sanitize_response( array $response ): array {
+		$safe = array();
+		foreach ( $response as $key => $value ) {
+			$key = sanitize_key( (string) $key );
+			if ( preg_match( '/token|secret|authorization|cookie/i', $key ) ) {
+				continue;
+			}
+			if ( is_array( $value ) ) {
+				$safe[ $key ] = $this->sanitize_response( $value );
+			} elseif ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+				$safe[ $key ] = $value;
+			} else {
+				$safe[ $key ] = sanitize_textarea_field( (string) $value );
+			}
+		}
+		return $safe;
+	}
+}

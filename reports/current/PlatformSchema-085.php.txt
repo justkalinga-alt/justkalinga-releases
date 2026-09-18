@@ -1,0 +1,143 @@
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+
+final class PlatformSchema {
+	public const VERSION = 'omnichannel_v5_2026-09-18';
+
+	public function catalog(): array {
+		$accounts = new AccountRepository();
+		$instagram_connected = ! empty( $accounts->connected( 'instagram' ) );
+		$facebook_connected  = ! empty( $accounts->connected( 'facebook' ) );
+		$youtube_connected   = ! empty( $accounts->connected( 'youtube' ) );
+		return array(
+			'instagram' => array(
+				'connection' => $instagram_connected ? 'connected' : 'not_connected',
+				'publication_types' => array( 'post', 'carousel', 'reel', 'story', 'live' ),
+				'fields' => array(
+					'title' => $this->field( false, 'internal_only', 'Internal/editorial title; Instagram does not expose a separate normal-post title.' ),
+					'caption' => $this->field( true, 'implemented' ),
+					'hashtags' => $this->field( true, 'implemented', 'Rendered into caption copy.' ),
+					'location_id' => $this->field( true, 'implemented', 'Requires a valid Meta location/Page ID. The Hub never invents one.' ),
+					'location_query' => $this->field( false, 'implemented', 'Resolved at publish time through Meta Places search. The first valid result is used; failure does not fabricate a location.' ),
+					'product_url' => $this->field( false, 'implemented', 'A JustKalinga product or product-search URL appended to public caption copy when absent.' ),
+					'music_suggestion' => $this->field( false, 'stored_manual', 'Devotional audio search suggestion only. Instagram Graph publishing does not expose licensed music-library selection.' ),
+					'user_tags' => $this->field( true, 'implemented', 'Images may require normalized x/y positions.' ),
+					'collaborators' => $this->field( true, 'implemented' ),
+					'alt_text' => $this->field( true, 'implemented', 'Image accessibility text.' ),
+					'media_fields' => $this->field( true, 'implemented', 'Per-carousel-item alt text and user tags keyed by attachment ID or zero-based media index.' ),
+					'share_to_feed' => $this->field( true, 'implemented', 'Reels only.' ),
+					'cover_attachment_id' => $this->field( true, 'implemented', 'Reels only; resolved to a public image URL.' ),
+					'thumb_offset_ms' => $this->field( true, 'implemented', 'Reels only.' ),
+					'product_tags' => $this->field( true, 'conditional_stored', 'Requires verified Instagram Shopping/catalog eligibility and product-ID mapping. Stored now, not sent until that account capability is verified.' ),
+					'is_ai_generated' => $this->field( true, 'conditional_stored', 'Stored and applied only where the connected API exposes a documented writable disclosure field.' ),
+					'story' => $this->field( true, 'planned_adapter', 'Story publishing is reserved but not live in this release.' ),
+					'live_ingest' => $this->field( false, 'external_ingest', 'Instagram Live uses a separate Live Producer/RTMP ingest path when available. The current Graph connector does not provision IG Live automatically.' ),
+				),
+			),
+			'facebook' => array(
+				'connection' => $facebook_connected ? 'connected' : 'not_connected',
+				'publication_types' => array( 'post', 'reel', 'live' ),
+				'fields' => array(
+					'title' => $this->field( true, 'implemented', 'Used for Reels; live title reserved for Live API adapter.' ),
+					'message' => $this->field( true, 'implemented' ),
+					'description' => $this->field( true, 'implemented', 'Used as Reel description/copy where applicable.' ),
+					'hashtags' => $this->field( true, 'implemented', 'Rendered into public copy.' ),
+					'link' => $this->field( true, 'conditional_stored', 'Stored now; dedicated link-post mapping will be enabled after endpoint validation.' ),
+					'place_id' => $this->field( true, 'conditional_stored', 'Stored only when a valid place identifier is known; not fabricated.' ),
+					'place_query' => $this->field( false, 'conditional_stored', 'Human location query retained for future Facebook place mapping.' ),
+					'product_url' => $this->field( false, 'implemented', 'Appended to public copy when absent.' ),
+					'product_refs' => $this->field( false, 'conditional_stored', 'Requires catalog/commerce mapping; fall back to normal product links until verified.' ),
+					'content_tags' => $this->field( true, 'planned_live_adapter', 'Facebook Live only, when valid content-tag IDs are available.' ),
+				),
+			),
+			'youtube' => array(
+				'connection' => $youtube_connected ? 'connected' : 'not_connected',
+				'publication_types' => array( 'community_post', 'short', 'video', 'live' ),
+				'fields' => array(
+					'title' => $this->field( true, 'implemented' ),
+					'description' => $this->field( true, 'implemented' ),
+					'tags' => $this->field( true, 'implemented' ),
+					'category_id' => $this->field( true, 'implemented' ),
+					'default_language' => $this->field( true, 'implemented' ),
+					'privacy_status' => $this->field( true, 'implemented' ),
+					'publish_at' => $this->field( true, 'implemented' ),
+					'embeddable' => $this->field( true, 'implemented' ),
+					'license' => $this->field( true, 'implemented' ),
+					'public_stats_viewable' => $this->field( true, 'implemented' ),
+					'made_for_kids' => $this->field( true, 'implemented', 'Must reflect the actual content. It is never guessed for convenience.' ),
+					'contains_synthetic_media' => $this->field( true, 'implemented', 'Set only when applicable.' ),
+					'recording_date' => $this->field( true, 'implemented' ),
+					'thumbnail_attachment_id' => $this->field( true, 'implemented' ),
+					'playlist_ids' => $this->field( true, 'implemented', 'Applied after upload via playlistItems.' ),
+					'notify_subscribers' => $this->field( true, 'implemented', 'Applied to videos.insert. JK Social Hub defaults this to false when omitted to avoid surprise subscriber notifications.' ),
+					'resolution' => $this->field( true, 'implemented', 'YouTube Live only. Used as liveStreams.cdn.resolution.' ),
+					'frame_rate' => $this->field( true, 'implemented', 'YouTube Live only. Used as liveStreams.cdn.frameRate.' ),
+					'location' => $this->field( false, 'deprecated_platform_field', 'YouTube recording-location fields are deprecated. The Hub may retain source location internally but will not rely on deprecated API writes.' ),
+					'location_text' => $this->field( false, 'implemented', 'Retained in public description copy because YouTube recording-location API writes are deprecated.' ),
+					'product_url' => $this->field( false, 'implemented', 'A JustKalinga product or product-search URL appended to the description when absent.' ),
+					'community_images' => $this->field( false, 'worker_or_manual_path', 'Permanent JK rule: image/carousel content maps to a YouTube Community Post with original images, never a fake Short/slideshow unless explicitly requested.' ),
+				),
+			),
+		);
+	}
+
+	public function sanitize_fields( string $platform, array $fields ): array {
+		$platform = sanitize_key( $platform );
+		$allowed = array_keys( $this->catalog()[ $platform ]['fields'] ?? array() );
+		$out = array();
+		foreach ( $fields as $key => $value ) {
+			$key = sanitize_key( (string) $key );
+			if ( ! in_array( $key, $allowed, true ) ) {
+				continue;
+			}
+			if ( preg_match( '/token|secret|password|credential|authorization|cookie|nonce|state|stream_key/i', $key ) ) {
+				continue;
+			}
+			$out[ $key ] = $this->sanitize_value( $value );
+		}
+		return $out;
+	}
+
+	public function summarize_fields( string $platform, array $fields ): array {
+		$defs = $this->catalog()[ sanitize_key( $platform ) ]['fields'] ?? array();
+		$implemented = array();
+		$stored = array();
+		foreach ( array_keys( $fields ) as $key ) {
+			$key = sanitize_key( (string) $key );
+			if ( ! isset( $defs[ $key ] ) ) {
+				continue;
+			}
+			$adapter = (string) ( $defs[ $key ]['adapter'] ?? 'unknown' );
+			if ( 'implemented' === $adapter || 'internal_only' === $adapter ) {
+				$implemented[] = $key;
+			} else {
+				$stored[] = array( 'field' => $key, 'adapter' => $adapter );
+			}
+		}
+		return array( 'implemented_now' => $implemented, 'stored_or_pending' => $stored, 'schema_version' => self::VERSION );
+	}
+
+	private function field( bool $platform_api, string $adapter, string $note = '' ): array {
+		return array( 'platform_api' => $platform_api, 'adapter' => $adapter, 'note' => $note );
+	}
+
+	private function sanitize_value( mixed $value ): mixed {
+		if ( is_array( $value ) ) {
+			$out = array();
+			foreach ( $value as $key => $item ) {
+				$safe_key = is_string( $key ) ? sanitize_key( $key ) : $key;
+				if ( is_string( $safe_key ) && preg_match( '/token|secret|password|credential|authorization|cookie|nonce|state|stream_key/i', $safe_key ) ) {
+					continue;
+				}
+				$out[ $safe_key ] = $this->sanitize_value( $item );
+			}
+			return $out;
+		}
+		if ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+			return $value;
+		}
+		return sanitize_textarea_field( (string) $value );
+	}
+}

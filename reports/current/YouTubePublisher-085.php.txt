@@ -1,0 +1,396 @@
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+
+final class YouTubePublisher {
+	private AccountRepository $accounts;
+	private YouTubeClient $client;
+
+	public function __construct() {
+		$this->accounts = new AccountRepository();
+		$this->client   = new YouTubeClient();
+	}
+
+	public function readiness(): array {
+		$settings = new Settings();
+		$account  = $this->primary_account();
+		$issues   = array();
+		$name     = '';
+		$external = '';
+		$expiry   = null;
+
+		if ( ! $account ) {
+			$issues[] = 'No connected YouTube channel.';
+		} else {
+			$name     = sanitize_text_field( (string) $account->account_name );
+			$external = sanitize_text_field( (string) $account->external_account_id );
+			$expiry   = $account->token_expires_at ? sanitize_text_field( (string) $account->token_expires_at ) : null;
+			$credentials = $this->accounts->credentials( $account );
+			if ( empty( $credentials['refresh_token'] ) ) {
+				$issues[] = 'Encrypted YouTube refresh token is missing.';
+			}
+		}
+		if ( ! function_exists( 'curl_init' ) ) {
+			$issues[] = 'PHP cURL is required for streamed YouTube video uploads.';
+		}
+
+		$connected = $account && empty( $issues );
+		return array(
+			'dry_run'                       => (bool) $settings->get( 'dry_run', 1 ),
+			'youtube_live_publish_enabled'   => (bool) $settings->get( 'youtube_live_publish_enabled', 0 ),
+			'live_publish_possible'          => $connected && ! $settings->get( 'dry_run', 1 ) && $settings->get( 'youtube_live_publish_enabled', 0 ),
+			'account'                        => array(
+				'connected'           => (bool) $account,
+				'healthy'             => $connected,
+				'name'                => $name,
+				'external_account_id' => $external,
+				'token_expires_at'    => $expiry,
+				'issues'              => $issues,
+			),
+			'supported'                      => array( 'video', 'short' ),
+			'community_post'                 => 'stored_for_worker_or_manual_path',
+			'upload_transport'                => 'YouTube resumable upload with streamed file body',
+			'api_project_privacy_caveat'      => 'Google may force uploads from unverified API projects created after 2020-07-28 to private until the project passes a YouTube API audit.',
+			'safety'                         => 'Dry Run validates the exact YouTube payload without calling videos.insert. Live upload also requires the separate YouTube master switch.',
+		);
+	}
+
+	public function preflight( object $variant ): array {
+		$account = $this->primary_account();
+		if ( ! $account ) {
+			return $this->failure( 'No connected YouTube channel is available.', false );
+		}
+		$type   = sanitize_key( (string) $variant->publication_type );
+		$fields = $this->fields( $variant );
+		$media  = $this->media( $variant );
+
+		if ( 'community_post' === $type ) {
+			return array(
+				'ok'      => true,
+				'message' => 'YouTube Community Post package passed local Dry Run packaging. Publishing remains on the manual/worker path.',
+				'details' => array(
+					'platform'         => 'youtube',
+					'publication_type' => $type,
+					'media_count'      => count( $media ),
+					'adapter'          => 'worker_or_manual_path',
+					'field_mapping'    => ( new PlatformSchema() )->summarize_fields( 'youtube', $fields ),
+				),
+			);
+		}
+		if ( ! in_array( $type, array( 'video', 'short' ), true ) ) {
+			return $this->failure( 'YouTube publishing currently supports video and short variants only.', false );
+		}
+		if ( 1 !== count( $media ) ) {
+			return $this->failure( 'YouTube video/Short publishing requires exactly one video attachment.', false );
+		}
+		$item = $media[0];
+		if ( 'video' !== $item['type'] ) {
+			return $this->failure( 'The YouTube video/Short attachment must be a video file.', false );
+		}
+		$file = get_attached_file( (int) $item['id'] );
+		if ( ! $file || ! is_readable( $file ) || filesize( $file ) < 1 ) {
+			return $this->failure( 'The YouTube video attachment is not readable on the server.', false );
+		}
+		if ( filesize( $file ) > 256 * 1024 * 1024 * 1024 ) {
+			return $this->failure( 'The YouTube video exceeds the 256 GB API upload limit.', false );
+		}
+
+		$title = $this->title( $variant, $fields );
+		if ( '' === $title ) {
+			return $this->failure( 'YouTube title is required.', false );
+		}
+		if ( $this->strlen( $title ) > 100 ) {
+			return $this->failure( 'YouTube title exceeds 100 characters.', false );
+		}
+		$description = $this->description( $variant, $fields );
+		if ( strlen( $description ) > 5000 ) {
+			return $this->failure( 'YouTube description exceeds the 5000-byte API limit.', false );
+		}
+		$tags = array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $fields['tags'] ?? array() ) ) ) );
+		if ( $this->tags_length( $tags ) > 500 ) {
+			return $this->failure( 'YouTube tags exceed the 500-character API limit after commas/quoted spaces are counted.', false );
+		}
+
+		$privacy = sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) );
+		if ( ! in_array( $privacy, array( 'private', 'unlisted', 'public' ), true ) ) {
+			return $this->failure( 'YouTube privacy_status must be private, unlisted or public.', false );
+		}
+		if ( ! empty( $fields['publish_at'] ) ) {
+			$publish_ts = strtotime( (string) $fields['publish_at'] );
+			if ( ! $publish_ts ) {
+				return $this->failure( 'YouTube publish_at is not a valid date/time.', false );
+			}
+			if ( 'private' !== $privacy ) {
+				return $this->failure( 'YouTube publish_at requires privacy_status=private.', false );
+			}
+		}
+
+		$thumb = $this->thumbnail_preflight( $fields );
+		if ( ! $thumb['ok'] ) {
+			return $thumb;
+		}
+
+		$short = array( 'checked' => false, 'eligible_by_metadata' => null );
+		if ( 'short' === $type ) {
+			$short = $this->short_metadata( $file );
+			if ( false === $short['eligible_by_metadata'] ) {
+				return $this->failure( 'This Short is clearly outside YouTube Shorts shape/duration rules: it must be square or vertical and no longer than 3 minutes.', false, array( 'short_validation' => $short ) );
+			}
+		}
+
+		return array(
+			'ok'      => true,
+			'message' => 'YouTube variant passed local publishing preflight.',
+			'details' => array(
+				'platform'         => 'youtube',
+				'publication_type' => $type,
+				'media_count'      => 1,
+				'media_types'      => array( 'video' ),
+				'bytes'            => (int) filesize( $file ),
+				'privacy_status'   => $privacy,
+				'short_validation' => $short,
+				'field_mapping'    => ( new PlatformSchema() )->summarize_fields( 'youtube', $fields ),
+			),
+		);
+	}
+
+	public function publish( object $variant, array $payload = array() ): array {
+		$preflight = $this->preflight( $variant );
+		if ( empty( $preflight['ok'] ) ) {
+			return $preflight;
+		}
+		$type = sanitize_key( (string) $variant->publication_type );
+		if ( 'community_post' === $type ) {
+			return $this->failure( 'YouTube Community Post publishing is not exposed through the current YouTube Data API adapter. The original images remain stored for the worker/manual path.', false );
+		}
+
+		$account = $this->primary_account();
+		$fields  = $this->fields( $variant );
+		$media   = $this->media( $variant );
+		$file    = get_attached_file( (int) $media[0]['id'] );
+		$mime    = (string) get_post_mime_type( (int) $media[0]['id'] );
+		$meta    = $this->metadata( $variant, $fields );
+
+		$notify = array_key_exists( 'notify_subscribers', $fields ) ? (bool) $fields['notify_subscribers'] : false;
+		$upload = $this->client->upload_video_resumable( $account, $file, $mime, $meta, $notify );
+		if ( empty( $upload['ok'] ) || empty( $upload['data']['id'] ) ) {
+			return $this->failure(
+				'YouTube video upload failed: ' . sanitize_textarea_field( (string) ( $upload['message'] ?? 'Unknown YouTube upload error.' ) ),
+				false,
+				array( 'status' => (int) ( $upload['status'] ?? 0 ), 'stage' => 'video_upload' )
+			);
+		}
+		$video_id = sanitize_text_field( (string) $upload['data']['id'] );
+		$warnings = array();
+		$secondary = array();
+
+		if ( ! empty( $fields['thumbnail_attachment_id'] ) ) {
+			$thumb_id = absint( $fields['thumbnail_attachment_id'] );
+			$thumb_file = get_attached_file( $thumb_id );
+			$thumb_mime = (string) get_post_mime_type( $thumb_id );
+			$result = $this->client->set_thumbnail( $account, $video_id, $thumb_file, $thumb_mime );
+			$secondary['thumbnail'] = array(
+				'ok' => ! empty( $result['ok'] ),
+				'status' => (int) ( $result['status'] ?? 0 ),
+				'attachment_id' => $thumb_id,
+				'api' => 'thumbnails.set',
+				'note' => 'YouTube accepted the custom thumbnail request when ok=true. Some vertical-video browse surfaces may still render an automatically cropped preview.',
+			);
+			if ( empty( $result['ok'] ) ) {
+				$warnings[] = 'Video uploaded, but custom thumbnail failed: ' . sanitize_textarea_field( (string) ( $result['message'] ?? 'Unknown error.' ) );
+			}
+		}
+
+		$playlists = $this->playlist_ids( $fields );
+		if ( $playlists ) {
+			$secondary['playlists'] = array();
+			$account_settings = $this->accounts->settings( $account );
+			$uploads_playlist = sanitize_text_field( (string) ( $account_settings['uploads_playlist_id'] ?? '' ) );
+			foreach ( $playlists as $playlist_id ) {
+				if ( '' !== $uploads_playlist && hash_equals( $uploads_playlist, $playlist_id ) ) {
+					$warnings[] = 'Skipped the channel uploads playlist because YouTube does not allow playlistItems.insert into that system playlist.';
+					continue;
+				}
+				$result = $this->client->add_to_playlist( $account, $playlist_id, $video_id );
+				$secondary['playlists'][] = array( 'playlist_id' => $playlist_id, 'ok' => ! empty( $result['ok'] ), 'status' => (int) ( $result['status'] ?? 0 ) );
+				if ( empty( $result['ok'] ) ) {
+					$warnings[] = 'Video uploaded, but playlist ' . $playlist_id . ' failed: ' . sanitize_textarea_field( (string) ( $result['message'] ?? 'Unknown error.' ) );
+				}
+			}
+		}
+
+		$requested_privacy = sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) );
+		$actual_privacy = sanitize_key( (string) ( $upload['data']['status']['privacyStatus'] ?? '' ) );
+		if ( '' !== $actual_privacy && $actual_privacy !== $requested_privacy ) {
+			$warnings[] = 'YouTube returned privacyStatus=' . $actual_privacy . ' instead of requested ' . $requested_privacy . '. This can happen when an API project is subject to upload-audit restrictions.';
+		}
+
+		return array(
+			'ok'           => true,
+			'pending'      => false,
+			'external_id'  => $video_id,
+			'external_url' => 'https://www.youtube.com/watch?v=' . rawurlencode( $video_id ),
+			'message'      => $warnings ? 'YouTube video uploaded with follow-up warnings.' : 'YouTube video uploaded successfully.',
+			'payload'      => $payload,
+			'response'     => array(
+				'video_id'          => $video_id,
+				'publication_type'  => $type,
+				'requested_privacy' => $requested_privacy,
+				'actual_privacy'    => $actual_privacy,
+				'notify_subscribers' => $notify,
+				'secondary'         => $secondary,
+				'warnings'          => $warnings,
+			),
+			'retryable'    => false,
+		);
+	}
+
+	private function primary_account(): ?object {
+		$items = $this->accounts->connected( 'youtube' );
+		return $items ? $items[0] : null;
+	}
+
+	private function fields( object $variant ): array {
+		$data = json_decode( (string) ( $variant->fields_json ?? '{}' ), true );
+		return is_array( $data ) ? $data : array();
+	}
+
+	private function media( object $variant ): array {
+		$ids = json_decode( (string) ( $variant->media_json ?? '[]' ), true );
+		$ids = is_array( $ids ) ? $ids : array();
+		return ( new MediaResolver() )->resolve_ids( $ids )['items'] ?? array();
+	}
+
+	private function title( object $variant, array $fields ): string {
+		return sanitize_text_field( (string) ( $fields['title'] ?? $variant->title ?? '' ) );
+	}
+
+    private function description( object $variant, array $fields ): string {
+        $description = sanitize_textarea_field( (string) ( $fields['description'] ?? $variant->description ?? '' ) );
+        $location = trim( sanitize_text_field( (string) ( $fields['location_text'] ?? '' ) ) );
+        $product_url = esc_url_raw( (string) ( $fields['product_url'] ?? '' ) );
+        if ( $location && false === stripos( $description, $location ) ) {
+            $description .= ( '' !== $description ? "\n\n" : '' ) . '📍 ' . $location;
+        }
+        if ( $product_url && false === strpos( $description, $product_url ) ) {
+            $description .= ( '' !== $description ? "\n" : '' ) . '🔗 ' . $product_url;
+        }
+        return sanitize_textarea_field( $description );
+    }
+
+	private function metadata( object $variant, array $fields ): array {
+		$snippet = array(
+			'title'       => $this->title( $variant, $fields ),
+			'description' => $this->description( $variant, $fields ),
+		);
+		$tags = array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $fields['tags'] ?? array() ) ) ) );
+		if ( $tags ) {
+			$snippet['tags'] = $tags;
+		}
+		if ( ! empty( $fields['category_id'] ) ) {
+			$snippet['categoryId'] = sanitize_text_field( (string) $fields['category_id'] );
+		}
+		if ( ! empty( $fields['default_language'] ) ) {
+			$snippet['defaultLanguage'] = sanitize_text_field( (string) $fields['default_language'] );
+		}
+
+		$status = array( 'privacyStatus' => sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) ) );
+		if ( array_key_exists( 'embeddable', $fields ) ) {
+			$status['embeddable'] = (bool) $fields['embeddable'];
+		}
+		if ( ! empty( $fields['license'] ) ) {
+			$status['license'] = sanitize_key( (string) $fields['license'] );
+		}
+		if ( array_key_exists( 'public_stats_viewable', $fields ) ) {
+			$status['publicStatsViewable'] = (bool) $fields['public_stats_viewable'];
+		}
+		if ( array_key_exists( 'made_for_kids', $fields ) ) {
+			$status['selfDeclaredMadeForKids'] = (bool) $fields['made_for_kids'];
+		}
+		if ( array_key_exists( 'contains_synthetic_media', $fields ) ) {
+			$status['containsSyntheticMedia'] = (bool) $fields['contains_synthetic_media'];
+		}
+		if ( ! empty( $fields['publish_at'] ) ) {
+			$ts = strtotime( (string) $fields['publish_at'] );
+			if ( $ts ) {
+				$status['privacyStatus'] = 'private';
+				$status['publishAt'] = gmdate( 'c', $ts );
+			}
+		}
+		$metadata = array( 'snippet' => $snippet, 'status' => $status );
+		if ( ! empty( $fields['recording_date'] ) ) {
+			$ts = strtotime( (string) $fields['recording_date'] );
+			if ( $ts ) {
+				$metadata['recordingDetails'] = array( 'recordingDate' => gmdate( 'c', $ts ) );
+			}
+		}
+		return $metadata;
+	}
+
+	private function thumbnail_preflight( array $fields ): array {
+		if ( empty( $fields['thumbnail_attachment_id'] ) ) {
+			return array( 'ok' => true );
+		}
+		$id = absint( $fields['thumbnail_attachment_id'] );
+		if ( ! wp_attachment_is_image( $id ) ) {
+			return $this->failure( 'YouTube thumbnail_attachment_id must reference an image attachment.', false );
+		}
+		$mime = (string) get_post_mime_type( $id );
+		if ( ! in_array( $mime, array( 'image/jpeg', 'image/png' ), true ) ) {
+			return $this->failure( 'YouTube custom thumbnail must be JPEG or PNG.', false );
+		}
+		$file = get_attached_file( $id );
+		if ( ! $file || ! is_readable( $file ) ) {
+			return $this->failure( 'YouTube custom thumbnail file is not readable on the server.', false );
+		}
+		if ( filesize( $file ) > 10 * 1024 * 1024 ) {
+			return $this->failure( 'JK Social Hub locally limits custom thumbnails to 10 MB for server memory safety before calling YouTube thumbnails.set.', false );
+		}
+		return array( 'ok' => true );
+	}
+
+	private function short_metadata( string $file ): array {
+		if ( ! function_exists( 'wp_read_video_metadata' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/media.php';
+		}
+		$meta = function_exists( 'wp_read_video_metadata' ) ? wp_read_video_metadata( $file ) : array();
+		$width = (int) ( $meta['width'] ?? 0 );
+		$height = (int) ( $meta['height'] ?? 0 );
+		$duration = (float) ( $meta['length'] ?? 0 );
+		$checked = $width > 0 && $height > 0 && $duration > 0;
+		$eligible = $checked ? ( $width <= $height && $duration <= 180.0 ) : null;
+		return array( 'checked' => $checked, 'eligible_by_metadata' => $eligible, 'width' => $width, 'height' => $height, 'duration_seconds' => $duration );
+	}
+
+	private function playlist_ids( array $fields ): array {
+		$out = array();
+		foreach ( array_slice( (array) ( $fields['playlist_ids'] ?? array() ), 0, 20 ) as $id ) {
+			$id = sanitize_text_field( (string) $id );
+			if ( '' !== $id ) {
+				$out[] = $id;
+			}
+		}
+		return array_values( array_unique( $out ) );
+	}
+
+	private function tags_length( array $tags ): int {
+		$total = 0;
+		foreach ( $tags as $index => $tag ) {
+			$length = $this->strlen( (string) $tag );
+			if ( str_contains( (string) $tag, ' ' ) ) {
+				$length += 2;
+			}
+			$total += $length + ( $index > 0 ? 1 : 0 );
+		}
+		return $total;
+	}
+
+	private function strlen( string $value ): int {
+		return function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value );
+	}
+
+	private function failure( string $message, bool $retryable = false, array $details = array() ): array {
+		return array( 'ok' => false, 'message' => sanitize_textarea_field( $message ), 'retryable' => $retryable, 'response' => $details, 'details' => $details );
+	}
+}
