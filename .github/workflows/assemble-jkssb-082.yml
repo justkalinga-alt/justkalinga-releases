@@ -21,11 +21,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat staging/jkssb082full/part{00,01,02,03,04,05,06}.b64 | base64 -d > /tmp/jkssb082.zip
+          cat staging/jkssb082full/part{00,01,02,03,04,05,06}.b64 | base64 -d > /tmp/jkssb082.raw
+          python3 - <<'PY'
+          from pathlib import Path
+          raw = Path('/tmp/jkssb082.raw').read_bytes()
+          sig = raw.find(b'PK\\x03\\x04')
+          if sig < 0:
+              raise SystemExit('ZIP local header not found')
+          Path('/tmp/jkssb082.zip').write_bytes(raw[sig:])
+          print(f'trimmed_prefix_bytes={sig}')
+          PY
+          EXPECT='a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd'
           ACTUAL="$(sha256sum /tmp/jkssb082.zip | awk '{print $1}')"
           SIZE="$(stat -c%s /tmp/jkssb082.zip)"
           echo "assembled_sha256=$ACTUAL"
           echo "assembled_bytes=$SIZE"
+          test "$ACTUAL" = "$EXPECT"
+          test "$SIZE" = '40201'
           unzip -t /tmp/jkssb082.zip
           unzip -p /tmp/jkssb082.zip jk-social-supabase-bridge/jk-social-supabase-bridge.php > /tmp/jkssb082.php
           php -l /tmp/jkssb082.php
