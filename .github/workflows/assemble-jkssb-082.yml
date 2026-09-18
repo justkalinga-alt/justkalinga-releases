@@ -32,6 +32,7 @@ jobs:
           grep -q 'Version: 0.8.2' /tmp/jkssb082.php
           grep -q "add_shortcode( 'jk_social_upload'" /tmp/jkssb082.php
           mkdir -p dist reports
+          cp /tmp/jkssb082.php reports/jkssb-082-source.php.txt
           cp /tmp/jkssb082.zip dist/jk-social-supabase-bridge-v0.8.2.zip
           printf '%s\n' 'JK Social Supabase Bridge v0.8.2' "sha256=$ACTUAL" 'bytes=40201' 'shortcode=[jk_social_upload]' > reports/jkssb-082-manifest.txt
       - name: Commit distributable
@@ -40,7 +41,7 @@ jobs:
           set -euo pipefail
           git config user.name 'JK Social Maintenance Bot'
           git config user.email 'justkalinga@gmail.com'
-          git add dist/jk-social-supabase-bridge-v0.8.2.zip reports/jkssb-082-manifest.txt
+          git add dist/jk-social-supabase-bridge-v0.8.2.zip reports/jkssb-082-manifest.txt reports/jkssb-082-source.php.txt
           if git diff --cached --quiet; then
             echo 'Bridge 0.8.2 dist already current.'
           else
