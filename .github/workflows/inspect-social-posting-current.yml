@@ -1,0 +1,44 @@
+name: Inspect current Social posting sources
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/inspect-social-posting-current.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Extract exact current package sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/jksh085 /tmp/jkssb083
+          mkdir -p /tmp/jksh085 /tmp/jkssb083 reports/current
+          unzip -q dist/jk-social-hub-v0.8.5-autopilot.zip -d /tmp/jksh085
+          unzip -q dist/jk-social-supabase-bridge-v0.8.3.zip -d /tmp/jkssb083
+          cp /tmp/jkssb083/jk-social-supabase-bridge/jk-social-supabase-bridge.php reports/current/jkssb-083.php.txt
+          cp /tmp/jksh085/jk-social-hub/src/Services/MetaPublisher.php reports/current/MetaPublisher-085.php.txt
+          cp /tmp/jksh085/jk-social-hub/src/Services/PlatformSchema.php reports/current/PlatformSchema-085.php.txt
+          cp /tmp/jksh085/jk-social-hub/src/Services/YouTubePublisher.php reports/current/YouTubePublisher-085.php.txt
+          sha256sum dist/jk-social-hub-v0.8.5-autopilot.zip > reports/current/hub085.sha256.txt
+          sha256sum dist/jk-social-supabase-bridge-v0.8.3.zip > reports/current/bridge083.sha256.txt
+      - name: Commit inspection sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add reports/current
+          if ! git diff --cached --quiet; then
+            git commit -m 'Inspect current Social posting sources'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
