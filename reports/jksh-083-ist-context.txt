@@ -1445,6 +1445,1403 @@ final class LiveStreaming {
 	}
 }
 
+===== src/Services/LiveWorker.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\LiveStreamRepository;
+use JKSH\Repositories\LogRepository;
+
+final class LiveWorker {
+	private Settings $settings;
+	private LiveStreamRepository $streams;
+	private LiveSecretStore $secrets;
+	private LiveWorkerClient $client;
+	private LiveWorkerSigner $signer;
+
+	public function __construct() {
+		$this->settings = new Settings();
+		$this->streams  = new LiveStreamRepository();
+		$this->secrets  = new LiveSecretStore();
+		$this->client   = new LiveWorkerClient();
+		$this->signer   = new LiveWorkerSigner();
+	}
+
+	public function readiness( bool $probe = false ): array {
+		$keys = $this->signer->public_bundle();
+		$key_ok = ! empty( $keys['configured'] );
+		$health = $probe && $this->client->endpoint_valid() ? $this->client->health() : null;
+		$signed_handshake = $probe && $this->client->endpoint_valid() ? $this->client->signed_handshake() : null;
+		return array(
+			'contract_version' => 'jksh-relay-v1',
+			'enabled' => (bool) $this->settings->get( 'live_worker_enabled', 0 ),
+			'public_key_b64' => $key_ok ? base64_encode( (string) ( $keys['public_key_pem'] ?? '' ) ) : '',
+			'endpoint_configured' => '' !== $this->client->endpoint(),
+			'endpoint_valid' => $this->client->endpoint_valid(),
+			'ingest_base_configured' => '' !== trim( (string) $this->settings->get( 'live_worker_ingest_base', '' ) ),
+			'internal_ingest_base_configured' => '' !== trim( (string) $this->settings->get( 'live_worker_internal_ingest_base', 'rtmp://mediamtx:1935/jksh' ) ),
+			'signing_key_configured' => $key_ok,
+			'key_id' => $key_ok ? sanitize_text_field( (string) $keys['key_id'] ) : '',
+			'health' => $health,
+			'signed_handshake' => $signed_handshake,
+			'dry_run' => (bool) $this->settings->get( 'dry_run', 1 ),
+			'dispatch_possible' => $key_ok && $this->settings->get( 'live_worker_enabled', 0 ) && $this->client->endpoint_valid() && ! $this->settings->get( 'dry_run', 1 ),
+			'note' => 'The relay worker runs outside WordPress. Read-only health and signed handshake probes are allowed during Dry Run; stream dispatch remains blocked while global Dry Run is ON.',
+		);
+	}
+
+	public function pairing(): array|\WP_Error {
+		$bundle = $this->signer->ensure();
+		if ( is_wp_error( $bundle ) ) {
+			return $bundle;
+		}
+		return array(
+			'contract_version' => 'jksh-relay-v1',
+			'algorithm' => 'RSA-SHA256',
+			'key_id' => sanitize_text_field( (string) $bundle['key_id'] ),
+			'public_key_pem' => (string) $bundle['public_key_pem'],
+			'public_key_b64' => base64_encode( (string) $bundle['public_key_pem'] ),
+			'worker_paths' => array(
+				'health' => '/v1/health',
+				'start' => '/v1/jobs/start',
+				'stop' => '/v1/jobs/stop',
+				'status' => '/v1/jobs/status',
+			),
+			'note' => 'This is a public verification key, not a credential. The private signing key never leaves WordPress.',
+		);
+	}
+
+	public function preflight( int $id ): array|\WP_Error {
+		$row = $this->streams->get( $id );
+		if ( ! $row ) {
+			return new \WP_Error( 'jksh_worker_draft', 'Live stream draft not found.' );
+		}
+		$destinations = json_decode( (string) $row->destinations_json, true );
+		$destinations = is_array( $destinations ) ? $destinations : array();
+		$metadata = json_decode( (string) $row->metadata_json, true );
+		$metadata = is_array( $metadata ) ? $metadata : array();
+		$source = $this->source_for( $row );
+		$issues = array();
+		if ( is_wp_error( $source ) ) {
+			$issues[] = $source->get_error_message();
+		}
+		$outputs = array();
+		foreach ( $destinations as $platform ) {
+			$platform = sanitize_key( (string) $platform );
+			$resolved = $this->destination_for( $id, $platform, $metadata );
+			if ( is_wp_error( $resolved ) ) {
+				$issues[] = ucfirst( $platform ) . ': ' . $resolved->get_error_message();
+				continue;
+			}
+			$outputs[] = array( 'platform' => $platform, 'protocol' => $this->scheme_of( (string) $resolved ) );
+		}
+		return array(
+			'ok' => empty( $issues ),
+			'live_stream_id' => $id,
+			'source_type' => sanitize_key( (string) $row->source_type ),
+			'source_ready' => ! is_wp_error( $source ),
+			'destinations_requested' => array_values( array_map( 'sanitize_key', $destinations ) ),
+			'destinations_ready' => $outputs,
+			'issues' => array_values( $issues ),
+			'worker' => $this->readiness( false ),
+			'note' => 'Preflight never returns source URLs, destination URLs, stream names or stream keys.',
+		);
+	}
+
+	public function dispatch( array $input ): array|\WP_Error {
+		$id = absint( $input['live_stream_id'] ?? 0 );
+		if ( empty( $input['confirm'] ) ) {
+			return new \WP_Error( 'jksh_worker_confirm', 'confirm=true is required before starting the relay worker.' );
+		}
+		if ( $this->settings->get( 'dry_run', 1 ) ) {
+			return new \WP_Error( 'jksh_worker_dry_run', 'Relay-worker dispatch is blocked while global Dry Run is ON.' );
+		}
+		if ( ! $this->settings->get( 'live_worker_enabled', 0 ) ) {
+			return new \WP_Error( 'jksh_worker_switch', 'Live relay-worker master switch is OFF.' );
+		}
+		$preflight = $this->preflight( $id );
+		if ( is_wp_error( $preflight ) ) {
+			return $preflight;
+		}
+		if ( empty( $preflight['ok'] ) ) {
+			return new \WP_Error( 'jksh_worker_preflight', 'Relay-worker preflight failed: ' . implode( ' ', (array) $preflight['issues'] ) );
+		}
+		$row = $this->streams->get( $id );
+		$metadata = json_decode( (string) $row->metadata_json, true );
+		$metadata = is_array( $metadata ) ? $metadata : array();
+		$destinations = json_decode( (string) $row->destinations_json, true );
+		$destinations = is_array( $destinations ) ? $destinations : array();
+		$source = $this->source_for( $row );
+		if ( is_wp_error( $source ) ) {
+			return $source;
+		}
+		$outputs = array();
+		foreach ( $destinations as $platform ) {
+			$resolved = $this->destination_for( $id, sanitize_key( (string) $platform ), $metadata );
+			if ( is_wp_error( $resolved ) ) {
+				return $resolved;
+			}
+			$outputs[] = array( 'platform' => sanitize_key( (string) $platform ), 'url' => (string) $resolved );
+		}
+		$worker_id = 'jksh-live-' . $id . '-' . substr( str_replace( '-', '', (string) $row->uuid ), 0, 12 );
+		$response = $this->client->start(
+			array(
+				'job_id' => $worker_id,
+				'live_stream_id' => $id,
+				'source_url' => (string) $source,
+				'outputs' => $outputs,
+				'profile' => array(
+					'mode' => sanitize_key( (string) ( $metadata['relay_profile']['mode'] ?? 'copy' ) ),
+					'restart_on_failure' => true,
+				),
+			)
+		);
+		if ( empty( $response['ok'] ) ) {
+			$this->streams->update( $id, array( 'last_error' => (string) ( $response['message'] ?? 'Relay worker rejected the job.' ) ) );
+			return new \WP_Error( 'jksh_worker_start', 'Relay worker did not start: ' . sanitize_textarea_field( (string) ( $response['message'] ?? '' ) ) );
+		}
+		$this->streams->update( $id, array( 'worker_job_id' => $worker_id, 'status' => 'relay_starting', 'started_at' => current_time( 'mysql', true ), 'last_error' => '' ) );
+		( new LogRepository() )->add( array(
+			'action' => 'live_worker_start',
+			'result' => 'success',
+			'message' => 'Signed live relay-worker job dispatched.',
+			'context' => array( 'live_stream_id' => $id, 'worker_job_id' => $worker_id, 'destinations' => array_values( array_map( 'sanitize_key', $destinations ) ) ),
+		) );
+		return array( 'ok' => true, 'live_stream_id' => $id, 'worker_job_id' => $worker_id, 'status' => 'relay_starting', 'secrets_returned' => false );
+	}
+
+	public function stop( array $input ): array|\WP_Error {
+		$id = absint( $input['live_stream_id'] ?? 0 );
+		if ( empty( $input['confirm'] ) ) {
+			return new \WP_Error( 'jksh_worker_stop_confirm', 'confirm=true is required before stopping the relay worker.' );
+		}
+		$row = $this->streams->get( $id );
+		if ( ! $row || '' === (string) $row->worker_job_id ) {
+			return new \WP_Error( 'jksh_worker_job', 'No worker job is recorded for this live stream.' );
+		}
+		$response = $this->client->stop( (string) $row->worker_job_id );
+		if ( empty( $response['ok'] ) ) {
+			return new \WP_Error( 'jksh_worker_stop', 'Relay worker stop failed: ' . sanitize_textarea_field( (string) ( $response['message'] ?? '' ) ) );
+		}
+		$this->streams->update( $id, array( 'status' => 'relay_stopped', 'ended_at' => current_time( 'mysql', true ), 'last_error' => '' ) );
+		( new LogRepository() )->add( array( 'action' => 'live_worker_stop', 'result' => 'success', 'message' => 'Live relay-worker job stopped.', 'context' => array( 'live_stream_id' => $id, 'worker_job_id' => (string) $row->worker_job_id ) ) );
+		return array( 'ok' => true, 'live_stream_id' => $id, 'worker_job_id' => sanitize_text_field( (string) $row->worker_job_id ), 'status' => 'relay_stopped' );
+	}
+
+	private function source_for( object $row ): string|\WP_Error {
+		$source_json = json_decode( (string) $row->source_json, true );
+		$source_json = is_array( $source_json ) ? $source_json : array();
+		$reference = trim( (string) ( $source_json['reference'] ?? '' ) );
+		if ( '' !== $reference ) {
+			if ( preg_match( '#^(?:rtmps?|srt|https?)://#i', $reference ) ) {
+				return $reference;
+			}
+			return new \WP_Error( 'jksh_worker_source_scheme', 'Source reference must use RTMP, RTMPS, SRT, HTTP or HTTPS.' );
+		}
+		if ( 'rtmp_input' === (string) $row->source_type ) {
+			$base = rtrim( trim( (string) $this->settings->get( 'live_worker_internal_ingest_base', 'rtmp://mediamtx:1935/jksh' ) ), '/' );
+			if ( '' === $base || ! preg_match( '#^rtmps?://#i', $base ) ) {
+				return new \WP_Error( 'jksh_worker_ingest_base', 'No RTMP/RTMPS worker ingest base is configured.' );
+			}
+			$secret = $this->secrets->get( (int) $row->id, 'worker_ingest' );
+			$key = (string) ( $secret['stream_key'] ?? '' );
+			if ( '' === $key ) {
+				$key = 'jksh_' . wp_generate_password( 40, false, false );
+				$this->secrets->put( (int) $row->id, 'worker_ingest', array( 'stream_key' => $key ) );
+			}
+			return $base . '/' . rawurlencode( $key );
+		}
+		return new \WP_Error( 'jksh_worker_source', 'This live draft does not contain a relay-worker source URL.' );
+	}
+
+	private function destination_for( int $id, string $platform, array $metadata ): string|\WP_Error {
+		if ( 'youtube' === $platform ) {
+			$yt = (array) ( $metadata['youtube'] ?? array() );
+			$address = (string) ( $yt['rtmps_ingestion_address'] ?? $yt['ingestion_address'] ?? '' );
+			$key = (string) ( $this->secrets->get( $id, 'youtube' )['stream_name'] ?? '' );
+			if ( '' === $address || '' === $key ) {
+				return new \WP_Error( 'jksh_worker_youtube', 'YouTube Live has not been provisioned for this draft.' );
+			}
+			return rtrim( $address, '/' ) . '/' . rawurlencode( $key );
+		}
+		$secret = $this->secrets->get( $id, $platform );
+		$url = (string) ( $secret['stream_url'] ?? '' );
+		if ( '' === $url ) {
+			return new \WP_Error( 'jksh_worker_destination', 'No encrypted live ingest URL is stored for this destination.' );
+		}
+		if ( ! preg_match( '#^rtmps?://#i', $url ) ) {
+			return new \WP_Error( 'jksh_worker_destination_scheme', 'Destination ingest URL is not RTMP/RTMPS.' );
+		}
+		return $url;
+	}
+
+	private function scheme_of( string $url ): string {
+		$pos = strpos( $url, '://' );
+		return false === $pos ? '' : sanitize_key( substr( $url, 0, $pos ) );
+	}
+}
+
+===== src/Services/MetaPublisher.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+
+final class MetaPublisher {
+	private AccountRepository $accounts;
+	private MediaResolver $media;
+
+	public function __construct() {
+		$this->accounts = new AccountRepository();
+		$this->media    = new MediaResolver();
+	}
+
+	public function publish( object $variant, array $payload = array() ): array {
+		$platform = sanitize_key( (string) $variant->platform );
+		if ( ! in_array( $platform, array( 'facebook', 'instagram' ), true ) ) {
+			return $this->failure( 'Live publishing for ' . $platform . ' is not implemented in this release.', false );
+		}
+
+		$account = $this->primary_account( $platform );
+		if ( ! $account ) {
+			return $this->failure( ucfirst( $platform ) . ' is not connected.', false );
+		}
+		if ( 'connected' !== (string) $account->status ) {
+			return $this->failure( ucfirst( $platform ) . ' account is not healthy: ' . sanitize_text_field( (string) $account->status ) . '.', false );
+		}
+		if ( ! empty( $account->token_expires_at ) ) {
+			$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+			if ( false !== $expiry && $expiry <= time() ) {
+				return $this->failure( ucfirst( $platform ) . ' access token has expired. Reconnect Meta.', false );
+			}
+		}
+
+		$credentials = $this->accounts->credentials( $account );
+		$token = (string) ( $credentials['access_token'] ?? '' );
+		if ( '' === $token ) {
+			return $this->failure( ucfirst( $platform ) . ' access token is unavailable. Reconnect Meta.', false );
+		}
+
+		$settings = $this->accounts->settings( $account );
+		$client = new MetaClient( (string) ( $settings['graph_version'] ?? 'v25.0' ) );
+		$media_ids = json_decode( (string) ( $variant->media_json ?? '[]' ), true );
+		$media_ids = is_array( $media_ids ) ? $media_ids : array();
+		$resolved = $this->media->resolve_ids( $media_ids );
+		if ( ! $resolved['ok'] ) {
+			return $this->failure( implode( ' ', $resolved['errors'] ), false );
+		}
+
+		$caption = $this->compose_caption( $variant );
+		if ( 'instagram' === $platform && function_exists( 'mb_strlen' ) && mb_strlen( $caption ) > 2200 ) {
+			return $this->failure( 'Instagram caption exceeds 2,200 characters. Edit the Instagram variant before publishing.', false );
+		}
+
+		if ( 'facebook' === $platform ) {
+			return $this->publish_facebook( $client, $account, $token, $variant, $caption, $resolved['items'], $payload );
+		}
+		return $this->publish_instagram( $client, $account, $token, $variant, $caption, $resolved['items'], $payload );
+	}
+
+	public function preflight( object $variant ): array {
+		$platform = sanitize_key( (string) $variant->platform );
+		if ( ! in_array( $platform, array( 'facebook', 'instagram' ), true ) ) {
+			return array( 'ok' => true, 'message' => 'No Meta preflight required for ' . $platform . '.', 'details' => array( 'platform' => $platform ) );
+		}
+
+		$account = $this->primary_account( $platform );
+		if ( ! $account || 'connected' !== (string) $account->status ) {
+			return array( 'ok' => false, 'message' => ucfirst( $platform ) . ' is not connected and healthy.', 'details' => array( 'platform' => $platform ) );
+		}
+		$credentials = $this->accounts->credentials( $account );
+		if ( empty( $credentials['access_token'] ) ) {
+			return array( 'ok' => false, 'message' => ucfirst( $platform ) . ' access token is missing.', 'details' => array( 'platform' => $platform ) );
+		}
+		if ( ! empty( $account->token_expires_at ) ) {
+			$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+			if ( false !== $expiry && $expiry <= time() ) {
+				return array( 'ok' => false, 'message' => ucfirst( $platform ) . ' access token is expired.', 'details' => array( 'platform' => $platform ) );
+			}
+		}
+
+		$media_ids = json_decode( (string) ( $variant->media_json ?? '[]' ), true );
+		$media_ids = is_array( $media_ids ) ? $media_ids : array();
+		$resolved = $this->media->resolve_ids( $media_ids );
+		if ( ! $resolved['ok'] ) {
+			return array( 'ok' => false, 'message' => implode( ' ', $resolved['errors'] ), 'details' => array( 'platform' => $platform ) );
+		}
+
+		$media = $resolved['items'];
+		$type = sanitize_key( (string) $variant->publication_type );
+		$caption = $this->compose_caption( $variant );
+		if ( 'instagram' === $platform && function_exists( 'mb_strlen' ) && mb_strlen( $caption ) > 2200 ) {
+			return array( 'ok' => false, 'message' => 'Instagram caption exceeds 2,200 characters.', 'details' => array( 'platform' => $platform, 'caption_length' => mb_strlen( $caption ) ) );
+		}
+
+		if ( 'facebook' === $platform ) {
+			if ( 'reel' === $type ) {
+				$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+				if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+					return array( 'ok' => false, 'message' => 'Facebook Reel requires exactly one video attachment.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			} elseif ( $media ) {
+				$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+				if ( count( $images ) !== count( $media ) || count( $images ) > 10 ) {
+					return array( 'ok' => false, 'message' => 'Facebook image post must contain 1-10 image attachments only.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			}
+		} else {
+			if ( 'reel' === $type ) {
+				$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+				if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+					return array( 'ok' => false, 'message' => 'Instagram Reel requires exactly one video attachment.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			} else {
+				$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+				if ( ! $media || count( $images ) !== count( $media ) || count( $images ) > 10 ) {
+					return array( 'ok' => false, 'message' => 'Instagram image post/carousel must contain 1-10 image attachments.', 'details' => array( 'platform' => $platform, 'media_count' => count( $media ) ) );
+				}
+			}
+		}
+
+		return array(
+			'ok'      => true,
+			'message' => ucfirst( $platform ) . ' variant passed local publishing preflight.',
+			'details' => array(
+				'platform'         => $platform,
+				'publication_type' => $type,
+				'media_count'      => count( $media ),
+				'media_types'      => array_values( array_unique( array_map( static fn( array $item ): string => $item['type'], $media ) ) ),
+				'field_mapping'     => ( new PlatformSchema() )->summarize_fields( $platform, $this->platform_fields( $variant ) ),
+			),
+		);
+	}
+
+	public function readiness(): array {
+		$settings = new Settings();
+		$items = array();
+		foreach ( array( 'facebook', 'instagram' ) as $platform ) {
+			$account = $this->primary_account( $platform );
+			$row = array(
+				'platform'  => $platform,
+				'connected' => false,
+				'healthy'   => false,
+				'name'      => '',
+				'external_account_id' => '',
+				'token_expires_at' => null,
+				'issues'    => array(),
+			);
+			if ( ! $account ) {
+				$row['issues'][] = 'No connected account.';
+				$items[] = $row;
+				continue;
+			}
+			$row['connected'] = true;
+			$row['name'] = sanitize_text_field( (string) $account->account_name );
+			$row['external_account_id'] = sanitize_text_field( (string) $account->external_account_id );
+			$row['token_expires_at'] = $account->token_expires_at ? sanitize_text_field( (string) $account->token_expires_at ) : null;
+			if ( 'connected' !== (string) $account->status ) {
+				$row['issues'][] = 'Stored account status is ' . sanitize_key( (string) $account->status ) . '.';
+			}
+			if ( ! empty( $account->token_expires_at ) ) {
+				$expiry = strtotime( (string) $account->token_expires_at . ' UTC' );
+				if ( false !== $expiry && $expiry <= time() ) {
+					$row['issues'][] = 'Token is expired.';
+				}
+			}
+			$credentials = $this->accounts->credentials( $account );
+			if ( empty( $credentials['access_token'] ) ) {
+				$row['issues'][] = 'Encrypted access token is missing.';
+			}
+			$row['healthy'] = empty( $row['issues'] );
+			$items[] = $row;
+		}
+
+		$all_healthy = 2 === count( array_filter( $items, static fn( array $item ): bool => ! empty( $item['healthy'] ) ) );
+		return array(
+			'dry_run'                   => (bool) $settings->get( 'dry_run', 1 ),
+			'meta_live_publish_enabled' => (bool) $settings->get( 'meta_live_publish_enabled', 0 ),
+			'live_publish_possible'     => $all_healthy && ! $settings->get( 'dry_run', 1 ) && $settings->get( 'meta_live_publish_enabled', 0 ),
+			'accounts'                  => $items,
+			'supported'                 => array(
+				'facebook'  => array( 'text_post', 'single_image', 'multi_image_post', 'reel' ),
+				'instagram' => array( 'single_image', 'image_carousel', 'reel' ),
+			),
+			'safety'                    => 'Jobs capture publish_mode when scheduled. A dry-run job cannot become live later merely because settings change.',
+		);
+	}
+
+	private function publish_facebook( MetaClient $client, object $account, string $token, object $variant, string $caption, array $media, array $payload ): array {
+		$page_id = sanitize_text_field( (string) $account->external_account_id );
+		$type = sanitize_key( (string) $variant->publication_type );
+
+		if ( 'reel' === $type ) {
+			$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+			if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+				return $this->failure( 'Facebook Reel publishing requires exactly one video attachment.', false );
+			}
+			return $this->facebook_reel( $client, $token, $variant, $caption, $videos[0], $payload );
+		}
+
+		if ( empty( $media ) ) {
+			$result = $client->post( $page_id . '/feed', $token, array( 'message' => $caption ) );
+			return $this->finish_graph_publish( $client, $result, $token, 'Facebook post published.', $payload );
+		}
+
+		$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+		if ( count( $images ) !== count( $media ) ) {
+			return $this->failure( 'Facebook non-Reel publishing currently supports image attachments only.', false );
+		}
+		if ( count( $images ) > 10 ) {
+			return $this->failure( 'Facebook multi-image publishing is limited to 10 images per JK Social Hub post.', false );
+		}
+
+		if ( 1 === count( $images ) ) {
+			$result = $client->post(
+				$page_id . '/photos',
+				$token,
+				array(
+					'url'     => $images[0]['url'],
+					'caption' => $caption,
+				)
+			);
+			return $this->finish_graph_publish( $client, $result, $token, 'Facebook photo published.', $payload );
+		}
+
+		$photo_ids = array();
+		foreach ( $images as $image ) {
+			$upload = $client->post(
+				$page_id . '/photos',
+				$token,
+				array(
+					'url'       => $image['url'],
+					'published' => 'false',
+				)
+			);
+			if ( ! $upload['ok'] || empty( $upload['data']['id'] ) ) {
+				return $this->from_api_error( $upload, 'Facebook image staging failed.' );
+			}
+			$photo_ids[] = sanitize_text_field( (string) $upload['data']['id'] );
+		}
+
+		$params = array( 'message' => $caption );
+		foreach ( $photo_ids as $index => $photo_id ) {
+			$params[ 'attached_media[' . $index . ']' ] = wp_json_encode( array( 'media_fbid' => $photo_id ) );
+		}
+		$result = $client->post( $page_id . '/feed', $token, $params );
+		return $this->finish_graph_publish( $client, $result, $token, 'Facebook multi-image post published.', $payload );
+	}
+
+	private function facebook_reel( MetaClient $client, string $token, object $variant, string $caption, array $video, array $payload ): array {
+		$start = $client->post( 'me/video_reels', $token, array( 'upload_phase' => 'start' ) );
+		if ( ! $start['ok'] || empty( $start['data']['video_id'] ) || empty( $start['data']['upload_url'] ) ) {
+			return $this->from_api_error( $start, 'Facebook Reel upload session could not be created.' );
+		}
+		$video_id  = sanitize_text_field( (string) $start['data']['video_id'] );
+		$upload_url = esc_url_raw( (string) $start['data']['upload_url'] );
+		$upload = $client->post_absolute(
+			$upload_url,
+			array(
+				'Authorization' => 'OAuth ' . $token,
+				'file_url'      => $video['url'],
+				'Accept'        => 'application/json',
+			)
+		);
+		if ( ! $upload['ok'] ) {
+			return $this->from_api_error( $upload, 'Facebook Reel video transfer failed.' );
+		}
+
+		$finish = $client->post(
+			'me/video_reels',
+			$token,
+			array(
+				'video_id'     => $video_id,
+				'upload_phase' => 'finish',
+				'video_state'  => 'PUBLISHED',
+				'description'  => $caption,
+				'title'        => sanitize_text_field( (string) $variant->title ),
+			)
+		);
+		if ( ! $finish['ok'] || empty( $finish['data']['success'] ) ) {
+			return $this->from_api_error( $finish, 'Facebook Reel publish step failed.' );
+		}
+		$permalink = $this->permalink( $client, $video_id, $token );
+		return $this->success( $video_id, $permalink, 'Facebook Reel accepted for publishing.', $finish['data'], $payload );
+	}
+
+	private function publish_instagram( MetaClient $client, object $account, string $token, object $variant, string $caption, array $media, array $payload ): array {
+		$ig_id = sanitize_text_field( (string) $account->external_account_id );
+		$type  = sanitize_key( (string) $variant->publication_type );
+		$fields = $this->platform_fields( $variant );
+		$state = isset( $payload['meta_state'] ) && is_array( $payload['meta_state'] ) ? $payload['meta_state'] : array();
+		$poll_count = (int) ( $state['poll_count'] ?? 0 );
+		if ( $poll_count > 20 ) {
+			return $this->failure( 'Instagram media processing did not finish within the JK Social Hub wait window.', false );
+		}
+
+		if ( 'reel' === $type ) {
+			$videos = array_values( array_filter( $media, static fn( array $item ): bool => 'video' === $item['type'] ) );
+			if ( 1 !== count( $videos ) || 1 !== count( $media ) ) {
+				return $this->failure( 'Instagram Reel publishing requires exactly one video attachment.', false );
+			}
+			if ( empty( $state['container_id'] ) ) {
+				$params = array(
+					'media_type'    => 'REELS',
+					'video_url'     => $videos[0]['url'],
+					'caption'       => $caption,
+					'share_to_feed' => array_key_exists( 'share_to_feed', $fields ) ? ( ! empty( $fields['share_to_feed'] ) ? 'true' : 'false' ) : 'true',
+				);
+				$params = array_merge( $params, $this->instagram_common_params( $fields, false ) );
+				if ( ! empty( $fields['cover_attachment_id'] ) ) {
+					$cover = wp_get_attachment_url( absint( $fields['cover_attachment_id'] ) );
+					if ( $cover ) {
+						$params['cover_url'] = esc_url_raw( $cover );
+					}
+				}
+				if ( isset( $fields['thumb_offset_ms'] ) ) {
+					$params['thumb_offset'] = max( 0, (int) $fields['thumb_offset_ms'] );
+				}
+				$create = $client->post( $ig_id . '/media', $token, $params );
+				if ( ! $create['ok'] || empty( $create['data']['id'] ) ) {
+					return $this->from_api_error( $create, 'Instagram Reel container creation failed.' );
+				}
+				$state = array( 'phase' => 'reel_wait', 'container_id' => sanitize_text_field( (string) $create['data']['id'] ), 'poll_count' => 0 );
+				return $this->pending( $payload, $state, 30, 'Instagram Reel uploaded. Waiting for Meta processing.' );
+			}
+			return $this->instagram_publish_when_ready( $client, $ig_id, $token, $payload, $state, 'Instagram Reel published.' );
+		}
+
+		if ( empty( $media ) ) {
+			return $this->failure( 'Instagram publishing requires at least one media attachment.', false );
+		}
+		$images = array_values( array_filter( $media, static fn( array $item ): bool => 'image' === $item['type'] ) );
+		if ( count( $images ) !== count( $media ) ) {
+			return $this->failure( 'Instagram v0.4.0 supports image posts/carousels or one-video Reels. Mixed image/video carousels are blocked.', false );
+		}
+		if ( count( $images ) > 10 ) {
+			return $this->failure( 'Instagram carousels are limited to 10 media items.', false );
+		}
+
+		if ( 1 === count( $images ) ) {
+			if ( empty( $state['container_id'] ) ) {
+				$params = array(
+					'image_url' => $images[0]['url'],
+					'caption'   => $caption,
+				);
+				$params = array_merge( $params, $this->instagram_common_params( $fields, true, $images[0], 0 ) );
+				$create = $client->post( $ig_id . '/media', $token, $params );
+				if ( ! $create['ok'] || empty( $create['data']['id'] ) ) {
+					return $this->from_api_error( $create, 'Instagram image container creation failed.' );
+				}
+				$state = array( 'phase' => 'image_wait', 'container_id' => sanitize_text_field( (string) $create['data']['id'] ), 'poll_count' => 0 );
+				return $this->pending( $payload, $state, 10, 'Instagram image container created. Waiting for Meta processing.' );
+			}
+			return $this->instagram_publish_when_ready( $client, $ig_id, $token, $payload, $state, 'Instagram image published.' );
+		}
+
+		if ( empty( $state['child_ids'] ) ) {
+			$child_ids = array();
+			foreach ( $images as $index => $image ) {
+				$item_fields = $this->instagram_media_fields( $fields, $image, $index );
+				$params = array(
+					'image_url'        => $image['url'],
+					'is_carousel_item' => 'true',
+				);
+				$params = array_merge( $params, $this->instagram_common_params( $item_fields, true, $image, $index, false ) );
+				$child = $client->post( $ig_id . '/media', $token, $params );
+				if ( ! $child['ok'] || empty( $child['data']['id'] ) ) {
+					return $this->from_api_error( $child, 'Instagram carousel item creation failed.' );
+				}
+				$child_ids[] = sanitize_text_field( (string) $child['data']['id'] );
+			}
+			$state = array( 'phase' => 'carousel_children_wait', 'child_ids' => $child_ids, 'poll_count' => 0 );
+			return $this->pending( $payload, $state, 10, 'Instagram carousel items created. Waiting for Meta processing.' );
+		}
+
+		if ( 'carousel_children_wait' === (string) ( $state['phase'] ?? '' ) ) {
+			$readiness = $this->containers_ready( $client, (array) $state['child_ids'], $token );
+			if ( ! $readiness['ok'] ) {
+				return $readiness;
+			}
+			if ( ! $readiness['ready'] ) {
+				$state['poll_count'] = $poll_count + 1;
+				return $this->pending( $payload, $state, 20, 'Instagram carousel items are still processing.' );
+			}
+			$params = array(
+				'media_type' => 'CAROUSEL',
+				'children'   => implode( ',', array_map( 'sanitize_text_field', (array) $state['child_ids'] ) ),
+				'caption'    => $caption,
+			);
+			$params = array_merge( $params, $this->instagram_common_params( $fields, false ) );
+			$parent = $client->post( $ig_id . '/media', $token, $params );
+			if ( ! $parent['ok'] || empty( $parent['data']['id'] ) ) {
+				return $this->from_api_error( $parent, 'Instagram carousel container creation failed.' );
+			}
+			$state = array(
+				'phase'        => 'carousel_parent_wait',
+				'container_id' => sanitize_text_field( (string) $parent['data']['id'] ),
+				'child_ids'    => array_values( array_map( 'sanitize_text_field', (array) $state['child_ids'] ) ),
+				'poll_count'   => 0,
+			);
+			return $this->pending( $payload, $state, 10, 'Instagram carousel container created. Waiting for final processing.' );
+		}
+
+		return $this->instagram_publish_when_ready( $client, $ig_id, $token, $payload, $state, 'Instagram carousel published.' );
+	}
+
+	private function instagram_common_params( array $fields, bool $allow_alt, ?array $media = null, int $index = 0, bool $allow_parent_fields = true ): array {
+		$params = array();
+		if ( $allow_parent_fields && ! empty( $fields['location_id'] ) ) {
+			$params['location_id'] = sanitize_text_field( (string) $fields['location_id'] );
+		}
+		if ( ! empty( $fields['user_tags'] ) && is_array( $fields['user_tags'] ) ) {
+			$params['user_tags'] = wp_json_encode( $this->sanitize_tag_rows( $fields['user_tags'] ) );
+		}
+		if ( $allow_parent_fields && ! empty( $fields['collaborators'] ) && is_array( $fields['collaborators'] ) ) {
+			$params['collaborators'] = wp_json_encode( array_values( array_filter( array_map( static fn( $v ): string => ltrim( sanitize_text_field( (string) $v ), '@' ), $fields['collaborators'] ) ) ) );
+		}
+		if ( $allow_alt && isset( $fields['alt_text'] ) && '' !== trim( (string) $fields['alt_text'] ) ) {
+			$params['alt_text'] = sanitize_textarea_field( (string) $fields['alt_text'] );
+		}
+		return $params;
+	}
+
+	private function instagram_media_fields( array $fields, array $media, int $index ): array {
+		$per = isset( $fields['media_fields'] ) && is_array( $fields['media_fields'] ) ? $fields['media_fields'] : array();
+		$candidates = array( (string) ( $media['id'] ?? '' ), (string) $index );
+		foreach ( $candidates as $key ) {
+			if ( '' !== $key && isset( $per[ $key ] ) && is_array( $per[ $key ] ) ) {
+				return $per[ $key ];
+			}
+		}
+		return array();
+	}
+
+	private function sanitize_tag_rows( array $rows ): array {
+		$out = array();
+		foreach ( $rows as $row ) {
+			if ( ! is_array( $row ) || empty( $row['username'] ) ) {
+				continue;
+			}
+			$item = array( 'username' => ltrim( sanitize_text_field( (string) $row['username'] ), '@' ) );
+			if ( isset( $row['x'] ) ) {
+				$item['x'] = max( 0, min( 1, (float) $row['x'] ) );
+			}
+			if ( isset( $row['y'] ) ) {
+				$item['y'] = max( 0, min( 1, (float) $row['y'] ) );
+			}
+			$out[] = $item;
+		}
+		return $out;
+	}
+
+	private function instagram_publish_when_ready( MetaClient $client, string $ig_id, string $token, array $payload, array $state, string $message ): array {
+		$container_id = sanitize_text_field( (string) ( $state['container_id'] ?? '' ) );
+		if ( '' === $container_id ) {
+			return $this->failure( 'Instagram publish state is missing the media container ID.', false );
+		}
+		$status = $this->container_status( $client, $container_id, $token );
+		if ( ! $status['ok'] ) {
+			return $status;
+		}
+		if ( ! $status['ready'] ) {
+			$state['poll_count'] = (int) ( $state['poll_count'] ?? 0 ) + 1;
+			return $this->pending( $payload, $state, 20, 'Instagram media is still processing.' );
+		}
+		$publish = $client->post( $ig_id . '/media_publish', $token, array( 'creation_id' => $container_id ) );
+		if ( ! $publish['ok'] || empty( $publish['data']['id'] ) ) {
+			return $this->from_api_error( $publish, 'Instagram media publish step failed.' );
+		}
+		$media_id = sanitize_text_field( (string) $publish['data']['id'] );
+		$permalink = $this->permalink( $client, $media_id, $token );
+		return $this->success( $media_id, $permalink, $message, $publish['data'], $payload );
+	}
+
+	private function containers_ready( MetaClient $client, array $ids, string $token ): array {
+		foreach ( $ids as $id ) {
+			$status = $this->container_status( $client, sanitize_text_field( (string) $id ), $token );
+			if ( ! $status['ok'] ) {
+				return $status;
+			}
+			if ( ! $status['ready'] ) {
+				return array( 'ok' => true, 'ready' => false );
+			}
+		}
+		return array( 'ok' => true, 'ready' => true );
+	}
+
+	private function container_status( MetaClient $client, string $container_id, string $token ): array {
+		$result = $client->get( $container_id, $token, array( 'fields' => 'status_code,status' ) );
+		if ( ! $result['ok'] ) {
+			return $this->from_api_error( $result, 'Instagram container status check failed.' );
+		}
+		$status = strtoupper( sanitize_text_field( (string) ( $result['data']['status_code'] ?? '' ) ) );
+		if ( in_array( $status, array( 'ERROR', 'EXPIRED' ), true ) ) {
+			return $this->failure( 'Instagram media container failed: ' . sanitize_text_field( (string) ( $result['data']['status'] ?? $status ) ), false );
+		}
+		return array( 'ok' => true, 'ready' => 'FINISHED' === $status );
+	}
+
+	private function finish_graph_publish( MetaClient $client, array $result, string $token, string $message, array $payload ): array {
+		if ( ! $result['ok'] ) {
+			return $this->from_api_error( $result, $message . ' Meta returned an error.' );
+		}
+		$id = sanitize_text_field( (string) ( $result['data']['post_id'] ?? $result['data']['id'] ?? '' ) );
+		if ( '' === $id ) {
+			return $this->failure( $message . ' Meta did not return an external ID.', true );
+		}
+		return $this->success( $id, $this->permalink( $client, $id, $token ), $message, $result['data'], $payload );
+	}
+
+	private function permalink( MetaClient $client, string $external_id, string $token ): string {
+		$result = $client->get( $external_id, $token, array( 'fields' => 'permalink_url,permalink' ) );
+		if ( ! $result['ok'] ) {
+			return '';
+		}
+		return esc_url_raw( (string) ( $result['data']['permalink_url'] ?? $result['data']['permalink'] ?? '' ) );
+	}
+
+	private function primary_account( string $platform ): ?object {
+		$rows = $this->accounts->connected( $platform );
+		if ( ! $rows ) {
+			return null;
+		}
+		if ( 'facebook' === $platform ) {
+			$preferred = ( new MetaConnector() )->preferred_page_id();
+			if ( '' !== $preferred ) {
+				foreach ( $rows as $row ) {
+					if ( $preferred === (string) $row->external_account_id ) {
+						return $row;
+					}
+				}
+			}
+		}
+		if ( 'instagram' === $platform ) {
+			$facebook = $this->primary_account( 'facebook' );
+			if ( $facebook ) {
+				foreach ( $rows as $row ) {
+					if ( (int) $row->parent_account_id === (int) $facebook->id ) {
+						return $row;
+					}
+				}
+			}
+		}
+		return $rows[0];
+	}
+
+
+	private function platform_fields( object $variant ): array {
+		$fields = json_decode( (string) ( $variant->fields_json ?? '{}' ), true );
+		return is_array( $fields ) ? $fields : array();
+	}
+
+
+	private function compose_caption( object $variant ): string {
+		$parts = array_filter(
+			array(
+				trim( (string) $variant->caption ),
+				trim( (string) $variant->hashtags ),
+				trim( (string) $variant->cta ),
+			),
+			static fn( string $value ): bool => '' !== $value
+		);
+		return sanitize_textarea_field( implode( "\n\n", $parts ) );
+	}
+
+	private function pending( array $payload, array $state, int $delay, string $message ): array {
+		$payload['meta_state'] = $state;
+		return array(
+			'ok'         => true,
+			'pending'    => true,
+			'delay'      => max( 10, $delay ),
+			'message'    => $message,
+			'payload'    => $payload,
+			'external_id'=> sanitize_text_field( (string) ( $state['container_id'] ?? '' ) ),
+			'external_url' => '',
+			'response'   => array( 'state' => $state ),
+		);
+	}
+
+	private function success( string $external_id, string $external_url, string $message, array $response, array $payload ): array {
+		unset( $payload['meta_state'] );
+		return array(
+			'ok'           => true,
+			'pending'      => false,
+			'message'      => $message,
+			'external_id'  => sanitize_text_field( $external_id ),
+			'external_url' => esc_url_raw( $external_url ),
+			'response'     => $this->sanitize_response( $response ),
+			'payload'      => $payload,
+		);
+	}
+
+	private function from_api_error( array $result, string $prefix ): array {
+		$code = (int) ( $result['code'] ?? 0 );
+		$message = trim( $prefix . ' ' . sanitize_text_field( (string) ( $result['message'] ?? 'Unknown Meta API error.' ) ) );
+		return array(
+			'ok'         => false,
+			'pending'    => false,
+			'message'    => $message,
+			'api_code'   => $code,
+			'retryable'  => $this->retryable_code( $code ),
+			'response'   => array( 'api_code' => $code, 'error_subcode' => (int) ( $result['error_subcode'] ?? 0 ) ),
+		);
+	}
+
+	private function failure( string $message, bool $retryable ): array {
+		return array(
+			'ok'        => false,
+			'pending'   => false,
+			'message'   => sanitize_textarea_field( $message ),
+			'api_code'  => 0,
+			'retryable' => $retryable,
+			'response'  => array(),
+		);
+	}
+
+	private function retryable_code( int $code ): bool {
+		return in_array( $code, array( 1, 2, 4, 17, 32, 341, 613 ), true ) || $code >= 500;
+	}
+
+	private function sanitize_response( array $response ): array {
+		$safe = array();
+		foreach ( $response as $key => $value ) {
+			$key = sanitize_key( (string) $key );
+			if ( preg_match( '/token|secret|authorization|cookie/i', $key ) ) {
+				continue;
+			}
+			if ( is_array( $value ) ) {
+				$safe[ $key ] = $this->sanitize_response( $value );
+			} elseif ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+				$safe[ $key ] = $value;
+			} else {
+				$safe[ $key ] = sanitize_textarea_field( (string) $value );
+			}
+		}
+		return $safe;
+	}
+}
+
+===== src/Services/YouTubePublisher.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+
+final class YouTubePublisher {
+	private AccountRepository $accounts;
+	private YouTubeClient $client;
+
+	public function __construct() {
+		$this->accounts = new AccountRepository();
+		$this->client   = new YouTubeClient();
+	}
+
+	public function readiness(): array {
+		$settings = new Settings();
+		$account  = $this->primary_account();
+		$issues   = array();
+		$name     = '';
+		$external = '';
+		$expiry   = null;
+
+		if ( ! $account ) {
+			$issues[] = 'No connected YouTube channel.';
+		} else {
+			$name     = sanitize_text_field( (string) $account->account_name );
+			$external = sanitize_text_field( (string) $account->external_account_id );
+			$expiry   = $account->token_expires_at ? sanitize_text_field( (string) $account->token_expires_at ) : null;
+			$credentials = $this->accounts->credentials( $account );
+			if ( empty( $credentials['refresh_token'] ) ) {
+				$issues[] = 'Encrypted YouTube refresh token is missing.';
+			}
+		}
+		if ( ! function_exists( 'curl_init' ) ) {
+			$issues[] = 'PHP cURL is required for streamed YouTube video uploads.';
+		}
+
+		$connected = $account && empty( $issues );
+		return array(
+			'dry_run'                       => (bool) $settings->get( 'dry_run', 1 ),
+			'youtube_live_publish_enabled'   => (bool) $settings->get( 'youtube_live_publish_enabled', 0 ),
+			'live_publish_possible'          => $connected && ! $settings->get( 'dry_run', 1 ) && $settings->get( 'youtube_live_publish_enabled', 0 ),
+			'account'                        => array(
+				'connected'           => (bool) $account,
+				'healthy'             => $connected,
+				'name'                => $name,
+				'external_account_id' => $external,
+				'token_expires_at'    => $expiry,
+				'issues'              => $issues,
+			),
+			'supported'                      => array( 'video', 'short' ),
+			'community_post'                 => 'stored_for_worker_or_manual_path',
+			'upload_transport'                => 'YouTube resumable upload with streamed file body',
+			'api_project_privacy_caveat'      => 'Google may force uploads from unverified API projects created after 2020-07-28 to private until the project passes a YouTube API audit.',
+			'safety'                         => 'Dry Run validates the exact YouTube payload without calling videos.insert. Live upload also requires the separate YouTube master switch.',
+		);
+	}
+
+	public function preflight( object $variant ): array {
+		$account = $this->primary_account();
+		if ( ! $account ) {
+			return $this->failure( 'No connected YouTube channel is available.', false );
+		}
+		$type   = sanitize_key( (string) $variant->publication_type );
+		$fields = $this->fields( $variant );
+		$media  = $this->media( $variant );
+
+		if ( 'community_post' === $type ) {
+			return array(
+				'ok'      => true,
+				'message' => 'YouTube Community Post package passed local Dry Run packaging. Publishing remains on the manual/worker path.',
+				'details' => array(
+					'platform'         => 'youtube',
+					'publication_type' => $type,
+					'media_count'      => count( $media ),
+					'adapter'          => 'worker_or_manual_path',
+					'field_mapping'    => ( new PlatformSchema() )->summarize_fields( 'youtube', $fields ),
+				),
+			);
+		}
+		if ( ! in_array( $type, array( 'video', 'short' ), true ) ) {
+			return $this->failure( 'YouTube publishing currently supports video and short variants only.', false );
+		}
+		if ( 1 !== count( $media ) ) {
+			return $this->failure( 'YouTube video/Short publishing requires exactly one video attachment.', false );
+		}
+		$item = $media[0];
+		if ( 'video' !== $item['type'] ) {
+			return $this->failure( 'The YouTube video/Short attachment must be a video file.', false );
+		}
+		$file = get_attached_file( (int) $item['id'] );
+		if ( ! $file || ! is_readable( $file ) || filesize( $file ) < 1 ) {
+			return $this->failure( 'The YouTube video attachment is not readable on the server.', false );
+		}
+		if ( filesize( $file ) > 256 * 1024 * 1024 * 1024 ) {
+			return $this->failure( 'The YouTube video exceeds the 256 GB API upload limit.', false );
+		}
+
+		$title = $this->title( $variant, $fields );
+		if ( '' === $title ) {
+			return $this->failure( 'YouTube title is required.', false );
+		}
+		if ( $this->strlen( $title ) > 100 ) {
+			return $this->failure( 'YouTube title exceeds 100 characters.', false );
+		}
+		$description = $this->description( $variant, $fields );
+		if ( strlen( $description ) > 5000 ) {
+			return $this->failure( 'YouTube description exceeds the 5000-byte API limit.', false );
+		}
+		$tags = array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $fields['tags'] ?? array() ) ) ) );
+		if ( $this->tags_length( $tags ) > 500 ) {
+			return $this->failure( 'YouTube tags exceed the 500-character API limit after commas/quoted spaces are counted.', false );
+		}
+
+		$privacy = sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) );
+		if ( ! in_array( $privacy, array( 'private', 'unlisted', 'public' ), true ) ) {
+			return $this->failure( 'YouTube privacy_status must be private, unlisted or public.', false );
+		}
+		if ( ! empty( $fields['publish_at'] ) ) {
+			$publish_ts = strtotime( (string) $fields['publish_at'] );
+			if ( ! $publish_ts ) {
+				return $this->failure( 'YouTube publish_at is not a valid date/time.', false );
+			}
+			if ( 'private' !== $privacy ) {
+				return $this->failure( 'YouTube publish_at requires privacy_status=private.', false );
+			}
+		}
+
+		$thumb = $this->thumbnail_preflight( $fields );
+		if ( ! $thumb['ok'] ) {
+			return $thumb;
+		}
+
+		$short = array( 'checked' => false, 'eligible_by_metadata' => null );
+		if ( 'short' === $type ) {
+			$short = $this->short_metadata( $file );
+			if ( false === $short['eligible_by_metadata'] ) {
+				return $this->failure( 'This Short is clearly outside YouTube Shorts shape/duration rules: it must be square or vertical and no longer than 3 minutes.', false, array( 'short_validation' => $short ) );
+			}
+		}
+
+		return array(
+			'ok'      => true,
+			'message' => 'YouTube variant passed local publishing preflight.',
+			'details' => array(
+				'platform'         => 'youtube',
+				'publication_type' => $type,
+				'media_count'      => 1,
+				'media_types'      => array( 'video' ),
+				'bytes'            => (int) filesize( $file ),
+				'privacy_status'   => $privacy,
+				'short_validation' => $short,
+				'field_mapping'    => ( new PlatformSchema() )->summarize_fields( 'youtube', $fields ),
+			),
+		);
+	}
+
+	public function publish( object $variant, array $payload = array() ): array {
+		$preflight = $this->preflight( $variant );
+		if ( empty( $preflight['ok'] ) ) {
+			return $preflight;
+		}
+		$type = sanitize_key( (string) $variant->publication_type );
+		if ( 'community_post' === $type ) {
+			return $this->failure( 'YouTube Community Post publishing is not exposed through the current YouTube Data API adapter. The original images remain stored for the worker/manual path.', false );
+		}
+
+		$account = $this->primary_account();
+		$fields  = $this->fields( $variant );
+		$media   = $this->media( $variant );
+		$file    = get_attached_file( (int) $media[0]['id'] );
+		$mime    = (string) get_post_mime_type( (int) $media[0]['id'] );
+		$meta    = $this->metadata( $variant, $fields );
+
+		$notify = array_key_exists( 'notify_subscribers', $fields ) ? (bool) $fields['notify_subscribers'] : false;
+		$upload = $this->client->upload_video_resumable( $account, $file, $mime, $meta, $notify );
+		if ( empty( $upload['ok'] ) || empty( $upload['data']['id'] ) ) {
+			return $this->failure(
+				'YouTube video upload failed: ' . sanitize_textarea_field( (string) ( $upload['message'] ?? 'Unknown YouTube upload error.' ) ),
+				false,
+				array( 'status' => (int) ( $upload['status'] ?? 0 ), 'stage' => 'video_upload' )
+			);
+		}
+		$video_id = sanitize_text_field( (string) $upload['data']['id'] );
+		$warnings = array();
+		$secondary = array();
+
+		if ( ! empty( $fields['thumbnail_attachment_id'] ) ) {
+			$thumb_id = absint( $fields['thumbnail_attachment_id'] );
+			$thumb_file = get_attached_file( $thumb_id );
+			$thumb_mime = (string) get_post_mime_type( $thumb_id );
+			$result = $this->client->set_thumbnail( $account, $video_id, $thumb_file, $thumb_mime );
+			$secondary['thumbnail'] = array( 'ok' => ! empty( $result['ok'] ), 'status' => (int) ( $result['status'] ?? 0 ) );
+			if ( empty( $result['ok'] ) ) {
+				$warnings[] = 'Video uploaded, but custom thumbnail failed: ' . sanitize_textarea_field( (string) ( $result['message'] ?? 'Unknown error.' ) );
+			}
+		}
+
+		$playlists = $this->playlist_ids( $fields );
+		if ( $playlists ) {
+			$secondary['playlists'] = array();
+			$account_settings = $this->accounts->settings( $account );
+			$uploads_playlist = sanitize_text_field( (string) ( $account_settings['uploads_playlist_id'] ?? '' ) );
+			foreach ( $playlists as $playlist_id ) {
+				if ( '' !== $uploads_playlist && hash_equals( $uploads_playlist, $playlist_id ) ) {
+					$warnings[] = 'Skipped the channel uploads playlist because YouTube does not allow playlistItems.insert into that system playlist.';
+					continue;
+				}
+				$result = $this->client->add_to_playlist( $account, $playlist_id, $video_id );
+				$secondary['playlists'][] = array( 'playlist_id' => $playlist_id, 'ok' => ! empty( $result['ok'] ), 'status' => (int) ( $result['status'] ?? 0 ) );
+				if ( empty( $result['ok'] ) ) {
+					$warnings[] = 'Video uploaded, but playlist ' . $playlist_id . ' failed: ' . sanitize_textarea_field( (string) ( $result['message'] ?? 'Unknown error.' ) );
+				}
+			}
+		}
+
+		$requested_privacy = sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) );
+		$actual_privacy = sanitize_key( (string) ( $upload['data']['status']['privacyStatus'] ?? '' ) );
+		if ( '' !== $actual_privacy && $actual_privacy !== $requested_privacy ) {
+			$warnings[] = 'YouTube returned privacyStatus=' . $actual_privacy . ' instead of requested ' . $requested_privacy . '. This can happen when an API project is subject to upload-audit restrictions.';
+		}
+
+		return array(
+			'ok'           => true,
+			'pending'      => false,
+			'external_id'  => $video_id,
+			'external_url' => 'https://www.youtube.com/watch?v=' . rawurlencode( $video_id ),
+			'message'      => $warnings ? 'YouTube video uploaded with follow-up warnings.' : 'YouTube video uploaded successfully.',
+			'payload'      => $payload,
+			'response'     => array(
+				'video_id'          => $video_id,
+				'publication_type'  => $type,
+				'requested_privacy' => $requested_privacy,
+				'actual_privacy'    => $actual_privacy,
+				'notify_subscribers' => $notify,
+				'secondary'         => $secondary,
+				'warnings'          => $warnings,
+			),
+			'retryable'    => false,
+		);
+	}
+
+	private function primary_account(): ?object {
+		$items = $this->accounts->connected( 'youtube' );
+		return $items ? $items[0] : null;
+	}
+
+	private function fields( object $variant ): array {
+		$data = json_decode( (string) ( $variant->fields_json ?? '{}' ), true );
+		return is_array( $data ) ? $data : array();
+	}
+
+	private function media( object $variant ): array {
+		$ids = json_decode( (string) ( $variant->media_json ?? '[]' ), true );
+		$ids = is_array( $ids ) ? $ids : array();
+		return ( new MediaResolver() )->resolve_ids( $ids )['items'] ?? array();
+	}
+
+	private function title( object $variant, array $fields ): string {
+		return sanitize_text_field( (string) ( $fields['title'] ?? $variant->title ?? '' ) );
+	}
+
+	private function description( object $variant, array $fields ): string {
+		return sanitize_textarea_field( (string) ( $fields['description'] ?? $variant->description ?? '' ) );
+	}
+
+	private function metadata( object $variant, array $fields ): array {
+		$snippet = array(
+			'title'       => $this->title( $variant, $fields ),
+			'description' => $this->description( $variant, $fields ),
+		);
+		$tags = array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $fields['tags'] ?? array() ) ) ) );
+		if ( $tags ) {
+			$snippet['tags'] = $tags;
+		}
+		if ( ! empty( $fields['category_id'] ) ) {
+			$snippet['categoryId'] = sanitize_text_field( (string) $fields['category_id'] );
+		}
+		if ( ! empty( $fields['default_language'] ) ) {
+			$snippet['defaultLanguage'] = sanitize_text_field( (string) $fields['default_language'] );
+		}
+
+		$status = array( 'privacyStatus' => sanitize_key( (string) ( $fields['privacy_status'] ?? 'private' ) ) );
+		if ( array_key_exists( 'embeddable', $fields ) ) {
+			$status['embeddable'] = (bool) $fields['embeddable'];
+		}
+		if ( ! empty( $fields['license'] ) ) {
+			$status['license'] = sanitize_key( (string) $fields['license'] );
+		}
+		if ( array_key_exists( 'public_stats_viewable', $fields ) ) {
+			$status['publicStatsViewable'] = (bool) $fields['public_stats_viewable'];
+		}
+		if ( array_key_exists( 'made_for_kids', $fields ) ) {
+			$status['selfDeclaredMadeForKids'] = (bool) $fields['made_for_kids'];
+		}
+		if ( array_key_exists( 'contains_synthetic_media', $fields ) ) {
+			$status['containsSyntheticMedia'] = (bool) $fields['contains_synthetic_media'];
+		}
+		if ( ! empty( $fields['publish_at'] ) ) {
+			$ts = strtotime( (string) $fields['publish_at'] );
+			if ( $ts ) {
+				$status['privacyStatus'] = 'private';
+				$status['publishAt'] = gmdate( 'c', $ts );
+			}
+		}
+		$metadata = array( 'snippet' => $snippet, 'status' => $status );
+		if ( ! empty( $fields['recording_date'] ) ) {
+			$ts = strtotime( (string) $fields['recording_date'] );
+			if ( $ts ) {
+				$metadata['recordingDetails'] = array( 'recordingDate' => gmdate( 'c', $ts ) );
+			}
+		}
+		return $metadata;
+	}
+
+	private function thumbnail_preflight( array $fields ): array {
+		if ( empty( $fields['thumbnail_attachment_id'] ) ) {
+			return array( 'ok' => true );
+		}
+		$id = absint( $fields['thumbnail_attachment_id'] );
+		if ( ! wp_attachment_is_image( $id ) ) {
+			return $this->failure( 'YouTube thumbnail_attachment_id must reference an image attachment.', false );
+		}
+		$mime = (string) get_post_mime_type( $id );
+		if ( ! in_array( $mime, array( 'image/jpeg', 'image/png' ), true ) ) {
+			return $this->failure( 'YouTube custom thumbnail must be JPEG or PNG.', false );
+		}
+		$file = get_attached_file( $id );
+		if ( ! $file || ! is_readable( $file ) ) {
+			return $this->failure( 'YouTube custom thumbnail file is not readable on the server.', false );
+		}
+		if ( filesize( $file ) > 10 * 1024 * 1024 ) {
+			return $this->failure( 'JK Social Hub limits custom thumbnails to 10 MB for server memory safety.', false );
+		}
+		return array( 'ok' => true );
+	}
+
+	private function short_metadata( string $file ): array {
+		if ( ! function_exists( 'wp_read_video_metadata' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/media.php';
+		}
+		$meta = function_exists( 'wp_read_video_metadata' ) ? wp_read_video_metadata( $file ) : array();
+		$width = (int) ( $meta['width'] ?? 0 );
+		$height = (int) ( $meta['height'] ?? 0 );
+		$duration = (float) ( $meta['length'] ?? 0 );
+		$checked = $width > 0 && $height > 0 && $duration > 0;
+		$eligible = $checked ? ( $width <= $height && $duration <= 180.0 ) : null;
+		return array( 'checked' => $checked, 'eligible_by_metadata' => $eligible, 'width' => $width, 'height' => $height, 'duration_seconds' => $duration );
+	}
+
+	private function playlist_ids( array $fields ): array {
+		$out = array();
+		foreach ( array_slice( (array) ( $fields['playlist_ids'] ?? array() ), 0, 20 ) as $id ) {
+			$id = sanitize_text_field( (string) $id );
+			if ( '' !== $id ) {
+				$out[] = $id;
+			}
+		}
+		return array_values( array_unique( $out ) );
+	}
+
+	private function tags_length( array $tags ): int {
+		$total = 0;
+		foreach ( $tags as $index => $tag ) {
+			$length = $this->strlen( (string) $tag );
+			if ( str_contains( (string) $tag, ' ' ) ) {
+				$length += 2;
+			}
+			$total += $length + ( $index > 0 ? 1 : 0 );
+		}
+		return $total;
+	}
+
+	private function strlen( string $value ): int {
+		return function_exists( 'mb_strlen' ) ? mb_strlen( $value, 'UTF-8' ) : strlen( $value );
+	}
+
+	private function failure( string $message, bool $retryable = false, array $details = array() ): array {
+		return array( 'ok' => false, 'message' => sanitize_textarea_field( $message ), 'retryable' => $retryable, 'response' => $details, 'details' => $details );
+	}
+}
+
+===== src/Services/PlatformSchema.php =====
+<?php
+namespace JKSH\Services;
+
+use JKSH\Repositories\AccountRepository;
+
+final class PlatformSchema {
+	public const VERSION = 'omnichannel_v4_2026-09-17';
+
+	public function catalog(): array {
+		$accounts = new AccountRepository();
+		$instagram_connected = ! empty( $accounts->connected( 'instagram' ) );
+		$facebook_connected  = ! empty( $accounts->connected( 'facebook' ) );
+		$youtube_connected   = ! empty( $accounts->connected( 'youtube' ) );
+		return array(
+			'instagram' => array(
+				'connection' => $instagram_connected ? 'connected' : 'not_connected',
+				'publication_types' => array( 'post', 'carousel', 'reel', 'story', 'live' ),
+				'fields' => array(
+					'title' => $this->field( false, 'internal_only', 'Internal/editorial title; Instagram does not expose a separate normal-post title.' ),
+					'caption' => $this->field( true, 'implemented' ),
+					'hashtags' => $this->field( true, 'implemented', 'Rendered into caption copy.' ),
+					'location_id' => $this->field( true, 'implemented', 'Requires a valid Meta location/Page ID. The Hub never invents one.' ),
+					'user_tags' => $this->field( true, 'implemented', 'Images may require normalized x/y positions.' ),
+					'collaborators' => $this->field( true, 'implemented' ),
+					'alt_text' => $this->field( true, 'implemented', 'Image accessibility text.' ),
+					'media_fields' => $this->field( true, 'implemented', 'Per-carousel-item alt text and user tags keyed by attachment ID or zero-based media index.' ),
+					'share_to_feed' => $this->field( true, 'implemented', 'Reels only.' ),
+					'cover_attachment_id' => $this->field( true, 'implemented', 'Reels only; resolved to a public image URL.' ),
+					'thumb_offset_ms' => $this->field( true, 'implemented', 'Reels only.' ),
+					'product_tags' => $this->field( true, 'conditional_stored', 'Requires verified Instagram Shopping/catalog eligibility and product-ID mapping. Stored now, not sent until that account capability is verified.' ),
+					'is_ai_generated' => $this->field( true, 'conditional_stored', 'Stored and applied only where the connected API exposes a documented writable disclosure field.' ),
+					'story' => $this->field( true, 'planned_adapter', 'Story publishing is reserved but not live in this release.' ),
+					'live_ingest' => $this->field( false, 'external_ingest', 'Instagram Live uses a separate Live Producer/RTMP ingest path when available. The current Graph connector does not provision IG Live automatically.' ),
+				),
+			),
+			'facebook' => array(
+				'connection' => $facebook_connected ? 'connected' : 'not_connected',
+				'publication_types' => array( 'post', 'reel', 'live' ),
+				'fields' => array(
+					'title' => $this->field( true, 'implemented', 'Used for Reels; live title reserved for Live API adapter.' ),
+					'message' => $this->field( true, 'implemented' ),
+					'description' => $this->field( true, 'implemented', 'Used as Reel description/copy where applicable.' ),
+					'hashtags' => $this->field( true, 'implemented', 'Rendered into public copy.' ),
+					'link' => $this->field( true, 'conditional_stored', 'Stored now; dedicated link-post mapping will be enabled after endpoint validation.' ),
+					'place_id' => $this->field( true, 'conditional_stored', 'Stored only when a valid place identifier is known; not fabricated.' ),
+					'product_refs' => $this->field( false, 'conditional_stored', 'Requires catalog/commerce mapping; fall back to normal product links until verified.' ),
+					'content_tags' => $this->field( true, 'planned_live_adapter', 'Facebook Live only, when valid content-tag IDs are available.' ),
+				),
+			),
+			'youtube' => array(
+				'connection' => $youtube_connected ? 'connected' : 'not_connected',
+				'publication_types' => array( 'community_post', 'short', 'video', 'live' ),
+				'fields' => array(
+					'title' => $this->field( true, 'implemented' ),
+					'description' => $this->field( true, 'implemented' ),
+					'tags' => $this->field( true, 'implemented' ),
+					'category_id' => $this->field( true, 'implemented' ),
+					'default_language' => $this->field( true, 'implemented' ),
+					'privacy_status' => $this->field( true, 'implemented' ),
+					'publish_at' => $this->field( true, 'implemented' ),
+					'embeddable' => $this->field( true, 'implemented' ),
+					'license' => $this->field( true, 'implemented' ),
+					'public_stats_viewable' => $this->field( true, 'implemented' ),
+					'made_for_kids' => $this->field( true, 'implemented', 'Must reflect the actual content. It is never guessed for convenience.' ),
+					'contains_synthetic_media' => $this->field( true, 'implemented', 'Set only when applicable.' ),
+					'recording_date' => $this->field( true, 'implemented' ),
+					'thumbnail_attachment_id' => $this->field( true, 'implemented' ),
+					'playlist_ids' => $this->field( true, 'implemented', 'Applied after upload via playlistItems.' ),
+					'notify_subscribers' => $this->field( true, 'implemented', 'Applied to videos.insert. JK Social Hub defaults this to false when omitted to avoid surprise subscriber notifications.' ),
+					'resolution' => $this->field( true, 'implemented', 'YouTube Live only. Used as liveStreams.cdn.resolution.' ),
+					'frame_rate' => $this->field( true, 'implemented', 'YouTube Live only. Used as liveStreams.cdn.frameRate.' ),
+					'location' => $this->field( false, 'deprecated_platform_field', 'YouTube recording-location fields are deprecated. The Hub may retain source location internally but will not rely on deprecated API writes.' ),
+					'community_images' => $this->field( false, 'worker_or_manual_path', 'Permanent JK rule: image/carousel content maps to a YouTube Community Post with original images, never a fake Short/slideshow unless explicitly requested.' ),
+				),
+			),
+		);
+	}
+
+	public function sanitize_fields( string $platform, array $fields ): array {
+		$platform = sanitize_key( $platform );
+		$allowed = array_keys( $this->catalog()[ $platform ]['fields'] ?? array() );
+		$out = array();
+		foreach ( $fields as $key => $value ) {
+			$key = sanitize_key( (string) $key );
+			if ( ! in_array( $key, $allowed, true ) ) {
+				continue;
+			}
+			if ( preg_match( '/token|secret|password|credential|authorization|cookie|nonce|state|stream_key/i', $key ) ) {
+				continue;
+			}
+			$out[ $key ] = $this->sanitize_value( $value );
+		}
+		return $out;
+	}
+
+	public function summarize_fields( string $platform, array $fields ): array {
+		$defs = $this->catalog()[ sanitize_key( $platform ) ]['fields'] ?? array();
+		$implemented = array();
+		$stored = array();
+		foreach ( array_keys( $fields ) as $key ) {
+			$key = sanitize_key( (string) $key );
+			if ( ! isset( $defs[ $key ] ) ) {
+				continue;
+			}
+			$adapter = (string) ( $defs[ $key ]['adapter'] ?? 'unknown' );
+			if ( 'implemented' === $adapter || 'internal_only' === $adapter ) {
+				$implemented[] = $key;
+			} else {
+				$stored[] = array( 'field' => $key, 'adapter' => $adapter );
+			}
+		}
+		return array( 'implemented_now' => $implemented, 'stored_or_pending' => $stored, 'schema_version' => self::VERSION );
+	}
+
+	private function field( bool $platform_api, string $adapter, string $note = '' ): array {
+		return array( 'platform_api' => $platform_api, 'adapter' => $adapter, 'note' => $note );
+	}
+
+	private function sanitize_value( mixed $value ): mixed {
+		if ( is_array( $value ) ) {
+			$out = array();
+			foreach ( $value as $key => $item ) {
+				$safe_key = is_string( $key ) ? sanitize_key( $key ) : $key;
+				if ( is_string( $safe_key ) && preg_match( '/token|secret|password|credential|authorization|cookie|nonce|state|stream_key/i', $safe_key ) ) {
+					continue;
+				}
+				$out[ $safe_key ] = $this->sanitize_value( $item );
+			}
+			return $out;
+		}
+		if ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+			return $value;
+		}
+		return sanitize_textarea_field( (string) $value );
+	}
+}
+
 ===== src/Services/YouTubeLive.php =====
 <?php
 namespace JKSH\Services;
