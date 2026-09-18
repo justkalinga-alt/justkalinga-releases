@@ -1,0 +1,6 @@
+JK Social Supabase Bridge v0.8.3 posting autopilot
+sha256=1c19bc1f280874015ff3a7628e9dee7a1a7552df022f662212e694f3bfdb7845
+bytes=47766
+base_version=0.8.2
+base_sha256=a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd
+features=media previews, delete, per-image alt, auto cover, product URL, location query, devotional audio suggestion, improved Community handoff
