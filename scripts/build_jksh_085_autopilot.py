@@ -57,7 +57,7 @@ replace_exact(
 )
 
 marker = "\tprivate function instagram_common_params( array $fields, bool $allow_alt, ?array $media = null, int $index = 0, bool $allow_parent_fields = true ): array {"
-helper = r'''\tprivate function resolve_instagram_location( MetaClient $client, string $token, array $fields ): array {
+helper = '''\tprivate function resolve_instagram_location( MetaClient $client, string $token, array $fields ): array {
 \t\tif ( ! empty( $fields['location_id'] ) ) {
 \t\t\treturn $fields;
 \t\t}
@@ -104,53 +104,53 @@ mtext = mtext.replace(marker, helper + marker, 1)
 meta.write_text(mtext)
 
 # Product URL is a supported public fallback on Meta posts. Music stays suggestion-only.
-old_compose = r'''\tprivate function compose_caption( object $variant ): string {
-\t\t$parts = array_filter(
-\t\t\tarray(
-\t\t\t\ttrim( (string) $variant->caption ),
-\t\t\t\ttrim( (string) $variant->hashtags ),
-\t\t\t\ttrim( (string) $variant->cta ),
-\t\t\t),
-\t\t\tstatic fn( string $value ): bool => '' !== $value
-\t\t);
-\t\treturn sanitize_textarea_field( implode( "\n\n", $parts ) );
-\t}'''
-new_compose = r'''\tprivate function compose_caption( object $variant ): string {
-\t\t$fields = $this->platform_fields( $variant );
-\t\t$parts = array_filter(
-\t\t\tarray(
-\t\t\t\ttrim( (string) $variant->caption ),
-\t\t\t\ttrim( (string) $variant->hashtags ),
-\t\t\t\ttrim( (string) $variant->cta ),
-\t\t\t),
-\t\t\tstatic fn( string $value ): bool => '' !== $value
-\t\t);
-\t\t$caption = implode( "\n\n", $parts );
-\t\t$product_url = esc_url_raw( (string) ( $fields['product_url'] ?? $fields['link'] ?? '' ) );
-\t\tif ( $product_url && false === strpos( $caption, $product_url ) ) {
-\t\t\t$caption .= ( '' !== $caption ? "\n\n" : '' ) . '🔗 ' . $product_url;
-\t\t}
-\t\treturn sanitize_textarea_field( $caption );
-\t}'''
-replace_exact(meta, old_compose, new_compose)
+mtext = meta.read_text()
+cstart = mtext.find("\tprivate function compose_caption( object $variant ): string {")
+cend = mtext.find("\n\tprivate function pending(", cstart)
+if cstart < 0 or cend < 0:
+    raise SystemExit("MetaPublisher compose_caption boundaries missing")
+new_compose = r'''    private function compose_caption( object $variant ): string {
+        $fields = $this->platform_fields( $variant );
+        $parts = array_filter(
+            array(
+                trim( (string) $variant->caption ),
+                trim( (string) $variant->hashtags ),
+                trim( (string) $variant->cta ),
+            ),
+            static fn( string $value ): bool => '' !== $value
+        );
+        $caption = implode( "\n\n", $parts );
+        $product_url = esc_url_raw( (string) ( $fields['product_url'] ?? $fields['link'] ?? '' ) );
+        if ( $product_url && false === strpos( $caption, $product_url ) ) {
+            $caption .= ( '' !== $caption ? "\n\n" : '' ) . '🔗 ' . $product_url;
+        }
+        return sanitize_textarea_field( $caption );
+    }
+'''
+mtext = mtext[:cstart] + new_compose + mtext[cend:]
+meta.write_text(mtext)
 
 # YouTube product + location autopilot stays inside description because native recording-location writes are deprecated.
-old_desc = r'''\tprivate function description( object $variant, array $fields ): string {
-\t\treturn sanitize_textarea_field( (string) ( $fields['description'] ?? $variant->description ?? '' ) );
-\t}'''
-new_desc = r'''\tprivate function description( object $variant, array $fields ): string {
-\t\t$description = sanitize_textarea_field( (string) ( $fields['description'] ?? $variant->description ?? '' ) );
-\t\t$location = trim( sanitize_text_field( (string) ( $fields['location_text'] ?? '' ) ) );
-\t\t$product_url = esc_url_raw( (string) ( $fields['product_url'] ?? '' ) );
-\t\tif ( $location && false === stripos( $description, $location ) ) {
-\t\t\t$description .= ( '' !== $description ? "\n\n" : '' ) . '📍 ' . $location;
-\t\t}
-\t\tif ( $product_url && false === strpos( $description, $product_url ) ) {
-\t\t\t$description .= ( '' !== $description ? "\n" : '' ) . '🔗 ' . $product_url;
-\t\t}
-\t\treturn sanitize_textarea_field( $description );
-\t}'''
-replace_exact(yt, old_desc, new_desc)
+ytext = yt.read_text()
+dstart = ytext.find("\tprivate function description( object $variant, array $fields ): string {")
+dend = ytext.find("\n\tprivate function metadata(", dstart)
+if dstart < 0 or dend < 0:
+    raise SystemExit("YouTubePublisher description boundaries missing")
+new_desc = r'''    private function description( object $variant, array $fields ): string {
+        $description = sanitize_textarea_field( (string) ( $fields['description'] ?? $variant->description ?? '' ) );
+        $location = trim( sanitize_text_field( (string) ( $fields['location_text'] ?? '' ) ) );
+        $product_url = esc_url_raw( (string) ( $fields['product_url'] ?? '' ) );
+        if ( $location && false === stripos( $description, $location ) ) {
+            $description .= ( '' !== $description ? "\n\n" : '' ) . '📍 ' . $location;
+        }
+        if ( $product_url && false === strpos( $description, $product_url ) ) {
+            $description .= ( '' !== $description ? "\n" : '' ) . '🔗 ' . $product_url;
+        }
+        return sanitize_textarea_field( $description );
+    }
+'''
+ytext = ytext[:dstart] + new_desc + ytext[dend:]
+yt.write_text(ytext)
 
 # Better thumbnail receipts for Shorts and videos.
 replace_exact(
