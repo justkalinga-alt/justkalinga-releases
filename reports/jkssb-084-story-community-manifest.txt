@@ -1,0 +1,6 @@
+JK Social Supabase Bridge v0.8.4 Story music Community
+sha256=031509c06f432ed9f5bc276be26beac329a507d54691e292d11ca83099c4d908
+bytes=49602
+base_version=0.8.3
+base_sha256=1c19bc1f280874015ff3a7628e9dee7a1a7552df022f662212e694f3bfdb7845
+features=music suggestion only on single/carousel images; reliable YouTube Community prepare/open buttons; Story UI preserved
