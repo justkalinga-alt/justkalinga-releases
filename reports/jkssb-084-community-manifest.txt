@@ -1,0 +1,5 @@
+JK Social Supabase Bridge v0.8.4
+sha256=b97aba6451030b7eccd90a1e1aa232f10d5babae00a9b69b452b89c2565e7150
+bytes=47820
+base_version=0.8.3
+feature=one click copies Community post text, prepares media downloads, then opens YouTube
