@@ -1,0 +1,4 @@
+JK Social Supabase Bridge v0.8.2 reconstructed source package
+sha256=a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd
+bytes=40201
+shortcode=[jk_social_upload]

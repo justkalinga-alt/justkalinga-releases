@@ -1,0 +1,2555 @@
+<?php
+/**
+ * Plugin Name: JK Social Supabase Bridge
+ * Description: Secure media-vault bridge between JK Social Hub and Supabase Storage.
+ * Version: 0.8.2
+ * Requires at least: 6.9
+ * Requires PHP: 8.1
+ * Author: JustKalinga
+ * Text Domain: jk-social-supabase-bridge
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+final class JKSSB_Bridge {
+    const VERSION  = '0.8.2';
+    const CONTRACT = 'jksh-media-v1';
+    const ENDPOINT = 'https://jfcovdfemyqzxtkjpcev.supabase.co/functions/v1/jksh-media-vault';
+    const OPT_KEY  = 'jkssb_key_material_v1';
+    const MAX_BYTES = 52428800; // Supabase Free-plan per-file ceiling.
+    const MAX_FALLBACK_BYTES = 524288000; // Hybrid WordPress fallback ceiling: 500 MB.
+    const DIRECT_CHUNK_BYTES = 4194304;
+    const DELIVERY_BASE = 'https://jfcovdfemyqzxtkjpcev.supabase.co/functions/v1/jksh-media-delivery?asset_id=';
+    const LIVE_SUPERVISOR_OPT = 'jkssb_live_supervisor_v1';
+    const LIVE_WATCHDOG_OPT   = 'jkssb_live_watchdog_v1';
+    const LIVE_CRON_HOOK      = 'jkssb_live_supervisor_tick';
+
+    private static $instance = null;
+
+    public static function instance() {
+        if ( null === self::$instance ) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    public static function activate() {
+        if ( version_compare( PHP_VERSION, '8.1', '<' ) ) {
+            deactivate_plugins( plugin_basename( __FILE__ ) );
+            wp_die( esc_html__( 'JK Social Supabase Bridge requires PHP 8.1 or newer.', 'jk-social-supabase-bridge' ) );
+        }
+        self::ensure_keypair();
+    }
+
+    private function __construct() {
+        add_action( 'wp_abilities_api_categories_init', array( $this, 'register_category' ) );
+        add_action( 'wp_abilities_api_init', array( $this, 'register_abilities' ) );
+        add_action( 'admin_menu', array( $this, 'register_upload_page' ) );
+        add_shortcode( 'jk_social_upload', array( $this, 'shortcode_social_upload' ) );
+        add_action( 'template_redirect', array( $this, 'maybe_render_upload_portal' ), 1 );
+        add_action( 'wp_ajax_jkssb_ui_begin', array( $this, 'ajax_ui_begin' ) );
+        add_action( 'wp_ajax_jkssb_ui_chunk', array( $this, 'ajax_ui_chunk' ) );
+        add_action( 'wp_ajax_jkssb_ui_finalize', array( $this, 'ajax_ui_finalize' ) );
+        add_action( 'wp_ajax_jkssb_ui_save_bundle', array( $this, 'ajax_ui_save_bundle' ) );
+        add_action( 'wp_ajax_jkssb_community_mark_done', array( $this, 'ajax_community_mark_done' ) );
+        add_action( 'wp_ajax_jkssb_live_supervisor_save', array( $this, 'ajax_live_supervisor_save' ) );
+        add_action( 'wp_ajax_jkssb_live_supervisor_run', array( $this, 'ajax_live_supervisor_run' ) );
+        add_filter( 'cron_schedules', array( $this, 'cron_schedules' ) );
+        add_action( 'init', array( $this, 'ensure_live_supervisor_cron' ), 20 );
+        add_action( self::LIVE_CRON_HOOK, array( $this, 'live_supervisor_tick' ) );
+    }
+
+    private static function crypto_key() {
+        return hash( 'sha256', wp_salt( 'auth' ) . '|jkssb|' . home_url( '/' ), true );
+    }
+
+    private static function encrypt_private_key( $plaintext ) {
+        if ( ! function_exists( 'openssl_encrypt' ) ) {
+            return new WP_Error( 'jkssb_openssl_missing', 'OpenSSL encryption is unavailable.' );
+        }
+        $iv  = random_bytes( 12 );
+        $tag = '';
+        $enc = openssl_encrypt( $plaintext, 'aes-256-gcm', self::crypto_key(), OPENSSL_RAW_DATA, $iv, $tag );
+        if ( false === $enc ) {
+            return new WP_Error( 'jkssb_encrypt_failed', 'Could not encrypt bridge private key.' );
+        }
+        return base64_encode( wp_json_encode( array(
+            'v'   => 1,
+            'iv'  => base64_encode( $iv ),
+            'tag' => base64_encode( $tag ),
+            'ct'  => base64_encode( $enc ),
+        ) ) );
+    }
+
+    private static function decrypt_private_key( $stored ) {
+        if ( ! $stored || ! function_exists( 'openssl_decrypt' ) ) {
+            return new WP_Error( 'jkssb_key_unavailable', 'Bridge private key is unavailable.' );
+        }
+        $decoded = json_decode( base64_decode( $stored ), true );
+        if ( ! is_array( $decoded ) || empty( $decoded['iv'] ) || empty( $decoded['tag'] ) || empty( $decoded['ct'] ) ) {
+            return new WP_Error( 'jkssb_key_corrupt', 'Stored bridge key material is invalid.' );
+        }
+        $plain = openssl_decrypt(
+            base64_decode( $decoded['ct'] ),
+            'aes-256-gcm',
+            self::crypto_key(),
+            OPENSSL_RAW_DATA,
+            base64_decode( $decoded['iv'] ),
+            base64_decode( $decoded['tag'] )
+        );
+        if ( false === $plain ) {
+            return new WP_Error( 'jkssb_decrypt_failed', 'Could not decrypt bridge private key.' );
+        }
+        return $plain;
+    }
+
+    private static function ensure_keypair() {
+        $existing = get_option( self::OPT_KEY );
+        if ( is_array( $existing ) && ! empty( $existing['private'] ) && ! empty( $existing['public_b64'] ) && ! empty( $existing['key_id'] ) ) {
+            return $existing;
+        }
+        if ( ! function_exists( 'openssl_pkey_new' ) ) {
+            return new WP_Error( 'jkssb_openssl_missing', 'OpenSSL key generation is unavailable.' );
+        }
+        $resource = openssl_pkey_new( array(
+            'private_key_bits' => 2048,
+            'private_key_type' => OPENSSL_KEYTYPE_RSA,
+        ) );
+        if ( ! $resource ) {
+            return new WP_Error( 'jkssb_keygen_failed', 'Could not generate RSA keypair.' );
+        }
+        $private = '';
+        if ( ! openssl_pkey_export( $resource, $private ) ) {
+            return new WP_Error( 'jkssb_private_export_failed', 'Could not export RSA private key.' );
+        }
+        $details = openssl_pkey_get_details( $resource );
+        if ( empty( $details['key'] ) ) {
+            return new WP_Error( 'jkssb_public_export_failed', 'Could not export RSA public key.' );
+        }
+        $public = $details['key'];
+        $encrypted = self::encrypt_private_key( $private );
+        if ( is_wp_error( $encrypted ) ) {
+            return $encrypted;
+        }
+        $data = array(
+            'private'    => $encrypted,
+            'public_b64' => base64_encode( $public ),
+            'key_id'     => substr( hash( 'sha256', $public ), 0, 24 ),
+            'created_at' => gmdate( 'c' ),
+        );
+        update_option( self::OPT_KEY, $data, false );
+        return $data;
+    }
+
+    private static function key_material() {
+        $data = self::ensure_keypair();
+        if ( is_wp_error( $data ) ) {
+            return $data;
+        }
+        $private = self::decrypt_private_key( $data['private'] );
+        if ( is_wp_error( $private ) ) {
+            return $private;
+        }
+        $data['private_plain'] = $private;
+        return $data;
+    }
+
+    public function register_category() {
+        if ( function_exists( 'wp_register_ability_category' ) ) {
+            wp_register_ability_category( 'jk-social-supabase', array(
+                'label'       => 'JK Social Supabase',
+                'description' => 'Secure Supabase media-vault operations for JK Social Hub.',
+            ) );
+        }
+    }
+
+    public function register_abilities() {
+        if ( ! function_exists( 'wp_register_ability' ) ) {
+            return;
+        }
+
+        $object_output = array( 'type' => 'object', 'additionalProperties' => true );
+        $public_meta   = array( 'public' => true );
+
+        wp_register_ability( 'jk-social-supabase/get-readiness', array(
+            'label'               => 'Get Supabase Bridge Readiness',
+            'description'         => 'Returns read-only JK Social Supabase bridge and endpoint readiness without exposing private keys.',
+            'category'            => 'jk-social-supabase',
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_readiness' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/get-public-key', array(
+            'label'               => 'Get Supabase Bridge Public Key',
+            'description'         => 'Returns only the bridge public verification key and key ID for pairing with the Supabase media vault.',
+            'category'            => 'jk-social-supabase',
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_public_key' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/ingest-media', array(
+            'label'               => 'Ingest Media To Supabase',
+            'description'         => 'Uploads an existing WordPress media attachment once into the private JK Social Supabase vault with SHA-256 deduplication. An explicit metadata.jksh_live_request with confirm_live=true can atomically queue a guarded live JK Social Hub publish after successful ingest.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'attachment_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'alt_text'      => array( 'type' => 'string' ),
+                    'ai_generated'  => array( 'type' => 'boolean' ),
+                    'product_refs'  => array( 'type' => 'array', 'items' => array( 'type' => 'object', 'additionalProperties' => true ) ),
+                    'metadata'      => array( 'type' => 'object', 'additionalProperties' => true ),
+                ),
+                'required' => array( 'attachment_id' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_ingest_media' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false, 'idempotent' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/create-delivery-url', array(
+            'label'               => 'Create Supabase Delivery URL',
+            'description'         => 'Creates a temporary signed delivery URL for a ready media asset so a social platform can fetch it.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'attachment_id'     => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'asset_id'          => array( 'type' => 'string' ),
+                    'expires_in_seconds'=> array( 'type' => 'integer', 'minimum' => 60, 'maximum' => 21600 ),
+                ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_delivery_url' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/inspect-jksh-runtime', array(
+            'label'               => 'Inspect JK Social Hub Runtime',
+            'description'         => 'Read-only inspection of JK Social Hub database tables, columns, loaded JKSH classes and public methods. No row data or secrets are returned.',
+            'category'            => 'jk-social-supabase',
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_inspect_jksh_runtime_with_uploads' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/inspect-jksh-records', array(
+            'label'               => 'Inspect JK Social Hub Content Records',
+            'description'         => 'Read-only inspection of one JK Social Hub content package at the database-row level, including sanitized variant/job payloads. Account credentials and secrets are never read.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'content_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+                ),
+                'required' => array( 'content_id' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_inspect_jksh_records' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/ingest-from-url', array(
+            'label'               => 'Ingest Media From URL',
+            'description'         => 'Downloads an explicitly supplied HTTPS media URL into WordPress, validates it, and ingests the resulting attachment into the private Supabase media vault.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'url'          => array( 'type' => 'string', 'format' => 'uri' ),
+                    'filename'     => array( 'type' => 'string' ),
+                    'title'        => array( 'type' => 'string' ),
+                    'alt_text'     => array( 'type' => 'string' ),
+                    'ai_generated' => array( 'type' => 'boolean' ),
+                    'product_refs' => array( 'type' => 'array', 'items' => array( 'type' => 'object', 'additionalProperties' => true ) ),
+                    'metadata'     => array( 'type' => 'object', 'additionalProperties' => true ),
+                ),
+                'required' => array( 'url' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_ingest_from_url' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/begin-direct-upload', array(
+            'label'               => 'Begin Hybrid Media Upload',
+            'description'         => 'Starts a temporary chunked upload. Files up to 50 MB finalize to the private Supabase vault; larger files up to 500 MB finalize to WordPress Media as the large-media fallback.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'filename'      => array( 'type' => 'string' ),
+                    'mime_type'     => array( 'type' => 'string' ),
+                    'bytes'         => array( 'type' => 'integer', 'minimum' => 1, 'maximum' => self::MAX_FALLBACK_BYTES ),
+                    'sha256'        => array( 'type' => 'string' ),
+                    'width'         => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'height'        => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'duration_ms'   => array( 'type' => 'integer', 'minimum' => 0 ),
+                    'alt_text'      => array( 'type' => 'string' ),
+                    'ai_generated'  => array( 'type' => 'boolean' ),
+                    'product_refs'  => array( 'type' => 'array', 'items' => array( 'type' => 'object', 'additionalProperties' => true ) ),
+                    'metadata'      => array( 'type' => 'object', 'additionalProperties' => true ),
+                ),
+                'required' => array( 'filename', 'mime_type', 'bytes', 'sha256' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_begin_direct_upload' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/append-direct-upload-chunk', array(
+            'label'               => 'Append Direct Upload Chunk',
+            'description'         => 'Appends one base64 chunk to a temporary direct-upload session. No WordPress media attachment is created.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'upload_id'    => array( 'type' => 'string' ),
+                    'offset'       => array( 'type' => 'integer', 'minimum' => 0 ),
+                    'chunk_base64' => array( 'type' => 'string' ),
+                ),
+                'required' => array( 'upload_id', 'offset', 'chunk_base64' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_append_direct_upload_chunk' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false, 'idempotent' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/finalize-direct-upload', array(
+            'label'               => 'Finalize Hybrid Media Upload',
+            'description'         => 'Verifies the original file. Files up to 50 MB finalize to Supabase; larger files finalize to WordPress Media, preserving the same bundle and guarded publishing workflow.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array( 'upload_id' => array( 'type' => 'string' ) ),
+                'required' => array( 'upload_id' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_finalize_direct_upload' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/abort-direct-upload', array(
+            'label'               => 'Abort Direct Supabase Upload',
+            'description'         => 'Deletes a temporary direct-upload buffer and its session metadata.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array( 'upload_id' => array( 'type' => 'string' ) ),
+                'required' => array( 'upload_id' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_abort_direct_upload' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => true, 'idempotent' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/list-upload-drafts', array(
+            'label' => 'List Social Upload Drafts', 'description' => 'Lists recent media bundles uploaded from the WordPress Social Upload screen.', 'category' => 'jk-social-supabase',
+            'output_schema' => $object_output, 'execute_callback' => array( $this, 'ability_list_upload_drafts' ), 'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/get-upload-draft', array(
+            'label' => 'Get Social Upload Draft', 'description' => 'Returns one uploaded media bundle by bundle_id.', 'category' => 'jk-social-supabase',
+            'input_schema' => array( 'type' => 'object', 'properties' => array( 'bundle_id' => array( 'type' => 'string' ) ), 'required' => array( 'bundle_id' ), 'additionalProperties' => false ),
+            'output_schema' => $object_output, 'execute_callback' => array( $this, 'ability_get_upload_draft' ), 'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/queue-upload-draft', array(
+            'label' => 'Queue Social Upload Draft', 'description' => 'Turns one uploaded bundle into guarded live JK Social Hub jobs.', 'category' => 'jk-social-supabase',
+            'input_schema' => array( 'type' => 'object', 'properties' => array(
+                'bundle_id' => array( 'type' => 'string' ), 'title' => array( 'type' => 'string' ), 'body' => array( 'type' => 'string' ), 'scheduled_at_ist' => array( 'type' => 'string' ),
+                'platforms' => array( 'type' => 'array', 'items' => array( 'type' => 'string' ) ), 'platform_fields' => array( 'type' => 'object', 'additionalProperties' => true ),
+                'location' => array( 'type' => 'object', 'additionalProperties' => true ), 'products' => array( 'type' => 'array', 'items' => array( 'type' => 'object', 'additionalProperties' => true ) ),
+                'cta' => array( 'type' => 'string' ), 'confirm_live' => array( 'type' => 'boolean' ) ),
+                'required' => array( 'bundle_id', 'scheduled_at_ist', 'confirm_live' ), 'additionalProperties' => false ),
+            'output_schema' => $object_output, 'execute_callback' => array( $this, 'ability_queue_upload_draft' ), 'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/list-youtube-community-handoffs', array(
+            'label' => 'List YouTube Community Handoffs',
+            'description' => 'Lists prepared YouTube Community handoff jobs, media and completion state. This never claims API publication.',
+            'category' => 'jk-social-supabase',
+            'output_schema' => $object_output,
+            'execute_callback' => array( $this, 'ability_list_youtube_community_handoffs' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/create-youtube-community-handoff', array(
+            'label' => 'Create YouTube Community Handoff',
+            'description' => 'Creates a manual YouTube Community handoff from an uploaded image or carousel bundle. It does not call a nonexistent Community-post API.',
+            'category' => 'jk-social-supabase',
+            'input_schema' => array( 'type' => 'object', 'properties' => array(
+                'bundle_id' => array( 'type' => 'string' ), 'title' => array( 'type' => 'string' ), 'body' => array( 'type' => 'string' ),
+                'scheduled_at_ist' => array( 'type' => 'string' ), 'platform_fields' => array( 'type' => 'object', 'additionalProperties' => true ),
+                'cta' => array( 'type' => 'string' ), 'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ) ),
+                'required' => array( 'bundle_id', 'confirm' ), 'additionalProperties' => false ),
+            'output_schema' => $object_output,
+            'execute_callback' => array( $this, 'ability_create_youtube_community_handoff' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false, 'idempotent' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/mark-youtube-community-posted', array(
+            'label' => 'Mark YouTube Community Handoff Posted',
+            'description' => 'Marks a prepared Community handoff as manually posted and records the supplied public URL as a receipt.',
+            'category' => 'jk-social-supabase',
+            'input_schema' => array( 'type' => 'object', 'properties' => array(
+                'job_id' => array( 'type' => 'integer', 'minimum' => 1 ), 'external_url' => array( 'type' => 'string' ),
+                'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ) ),
+                'required' => array( 'job_id', 'confirm' ), 'additionalProperties' => false ),
+            'output_schema' => $object_output,
+            'execute_callback' => array( $this, 'ability_mark_youtube_community_posted' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false, 'idempotent' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/get-live-supervisor-status', array(
+            'label' => 'Get Live Supervisor Status',
+            'description' => 'Returns the five-minute WP-Cron live supervisor configuration, next tick and last watchdog result without exposing stream keys.',
+            'category' => 'jk-social-supabase',
+            'output_schema' => $object_output,
+            'execute_callback' => array( $this, 'ability_get_live_supervisor_status' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/configure-live-supervisor', array(
+            'label' => 'Configure Live Supervisor',
+            'description' => 'Configures the five-minute WP-Cron supervisor. External YouTube provisioning and worker dispatch still require the Hub master switches and successful preflights.',
+            'category' => 'jk-social-supabase',
+            'input_schema' => array( 'type' => 'object', 'properties' => array(
+                'enabled' => array( 'type' => 'boolean' ), 'auto_provision' => array( 'type' => 'boolean' ), 'auto_dispatch' => array( 'type' => 'boolean' ),
+                'provision_lead_minutes' => array( 'type' => 'integer', 'minimum' => 5, 'maximum' => 60 ),
+                'dispatch_lead_minutes' => array( 'type' => 'integer', 'minimum' => 1, 'maximum' => 30 ),
+                'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ) ),
+                'required' => array( 'enabled', 'confirm' ), 'additionalProperties' => false ),
+            'output_schema' => $object_output,
+            'execute_callback' => array( $this, 'ability_configure_live_supervisor' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/run-live-supervisor', array(
+            'label' => 'Run Live Supervisor',
+            'description' => 'Runs one guarded live-supervisor pass. Auto actions occur only when configured, the Hub master switches are enabled and every preflight passes.',
+            'category' => 'jk-social-supabase',
+            'input_schema' => array( 'type' => 'object', 'properties' => array( 'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ) ), 'required' => array( 'confirm' ), 'additionalProperties' => false ),
+            'output_schema' => $object_output,
+            'execute_callback' => array( $this, 'ability_run_live_supervisor' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta' => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/export-live-social-hub', array(
+            'label'               => 'Export Live JK Social Hub',
+            'description'         => 'Creates a byte-preserving ZIP snapshot of the currently installed JK Social Hub plugin and stores it as a WordPress media attachment for safe maintenance. No plugin files are modified.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ),
+                ),
+                'required' => array( 'confirm' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_export_live_social_hub' ),
+            'permission_callback' => array( $this, 'can_update' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false, 'idempotent' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/reschedule-publish-job-ist', array(
+            'label'               => 'Reschedule Social Publish Job (IST)',
+            'description'         => 'Reschedules one not-yet-started JK Social Hub publish job using Indian Standard Time. Use delay_minutes for a relative schedule such as five minutes from now.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'job_id' => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'delay_minutes' => array( 'type' => 'integer', 'minimum' => 1, 'maximum' => 10080 ),
+                    'scheduled_at_ist' => array( 'type' => 'string' ),
+                    'confirm' => array( 'type' => 'boolean', 'enum' => array( true ) ),
+                ),
+                'required' => array( 'job_id', 'confirm' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_reschedule_publish_job_ist' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => false, 'idempotent' => false ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/get-update-readiness', array(
+            'label'               => 'Get Bridge Update Readiness',
+            'description'         => 'Read-only self-update readiness for JK Social Supabase Bridge.',
+            'category'            => 'jk-social-supabase',
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_update_readiness' ),
+            'permission_callback' => array( $this, 'can_manage' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/preflight-update-package', array(
+            'label'               => 'Preflight Bridge Update Package',
+            'description'         => 'Validates an uploaded JK Social Supabase Bridge ZIP by exact SHA-256 and plugin identity without installing it.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'attachment_id'   => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'expected_sha256' => array( 'type' => 'string', 'pattern' => '^[0-9a-fA-F]{64}$' ),
+                ),
+                'required' => array( 'attachment_id', 'expected_sha256' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_preflight_update' ),
+            'permission_callback' => array( $this, 'can_update' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'readonly' => true ) ) ),
+        ) );
+
+        wp_register_ability( 'jk-social-supabase/install-update-package', array(
+            'label'               => 'Install Bridge Update Package',
+            'description'         => 'Installs only a verified JK Social Supabase Bridge ZIP. Requires exact SHA-256, current version and confirm=true.',
+            'category'            => 'jk-social-supabase',
+            'input_schema'        => array(
+                'type' => 'object',
+                'properties' => array(
+                    'attachment_id'            => array( 'type' => 'integer', 'minimum' => 1 ),
+                    'expected_sha256'          => array( 'type' => 'string', 'pattern' => '^[0-9a-fA-F]{64}$' ),
+                    'expected_current_version' => array( 'type' => 'string' ),
+                    'confirm'                  => array( 'type' => 'boolean' ),
+                    'delete_package_after'     => array( 'type' => 'boolean' ),
+                ),
+                'required' => array( 'attachment_id', 'expected_sha256', 'expected_current_version', 'confirm' ),
+                'additionalProperties' => false,
+            ),
+            'output_schema'       => $object_output,
+            'execute_callback'    => array( $this, 'ability_install_update' ),
+            'permission_callback' => array( $this, 'can_update' ),
+            'meta'                => array_merge( $public_meta, array( 'annotations' => array( 'destructive' => true ) ) ),
+        ) );
+    }
+
+    public function can_manage() {
+        return current_user_can( 'manage_options' );
+    }
+
+    public function ability_public_key() {
+        $keys = self::ensure_keypair();
+        if ( is_wp_error( $keys ) ) {
+            return $keys;
+        }
+        return array(
+            'ok'             => true,
+            'contract'       => self::CONTRACT,
+            'key_id'         => $keys['key_id'],
+            'public_key_b64' => $keys['public_b64'],
+            'created_at'     => $keys['created_at'],
+        );
+    }
+
+    public function ability_readiness() {
+        $keys = self::ensure_keypair();
+        $health = wp_remote_get( self::ENDPOINT, array( 'timeout' => 10, 'redirection' => 2 ) );
+        $health_data = null;
+        if ( ! is_wp_error( $health ) ) {
+            $health_data = json_decode( wp_remote_retrieve_body( $health ), true );
+        }
+        return array(
+            'ok'                    => ! is_wp_error( $keys ),
+            'version'               => self::VERSION,
+            'contract'              => self::CONTRACT,
+            'endpoint'              => self::ENDPOINT,
+            'key_id'                => is_wp_error( $keys ) ? null : $keys['key_id'],
+            'openssl_available'     => function_exists( 'openssl_sign' ),
+            'endpoint_health_code'  => is_wp_error( $health ) ? null : wp_remote_retrieve_response_code( $health ),
+            'endpoint_health'       => $health_data,
+            'max_upload_bytes'      => self::MAX_FALLBACK_BYTES,
+            'supabase_max_upload_bytes' => self::MAX_BYTES,
+            'wordpress_fallback_max_upload_bytes' => self::MAX_FALLBACK_BYTES,
+            'large_media_fallback'   => 'wordpress_media',
+            'storage_plan_note'      => 'Hybrid media routing: files up to 50 MB use Supabase; files above 50 MB and up to 500 MB use WordPress Media fallback.',
+            'private_key_exposed'   => false,
+        );
+    }
+
+    private function signed_post( $payload, $timeout = 30 ) {
+        $keys = self::key_material();
+        if ( is_wp_error( $keys ) ) {
+            return $keys;
+        }
+        $body = wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+        if ( false === $body ) {
+            return new WP_Error( 'jkssb_json_failed', 'Could not encode vault request.' );
+        }
+        $timestamp = (string) time();
+        $nonce     = bin2hex( random_bytes( 16 ) );
+        $canonical = self::CONTRACT . "\n" . $timestamp . "\n" . $nonce . "\n" . hash( 'sha256', $body );
+        $signature = '';
+        if ( ! openssl_sign( $canonical, $signature, $keys['private_plain'], OPENSSL_ALGO_SHA256 ) ) {
+            return new WP_Error( 'jkssb_sign_failed', 'Could not sign Supabase vault request.' );
+        }
+        $response = wp_remote_post( self::ENDPOINT, array(
+            'timeout' => $timeout,
+            'headers' => array(
+                'Content-Type'       => 'application/json',
+                'X-JKSH-Contract'    => self::CONTRACT,
+                'X-JKSH-Key-Id'      => $keys['key_id'],
+                'X-JKSH-Timestamp'   => $timestamp,
+                'X-JKSH-Nonce'       => $nonce,
+                'X-JKSH-Signature'   => base64_encode( $signature ),
+            ),
+            'body'        => $body,
+            'data_format' => 'body',
+        ) );
+        if ( is_wp_error( $response ) ) {
+            return $response;
+        }
+        $code = wp_remote_retrieve_response_code( $response );
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( $code < 200 || $code >= 300 || ! is_array( $data ) || empty( $data['ok'] ) ) {
+            return new WP_Error( 'jkssb_vault_request_failed', 'Supabase media-vault request failed.', array( 'status' => $code, 'response' => is_array( $data ) ? $data : null ) );
+        }
+        return $data;
+    }
+
+    public function ability_ingest_media( $input ) {
+        $attachment_id = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+        if ( ! $attachment_id || 'attachment' !== get_post_type( $attachment_id ) ) {
+            return new WP_Error( 'jkssb_invalid_attachment', 'A valid WordPress media attachment is required.' );
+        }
+        $file = get_attached_file( $attachment_id );
+        if ( ! $file || ! is_readable( $file ) ) {
+            return new WP_Error( 'jkssb_file_unreadable', 'The attachment file cannot be read.' );
+        }
+        $bytes = filesize( $file );
+        if ( false === $bytes || $bytes <= 0 || $bytes > self::MAX_BYTES ) {
+            return new WP_Error( 'jkssb_file_size', 'The attachment is empty or exceeds the 50 MB Phase 2 upload limit.' );
+        }
+        $mime = get_post_mime_type( $attachment_id );
+        $allowed = array( 'image/jpeg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm' );
+        if ( ! in_array( $mime, $allowed, true ) ) {
+            return new WP_Error( 'jkssb_mime_not_allowed', 'This attachment type is not allowed in the JK Social media vault.' );
+        }
+        $sha = hash_file( 'sha256', $file );
+        $meta = wp_get_attachment_metadata( $attachment_id );
+        $width = isset( $meta['width'] ) ? absint( $meta['width'] ) : null;
+        $height = isset( $meta['height'] ) ? absint( $meta['height'] ) : null;
+        $duration_ms = null;
+        if ( isset( $meta['length'] ) && is_numeric( $meta['length'] ) ) {
+            $duration_ms = (int) round( (float) $meta['length'] * 1000 );
+        }
+        $alt = isset( $input['alt_text'] ) ? sanitize_text_field( $input['alt_text'] ) : get_post_meta( $attachment_id, '_wp_attachment_image_alt', true );
+        $prepare = $this->signed_post( array(
+            'action'           => 'prepare_upload',
+            'filename'         => wp_basename( $file ),
+            'mime_type'        => $mime,
+            'bytes'            => (int) $bytes,
+            'sha256'           => $sha,
+            'width'            => $width,
+            'height'           => $height,
+            'duration_ms'      => $duration_ms,
+            'source'           => 'wordpress',
+            'source_reference' => 'attachment:' . $attachment_id,
+            'alt_text'         => $alt,
+            'ai_generated'     => ! empty( $input['ai_generated'] ),
+            'product_refs'     => isset( $input['product_refs'] ) && is_array( $input['product_refs'] ) ? $input['product_refs'] : array(),
+            'metadata'         => isset( $input['metadata'] ) && is_array( $input['metadata'] ) ? $input['metadata'] : array(),
+        ) );
+        if ( is_wp_error( $prepare ) ) {
+            return $prepare;
+        }
+        if ( ! empty( $prepare['duplicate'] ) && ! empty( $prepare['asset']['id'] ) ) {
+            $this->save_attachment_asset_meta( $attachment_id, $prepare['asset'] );
+            return $this->maybe_create_jksh_live_schedule(
+                array( 'ok' => true, 'duplicate' => true, 'attachment_id' => $attachment_id, 'asset' => $prepare['asset'] ),
+                $input
+            );
+        }
+        if ( empty( $prepare['asset_id'] ) || empty( $prepare['signed_upload_url'] ) ) {
+            return new WP_Error( 'jkssb_prepare_incomplete', 'Vault prepare response did not include an upload target.' );
+        }
+        $binary = file_get_contents( $file );
+        if ( false === $binary ) {
+            return new WP_Error( 'jkssb_file_read_failed', 'Could not read attachment bytes for upload.' );
+        }
+        $upload = wp_remote_request( $prepare['signed_upload_url'], array(
+            'method'  => 'PUT',
+            'timeout' => 180,
+            'headers' => array(
+                'Content-Type'  => $mime,
+                'Cache-Control' => 'max-age=3600',
+                'x-upsert'      => 'false',
+            ),
+            'body'        => $binary,
+            'data_format' => 'body',
+        ) );
+        unset( $binary );
+        if ( is_wp_error( $upload ) ) {
+            return $upload;
+        }
+        $upload_code = wp_remote_retrieve_response_code( $upload );
+        if ( $upload_code < 200 || $upload_code >= 300 ) {
+            return new WP_Error( 'jkssb_storage_upload_failed', 'Supabase Storage signed upload failed.', array( 'status' => $upload_code ) );
+        }
+        $final = $this->signed_post( array( 'action' => 'finalize_upload', 'asset_id' => $prepare['asset_id'] ) );
+        if ( is_wp_error( $final ) ) {
+            return $final;
+        }
+        if ( ! empty( $final['asset'] ) ) {
+            $this->save_attachment_asset_meta( $attachment_id, $final['asset'] );
+        }
+        return $this->maybe_create_jksh_live_schedule(
+            array(
+                'ok'            => true,
+                'duplicate'     => false,
+                'attachment_id' => $attachment_id,
+                'asset'         => isset( $final['asset'] ) ? $final['asset'] : null,
+            ),
+            $input
+        );
+    }
+
+    private function maybe_create_jksh_live_schedule( $ingest_result, $input ) {
+        $metadata = isset( $input['metadata'] ) && is_array( $input['metadata'] ) ? $input['metadata'] : array();
+        if ( empty( $metadata['jksh_live_request'] ) || ! is_array( $metadata['jksh_live_request'] ) ) {
+            return $ingest_result;
+        }
+        $live = $this->create_jksh_live_content(
+            absint( $ingest_result['attachment_id'] ),
+            $metadata['jksh_live_request'],
+            isset( $ingest_result['asset'] ) && is_array( $ingest_result['asset'] ) ? $ingest_result['asset'] : array()
+        );
+        if ( is_wp_error( $live ) ) {
+            $live->add_data( array_merge( (array) $live->get_error_data(), array(
+                'media_ingest_succeeded' => true,
+                'attachment_id'          => absint( $ingest_result['attachment_id'] ),
+            ) ) );
+            return $live;
+        }
+        $ingest_result['live_schedule'] = $live;
+        return $ingest_result;
+    }
+
+    private function sanitize_live_value( $value, $key = '' ) {
+        if ( preg_match( '/token|secret|credential|authorization|private|access[_-]?key|refresh/i', (string) $key ) ) {
+            return '[redacted]';
+        }
+        if ( is_array( $value ) ) {
+            $out = array();
+            foreach ( $value as $k => $v ) {
+                $out[ is_int( $k ) ? $k : sanitize_key( (string) $k ) ] = $this->sanitize_live_value( $v, (string) $k );
+            }
+            return $out;
+        }
+        if ( is_bool( $value ) || is_int( $value ) || is_float( $value ) || null === $value ) {
+            return $value;
+        }
+        return sanitize_textarea_field( (string) $value );
+    }
+
+    private function get_jksh_publishing_readiness() {
+        if ( ! function_exists( 'wp_get_ability' ) ) {
+            return new WP_Error( 'jkssb_abilities_unavailable', 'WordPress Abilities API is unavailable.' );
+        }
+        $ability = wp_get_ability( 'jk-social/get-publishing-readiness' );
+        if ( ! $ability ) {
+            return new WP_Error( 'jkssb_readiness_unavailable', 'JK Social Hub publishing readiness ability is unavailable.' );
+        }
+        $readiness = $ability->execute();
+        if ( is_wp_error( $readiness ) ) {
+            return $readiness;
+        }
+        if ( ! is_array( $readiness ) ) {
+            return new WP_Error( 'jkssb_readiness_invalid', 'JK Social Hub publishing readiness returned an invalid response.' );
+        }
+        return $readiness;
+    }
+
+    private function validate_jksh_live_media( $attachment_ids, $content_type ) {
+        $attachment_ids = array_values( array_unique( array_filter( array_map( 'absint', (array) $attachment_ids ) ) ) );
+        if ( empty( $attachment_ids ) || count( $attachment_ids ) > 10 ) {
+            return new WP_Error( 'jkssb_live_media_count', 'Live publish requires 1-10 valid media attachments.' );
+        }
+        $image_mimes = array( 'image/jpeg', 'image/png', 'image/webp', 'image/gif' );
+        $video_mimes = array( 'video/mp4', 'video/quicktime', 'video/webm' );
+        foreach ( $attachment_ids as $id ) {
+            if ( 'attachment' !== get_post_type( $id ) ) {
+                return new WP_Error( 'jkssb_live_media_invalid', 'A requested media attachment does not exist.', array( 'attachment_id' => $id ) );
+            }
+            $supabase_asset = get_post_meta( $id, '_jkssb_asset_id', true );
+            $local_fallback = get_post_meta( $id, '_jkssb_local_fallback', true );
+            if ( ! $supabase_asset && ! $local_fallback ) {
+                return new WP_Error( 'jkssb_live_media_not_ready', 'Every live media attachment must be either a ready Supabase asset or a verified WordPress large-media fallback attachment.', array( 'attachment_id' => $id ) );
+            }
+            if ( $local_fallback ) {
+                $local_file = get_attached_file( $id );
+                if ( ! $local_file || ! is_readable( $local_file ) ) {
+                    return new WP_Error( 'jkssb_live_media_local_missing', 'A WordPress large-media fallback file is missing or unreadable.', array( 'attachment_id' => $id ) );
+                }
+            }
+            $mime = get_post_mime_type( $id );
+            if ( in_array( $content_type, array( 'single_image', 'image', 'carousel' ), true ) && ! in_array( $mime, $image_mimes, true ) ) {
+                return new WP_Error( 'jkssb_live_media_type', 'Image content may contain image attachments only.', array( 'attachment_id' => $id, 'mime' => $mime ) );
+            }
+            if ( in_array( $content_type, array( 'reel', 'sell_reel', 'video', 'short' ), true ) && ! in_array( $mime, $video_mimes, true ) ) {
+                return new WP_Error( 'jkssb_live_media_type', 'Reel content requires a video attachment.', array( 'attachment_id' => $id, 'mime' => $mime ) );
+            }
+        }
+        if ( in_array( $content_type, array( 'single_image', 'image' ), true ) && 1 !== count( $attachment_ids ) ) {
+            return new WP_Error( 'jkssb_live_single_image_count', 'A single image post requires exactly one image.' );
+        }
+        if ( 'carousel' === $content_type && count( $attachment_ids ) < 2 ) {
+            return new WP_Error( 'jkssb_live_carousel_count', 'A carousel requires at least two images.' );
+        }
+        if ( in_array( $content_type, array( 'reel', 'sell_reel', 'video', 'short' ), true ) && 1 !== count( $attachment_ids ) ) {
+            return new WP_Error( 'jkssb_live_reel_count', 'A Reel requires exactly one video.' );
+        }
+        return $attachment_ids;
+    }
+
+    private function create_jksh_live_content( $current_attachment_id, $request, $asset ) {
+        global $wpdb;
+        if ( empty( $request['confirm_live'] ) || true !== $request['confirm_live'] ) {
+            return new WP_Error( 'jkssb_live_confirm_required', 'confirm_live=true is required to create live publishing jobs.' );
+        }
+        $request_id = isset( $request['request_id'] ) ? sanitize_text_field( (string) $request['request_id'] ) : '';
+        if ( ! preg_match( '/^[A-Za-z0-9._:-]{8,100}$/', $request_id ) ) {
+            return new WP_Error( 'jkssb_live_request_id', 'request_id must be 8-100 safe characters.' );
+        }
+        $title = isset( $request['title'] ) ? sanitize_text_field( $request['title'] ) : '';
+        if ( '' === $title ) {
+            return new WP_Error( 'jkssb_live_title', 'A title is required.' );
+        }
+        $body = isset( $request['body'] ) ? sanitize_textarea_field( $request['body'] ) : '';
+        $content_type = isset( $request['content_type'] ) ? sanitize_key( $request['content_type'] ) : 'single_image';
+        if ( ! in_array( $content_type, array( 'single_image', 'image', 'carousel', 'reel', 'sell_reel', 'video', 'short' ), true ) ) {
+            return new WP_Error( 'jkssb_live_content_type', 'Supported live content: single_image, image, carousel, reel, sell_reel, video and short.' );
+        }
+        $platforms = isset( $request['platforms'] ) && is_array( $request['platforms'] ) ? array_values( array_unique( array_map( 'sanitize_key', $request['platforms'] ) ) ) : array();
+        if ( empty( $platforms ) ) {
+            return new WP_Error( 'jkssb_live_platforms', 'At least one live platform is required.' );
+        }
+        foreach ( $platforms as $platform ) {
+            if ( ! in_array( $platform, array( 'instagram', 'facebook', 'youtube' ), true ) ) { return new WP_Error( 'jkssb_live_platform_unsupported', 'Unsupported live platform.', array( 'platform' => $platform ) ); }
+            if ( 'youtube' === $platform && ! in_array( $content_type, array( 'reel', 'sell_reel', 'video', 'short' ), true ) ) { return new WP_Error( 'jkssb_youtube_community_worker', 'YouTube image/community publishing remains on the Community worker/manual path; images are never converted to fake Shorts.' ); }
+        }
+        $scheduled_at = isset( $request['scheduled_at_utc'] ) ? sanitize_text_field( $request['scheduled_at_utc'] ) : '';
+        $dt = DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $scheduled_at, new DateTimeZone( 'UTC' ) );
+        if ( ! $dt || $dt->format( 'Y-m-d H:i:s' ) !== $scheduled_at ) {
+            return new WP_Error( 'jkssb_live_schedule_format', 'scheduled_at_utc must use YYYY-MM-DD HH:MM:SS in UTC.' );
+        }
+        $scheduled_ts = $dt->getTimestamp();
+        if ( $scheduled_ts < time() + 60 || $scheduled_ts > time() + YEAR_IN_SECONDS ) {
+            return new WP_Error( 'jkssb_live_schedule_range', 'Live schedule must be at least 60 seconds in the future and no more than one year ahead.' );
+        }
+        $readiness = $this->get_jksh_publishing_readiness();
+        if ( is_wp_error( $readiness ) ) {
+            return $readiness;
+        }
+        if ( ! empty( $readiness['dry_run'] ) ) {
+            return new WP_Error( 'jkssb_live_dry_run_on', 'JK Social Hub Dry Run is ON. Live job creation is refused.' );
+        }
+        $needs_meta = ! empty( array_intersect( $platforms, array( 'instagram', 'facebook' ) ) );
+        if ( $needs_meta && ( empty( $readiness['meta_live_publish_enabled'] ) || empty( $readiness['live_publish_possible'] ) ) ) {
+            return new WP_Error( 'jkssb_live_meta_disabled', 'JK Social Hub Meta live publishing is not ready.' );
+        }
+        $healthy = array();
+        foreach ( isset( $readiness['accounts'] ) && is_array( $readiness['accounts'] ) ? $readiness['accounts'] : array() as $account ) {
+            if ( ! empty( $account['platform'] ) && ! empty( $account['connected'] ) && ! empty( $account['healthy'] ) ) {
+                $healthy[ sanitize_key( $account['platform'] ) ] = true;
+            }
+        }
+        foreach ( $platforms as $platform ) {
+            if ( 'youtube' === $platform ) { if ( empty( $readiness['youtube']['live_publish_possible'] ) || empty( $readiness['youtube']['account']['healthy'] ) ) return new WP_Error( 'jkssb_live_account_unhealthy', 'YouTube is not connected and healthy.', array( 'platform' => 'youtube' ) ); continue; }
+            if ( empty( $healthy[ $platform ] ) ) return new WP_Error( 'jkssb_live_account_unhealthy', 'A selected platform account is not connected and healthy.', array( 'platform' => $platform ) );
+        }
+        $media_ids = isset( $request['media_attachment_ids'] ) && is_array( $request['media_attachment_ids'] ) ? $request['media_attachment_ids'] : array( $current_attachment_id );
+        if ( ! in_array( $current_attachment_id, array_map( 'absint', $media_ids ), true ) ) {
+            $media_ids[] = $current_attachment_id;
+        }
+        $media_ids = $this->validate_jksh_live_media( $media_ids, $content_type );
+        if ( is_wp_error( $media_ids ) ) {
+            return $media_ids;
+        }
+        $platform_fields = isset( $request['platform_fields'] ) && is_array( $request['platform_fields'] ) ? $request['platform_fields'] : array();
+        $location = isset( $request['location'] ) && is_array( $request['location'] ) ? $this->sanitize_live_value( $request['location'] ) : array();
+        $products = isset( $request['products'] ) && is_array( $request['products'] ) ? $this->sanitize_live_value( $request['products'] ) : array();
+        $cta_default = isset( $request['cta'] ) && '' !== trim( (string) $request['cta'] ) ? sanitize_text_field( $request['cta'] ) : 'Jai Jagannātha 🙏';
+
+        $idempotency_option = 'jkssb_live_req_' . hash( 'sha256', $request_id );
+        $existing = get_option( $idempotency_option );
+        if ( is_array( $existing ) && ! empty( $existing['content_id'] ) ) {
+            $existing['ok'] = true;
+            $existing['duplicate'] = true;
+            return $existing;
+        }
+        if ( false === add_option( $idempotency_option, array( 'status' => 'creating', 'created_at' => gmdate( 'c' ) ), '', false ) ) {
+            return new WP_Error( 'jkssb_live_request_in_progress', 'This live request_id is already being processed.' );
+        }
+
+        $content_table = $wpdb->prefix . 'jksh_content';
+        $variant_table = $wpdb->prefix . 'jksh_variants';
+        $job_table     = $wpdb->prefix . 'jksh_jobs';
+        $now           = gmdate( 'Y-m-d H:i:s' );
+        $content_uuid  = wp_generate_uuid4();
+        $meta = array(
+            'location'        => $location,
+            'products'        => $products,
+            'source'          => 'supabase_bridge',
+            'workflow'        => 'omnichannel_v1',
+            'request_id'      => $request_id,
+            'ai_generated'    => ! empty( $request['ai_generated'] ),
+            'supabase_asset'  => array(
+                'id'       => isset( $asset['id'] ) ? sanitize_text_field( $asset['id'] ) : '',
+                'asset_key'=> isset( $asset['asset_key'] ) ? sanitize_text_field( $asset['asset_key'] ) : '',
+            ),
+        );
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $inserted = $wpdb->insert( $content_table, array(
+                'uuid'         => $content_uuid,
+                'title'        => $title,
+                'content_type' => $content_type,
+                'body'         => $body,
+                'status'       => 'scheduled',
+                'media_json'   => wp_json_encode( $media_ids ),
+                'author_id'    => get_current_user_id(),
+                'created_at'   => $now,
+                'updated_at'   => $now,
+                'meta_json'    => wp_json_encode( $meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ),
+            ) );
+            if ( false === $inserted ) {
+                throw new RuntimeException( 'Could not create JK Social Hub content row: ' . $wpdb->last_error );
+            }
+            $content_id = (int) $wpdb->insert_id;
+            $created_variants = array();
+            foreach ( $platforms as $platform ) {
+                $raw_fields = isset( $platform_fields[ $platform ] ) && is_array( $platform_fields[ $platform ] ) ? $platform_fields[ $platform ] : array();
+                $fields = $this->sanitize_live_value( $raw_fields );
+                if ( 'instagram' === $platform ) {
+                    $caption = isset( $fields['caption'] ) ? (string) $fields['caption'] : $body; $hashtags = isset( $fields['hashtags'] ) ? (string) $fields['hashtags'] : ''; $description = isset( $fields['description'] ) ? (string) $fields['description'] : $body; if ( ! isset( $fields['caption'] ) ) { $fields['caption'] = $caption; }
+                } elseif ( 'youtube' === $platform ) {
+                    $caption = $body; $hashtags = ''; $description = isset( $fields['description'] ) ? (string) $fields['description'] : $body; if ( ! isset( $fields['title'] ) ) $fields['title'] = $title; if ( ! isset( $fields['description'] ) ) $fields['description'] = $description; if ( ! isset( $fields['privacy_status'] ) ) $fields['privacy_status'] = 'public'; if ( ! isset( $fields['notify_subscribers'] ) ) $fields['notify_subscribers'] = false;
+                } else {
+                    $caption = isset( $fields['message'] ) ? (string) $fields['message'] : $body;
+                    $hashtags = isset( $fields['hashtags'] ) ? (string) $fields['hashtags'] : '';
+                    $description = isset( $fields['description'] ) ? (string) $fields['description'] : $body;
+                    if ( ! isset( $fields['message'] ) ) { $fields['message'] = $caption; }
+                }
+                if ( ! isset( $fields['hashtags'] ) && '' !== $hashtags ) { $fields['hashtags'] = $hashtags; }
+                $publication_type = 'post';
+                if ( 'youtube' === $platform ) { $publication_type = in_array( $content_type, array( 'reel', 'sell_reel', 'short' ), true ) ? 'short' : 'video'; } elseif ( in_array( $content_type, array( 'reel', 'sell_reel' ), true ) ) { $publication_type = 'reel'; } elseif ( 'carousel' === $content_type && 'instagram' === $platform ) {
+                    $publication_type = 'carousel';
+                }
+                $variant_uuid = wp_generate_uuid4();
+                $variant_ok = $wpdb->insert( $variant_table, array(
+                    'uuid'             => $variant_uuid,
+                    'content_id'       => $content_id,
+                    'platform'         => $platform,
+                    'publication_type' => $publication_type,
+                    'title'            => $title,
+                    'caption'          => $caption,
+                    'description'      => $description,
+                    'hashtags'         => $hashtags,
+                    'cta'              => isset( $fields['cta'] ) ? sanitize_text_field( $fields['cta'] ) : $cta_default,
+                    'media_json'       => wp_json_encode( $media_ids ),
+                    'publish_at'       => $scheduled_at,
+                    'status'           => 'scheduled',
+                    'external_id'      => '',
+                    'external_url'     => null,
+                    'analytics_json'   => wp_json_encode( array() ),
+                    'created_at'       => $now,
+                    'updated_at'       => $now,
+                    'fields_json'      => wp_json_encode( $fields, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ),
+                ) );
+                if ( false === $variant_ok ) {
+                    throw new RuntimeException( 'Could not create JK Social Hub variant row: ' . $wpdb->last_error );
+                }
+                $variant_id = (int) $wpdb->insert_id;
+                $job_uuid = wp_generate_uuid4();
+                $idempotency_key = hash( 'sha256', 'jkssb-live-v1|' . $request_id . '|' . $platform . '|' . $variant_uuid . '|' . $scheduled_at );
+                $payload = array(
+                    'variant_id'   => $variant_id,
+                    'publish_mode' => 'live',
+                    'dry_run'      => false,
+                    'source'       => 'supabase_bridge',
+                );
+                $job_ok = $wpdb->insert( $job_table, array(
+                    'uuid'               => $job_uuid,
+                    'idempotency_key'    => $idempotency_key,
+                    'content_id'         => $content_id,
+                    'variant_id'         => $variant_id,
+                    'platform'           => $platform,
+                    'job_type'           => 'publish',
+                    'status'             => 'queued',
+                    'attempts'           => 0,
+                    'max_attempts'       => 3,
+                    'payload_json'       => wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ),
+                    'last_response_json' => wp_json_encode( array() ),
+                    'last_error'         => '',
+                    'scheduled_at'       => $scheduled_at,
+                    'started_at'         => null,
+                    'completed_at'       => null,
+                    'created_at'         => $now,
+                    'updated_at'         => $now,
+                ) );
+                if ( false === $job_ok ) {
+                    throw new RuntimeException( 'Could not create JK Social Hub live job row: ' . $wpdb->last_error );
+                }
+                $created_variants[] = array(
+                    'platform'         => $platform,
+                    'publication_type' => $publication_type,
+                    'variant_id'       => $variant_id,
+                    'job_id'           => (int) $wpdb->insert_id,
+                    'publish_mode'     => 'live',
+                );
+            }
+            $wpdb->query( 'COMMIT' );
+        } catch ( Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            delete_option( $idempotency_option );
+            return new WP_Error( 'jkssb_live_create_failed', 'JK Social Hub live queue creation failed safely; database transaction was rolled back.', array( 'detail' => sanitize_text_field( $e->getMessage() ) ) );
+        }
+        $result = array(
+            'ok'               => true,
+            'duplicate'        => false,
+            'request_id'       => $request_id,
+            'content_id'       => $content_id,
+            'scheduled_at_ist' => $this->utc_mysql_to_ist( $scheduled_at ),
+            'timezone' => 'Asia/Kolkata',
+            'publish_mode'     => 'live',
+            'variants'         => $created_variants,
+        );
+        update_option( $idempotency_option, $result, false );
+        return $result;
+    }
+
+    private function save_attachment_asset_meta( $attachment_id, $asset ) {
+        if ( ! empty( $asset['id'] ) ) {
+            update_post_meta( $attachment_id, '_jkssb_asset_id', sanitize_text_field( $asset['id'] ) );
+        }
+        if ( ! empty( $asset['asset_key'] ) ) {
+            update_post_meta( $attachment_id, '_jkssb_asset_key', sanitize_text_field( $asset['asset_key'] ) );
+        }
+        if ( ! empty( $asset['object_path'] ) ) {
+            update_post_meta( $attachment_id, '_jkssb_object_path', sanitize_text_field( $asset['object_path'] ) );
+        }
+        if ( ! empty( $asset['sha256'] ) ) {
+            update_post_meta( $attachment_id, '_jkssb_sha256', sanitize_text_field( $asset['sha256'] ) );
+        }
+    }
+
+    public function ability_delivery_url( $input ) {
+        $asset_id = isset( $input['asset_id'] ) ? sanitize_text_field( $input['asset_id'] ) : '';
+        $attachment_id = ! empty( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+        if ( ! $asset_id && $attachment_id ) {
+            $asset_id = get_post_meta( $attachment_id, '_jkssb_asset_id', true );
+        }
+        if ( ! $asset_id && $attachment_id && get_post_meta( $attachment_id, '_jkssb_local_fallback', true ) ) {
+            $url = wp_get_attachment_url( $attachment_id );
+            if ( ! $url ) return new WP_Error( 'jkssb_local_delivery_missing', 'WordPress fallback attachment URL is unavailable.' );
+            return array( 'ok' => true, 'attachment_id' => $attachment_id, 'asset_id' => '', 'signed_url' => esc_url_raw( $url ), 'delivery_url' => esc_url_raw( $url ), 'expires_in_seconds' => null, 'storage' => 'wordpress_media' );
+        }
+        if ( ! $asset_id ) {
+            return new WP_Error( 'jkssb_asset_missing', 'No Supabase asset or WordPress fallback attachment is linked to this request.' );
+        }
+        return $this->signed_post( array(
+            'action'             => 'create_delivery_url',
+            'asset_id'           => $asset_id,
+            'expires_in_seconds' => isset( $input['expires_in_seconds'] ) ? min( 21600, max( 60, absint( $input['expires_in_seconds'] ) ) ) : 3600,
+        ) );
+    }
+
+
+    public function can_update() {
+        return current_user_can( 'manage_options' ) && current_user_can( 'update_plugins' ) && current_user_can( 'install_plugins' );
+    }
+
+    public function ability_inspect_jksh_runtime() {
+        global $wpdb;
+        $tables = array();
+        $prefix = $wpdb->esc_like( $wpdb->prefix . 'jksh_' ) . '%';
+        $names = $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $prefix ) );
+        foreach ( (array) $names as $table ) {
+            $cols = $wpdb->get_results( 'DESCRIBE `' . esc_sql( $table ) . '`', ARRAY_A );
+            $tables[] = array(
+                'table'   => $table,
+                'columns' => array_map( function( $row ) {
+                    return array(
+                        'field' => isset( $row['Field'] ) ? $row['Field'] : '',
+                        'type'  => isset( $row['Type'] ) ? $row['Type'] : '',
+                        'null'  => isset( $row['Null'] ) ? $row['Null'] : '',
+                        'key'   => isset( $row['Key'] ) ? $row['Key'] : '',
+                        'default' => isset( $row['Default'] ) ? $row['Default'] : null,
+                    );
+                }, (array) $cols ),
+            );
+        }
+        $classes = array();
+        foreach ( get_declared_classes() as $class ) {
+            if ( 0 !== strpos( $class, 'JKSH' ) && 0 !== strpos( $class, 'JK\\Social' ) ) {
+                continue;
+            }
+            try {
+                $r = new ReflectionClass( $class );
+                $public = array();
+                foreach ( $r->getMethods( ReflectionMethod::IS_PUBLIC ) as $m ) {
+                    if ( $m->getDeclaringClass()->getName() !== $class ) {
+                        continue;
+                    }
+                    $public[] = $m->getName();
+                }
+                $classes[] = array( 'class' => $class, 'public_methods' => $public );
+            } catch ( Throwable $e ) {
+                // Skip unloadable reflection targets.
+            }
+        }
+        sort( $names );
+        usort( $classes, function( $a, $b ) { return strcmp( $a['class'], $b['class'] ); } );
+        $latest_records = null;
+        $content_table = $wpdb->prefix . 'jksh_content';
+        $content_exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $content_table ) );
+        if ( $content_exists === $content_table ) {
+            $latest_content_id = absint( $wpdb->get_var( "SELECT id FROM `{$content_table}` ORDER BY id DESC LIMIT 1" ) );
+            if ( $latest_content_id ) {
+                $inspected = $this->ability_inspect_jksh_records( array( 'content_id' => $latest_content_id ) );
+                if ( ! is_wp_error( $inspected ) ) {
+                    $latest_records = $inspected;
+                }
+            }
+        }
+        return array(
+            'ok'       => true,
+            'bridge_version' => self::VERSION,
+            'tables'   => $tables,
+            'classes'  => $classes,
+            'latest_content_records' => $latest_records,
+            'secrets_exposed' => false,
+        );
+    }
+
+    private function sanitize_runtime_value( $value, $key = '' ) {
+        if ( preg_match( '/(?:token|secret|credential|authorization|password|private[_-]?key|access[_-]?key|refresh[_-]?key)/i', (string) $key ) ) {
+            return '[redacted]';
+        }
+        if ( is_array( $value ) ) {
+            $out = array();
+            foreach ( $value as $k => $v ) {
+                $out[ $k ] = $this->sanitize_runtime_value( $v, (string) $k );
+            }
+            return $out;
+        }
+        if ( is_object( $value ) ) {
+            return $this->sanitize_runtime_value( get_object_vars( $value ), $key );
+        }
+        return $value;
+    }
+
+    private function decode_sanitized_json_field( $raw ) {
+        if ( null === $raw || '' === $raw ) {
+            return null;
+        }
+        $decoded = json_decode( $raw, true );
+        if ( JSON_ERROR_NONE !== json_last_error() ) {
+            return '[invalid-json]';
+        }
+        return $this->sanitize_runtime_value( $decoded );
+    }
+
+    public function ability_inspect_jksh_records( $input ) {
+        global $wpdb;
+        $content_id = isset( $input['content_id'] ) ? absint( $input['content_id'] ) : 0;
+        if ( ! $content_id ) {
+            return new WP_Error( 'jkssb_content_id_required', 'A valid JK Social Hub content_id is required.' );
+        }
+        $content_table  = $wpdb->prefix . 'jksh_content';
+        $variant_table  = $wpdb->prefix . 'jksh_variants';
+        $job_table      = $wpdb->prefix . 'jksh_jobs';
+        $media_table    = $wpdb->prefix . 'jksh_media';
+        foreach ( array( $content_table, $variant_table, $job_table, $media_table ) as $table ) {
+            $exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+            if ( $exists !== $table ) {
+                return new WP_Error( 'jkssb_jksh_table_missing', 'A required JK Social Hub table is missing.', array( 'table' => $table ) );
+            }
+        }
+        $content = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM `{$content_table}` WHERE id=%d", $content_id ), ARRAY_A );
+        if ( ! $content ) {
+            return new WP_Error( 'jkssb_content_not_found', 'JK Social Hub content record was not found.' );
+        }
+        foreach ( array( 'media_json', 'meta_json' ) as $field ) {
+            if ( array_key_exists( $field, $content ) ) {
+                $content[ $field ] = $this->decode_sanitized_json_field( $content[ $field ] );
+            }
+        }
+        $variants = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$variant_table}` WHERE content_id=%d ORDER BY id ASC", $content_id ), ARRAY_A );
+        foreach ( $variants as &$variant ) {
+            foreach ( array( 'media_json', 'analytics_json', 'fields_json' ) as $field ) {
+                if ( array_key_exists( $field, $variant ) ) {
+                    $variant[ $field ] = $this->decode_sanitized_json_field( $variant[ $field ] );
+                }
+            }
+        }
+        unset( $variant );
+        $jobs = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$job_table}` WHERE content_id=%d ORDER BY id ASC", $content_id ), ARRAY_A );
+        foreach ( $jobs as &$job ) {
+            foreach ( array( 'payload_json', 'last_response_json' ) as $field ) {
+                if ( array_key_exists( $field, $job ) ) {
+                    $job[ $field ] = $this->decode_sanitized_json_field( $job[ $field ] );
+                }
+            }
+            if ( isset( $job['last_error'] ) && is_string( $job['last_error'] ) && strlen( $job['last_error'] ) > 2000 ) {
+                $job['last_error'] = substr( $job['last_error'], 0, 2000 ) . '...';
+            }
+        }
+        unset( $job );
+        $media = $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$media_table}` WHERE content_id=%d ORDER BY sort_order ASC, id ASC", $content_id ), ARRAY_A );
+        foreach ( $media as &$row ) {
+            if ( array_key_exists( 'meta_json', $row ) ) {
+                $row['meta_json'] = $this->decode_sanitized_json_field( $row['meta_json'] );
+            }
+        }
+        unset( $row );
+        return array(
+            'ok'        => true,
+            'content'   => $content,
+            'variants'  => $variants,
+            'jobs'      => $jobs,
+            'media'     => $media,
+            'secrets_exposed' => false,
+        );
+    }
+
+    private function direct_session_key( $upload_id ) {
+        return 'jkssb_direct_' . md5( (string) $upload_id );
+    }
+
+    private function get_direct_session( $upload_id ) {
+        if ( ! preg_match( '/^[a-f0-9-]{36}$/i', (string) $upload_id ) ) {
+            return new WP_Error( 'jkssb_direct_upload_id', 'Invalid direct upload ID.' );
+        }
+        $session = get_transient( $this->direct_session_key( $upload_id ) );
+        if ( ! is_array( $session ) || empty( $session['path'] ) ) {
+            return new WP_Error( 'jkssb_direct_session_missing', 'Direct upload session is missing or expired.' );
+        }
+        return $session;
+    }
+
+    public function ability_begin_direct_upload( $input ) {
+        $allowed = array( 'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'video/quicktime', 'video/webm' );
+        $filename = isset( $input['filename'] ) ? sanitize_file_name( $input['filename'] ) : '';
+        $mime = isset( $input['mime_type'] ) ? sanitize_mime_type( $input['mime_type'] ) : '';
+        $bytes = isset( $input['bytes'] ) ? absint( $input['bytes'] ) : 0;
+        $sha256 = isset( $input['sha256'] ) ? strtolower( sanitize_text_field( $input['sha256'] ) ) : '';
+        if ( ! $filename || ! in_array( $mime, $allowed, true ) || $bytes < 1 || $bytes > self::MAX_FALLBACK_BYTES || ! preg_match( '/^[a-f0-9]{64}$/', $sha256 ) ) {
+            return new WP_Error( 'jkssb_direct_invalid', 'Direct upload metadata is invalid or exceeds the 500 MB hybrid upload limit.' );
+        }
+        $upload_id = wp_generate_uuid4();
+        $path = wp_tempnam( 'jkssb-' . $upload_id . '-' . $filename );
+        if ( ! $path || ! file_exists( $path ) ) {
+            return new WP_Error( 'jkssb_direct_temp', 'Could not create the temporary direct-upload buffer.' );
+        }
+        $session = array(
+            'path' => $path, 'filename' => $filename, 'mime_type' => $mime, 'bytes' => $bytes, 'sha256' => $sha256,
+            'width' => isset( $input['width'] ) ? absint( $input['width'] ) : null,
+            'height' => isset( $input['height'] ) ? absint( $input['height'] ) : null,
+            'duration_ms' => isset( $input['duration_ms'] ) ? absint( $input['duration_ms'] ) : null,
+            'alt_text' => isset( $input['alt_text'] ) ? sanitize_text_field( $input['alt_text'] ) : '',
+            'ai_generated' => ! empty( $input['ai_generated'] ),
+            'product_refs' => isset( $input['product_refs'] ) && is_array( $input['product_refs'] ) ? $input['product_refs'] : array(),
+            'metadata' => isset( $input['metadata'] ) && is_array( $input['metadata'] ) ? $input['metadata'] : array(),
+            'storage_target' => $bytes > self::MAX_BYTES ? 'wordpress_media' : 'supabase',
+            'created_at' => time(),
+        );
+        set_transient( $this->direct_session_key( $upload_id ), $session, HOUR_IN_SECONDS );
+        return array( 'ok' => true, 'upload_id' => $upload_id, 'next_offset' => 0, 'max_chunk_bytes' => self::DIRECT_CHUNK_BYTES, 'expires_in_seconds' => HOUR_IN_SECONDS, 'storage_target' => $session['storage_target'] );
+    }
+
+    public function ability_append_direct_upload_chunk( $input ) {
+        $upload_id = isset( $input['upload_id'] ) ? sanitize_text_field( $input['upload_id'] ) : '';
+        $session = $this->get_direct_session( $upload_id );
+        if ( is_wp_error( $session ) ) return $session;
+        $offset = isset( $input['offset'] ) ? absint( $input['offset'] ) : 0;
+        $current = file_exists( $session['path'] ) ? filesize( $session['path'] ) : false;
+        if ( false === $current || (int) $current !== (int) $offset ) {
+            return new WP_Error( 'jkssb_direct_offset', 'Chunk offset does not match the current upload position.', array( 'next_offset' => false === $current ? null : (int) $current ) );
+        }
+        $chunk = isset( $input['chunk_base64'] ) ? base64_decode( $input['chunk_base64'], true ) : false;
+        if ( false === $chunk || '' === $chunk || strlen( $chunk ) > self::DIRECT_CHUNK_BYTES ) {
+            return new WP_Error( 'jkssb_direct_chunk', 'Direct upload chunk is invalid or too large.' );
+        }
+        if ( $current + strlen( $chunk ) > (int) $session['bytes'] ) {
+            return new WP_Error( 'jkssb_direct_overflow', 'Chunk would exceed the declared original file size.' );
+        }
+        $written = file_put_contents( $session['path'], $chunk, FILE_APPEND | LOCK_EX );
+        unset( $chunk );
+        if ( false === $written ) return new WP_Error( 'jkssb_direct_write', 'Could not append the direct upload chunk.' );
+        set_transient( $this->direct_session_key( $upload_id ), $session, HOUR_IN_SECONDS );
+        return array( 'ok' => true, 'upload_id' => $upload_id, 'next_offset' => (int) $current + (int) $written, 'complete' => ( (int) $current + (int) $written ) === (int) $session['bytes'] );
+    }
+
+    private function create_external_attachment_shell( $session, $asset ) {
+        if ( empty( $asset['id'] ) ) return new WP_Error( 'jkssb_direct_asset', 'Ready Supabase asset ID is missing.' );
+        $delivery = self::DELIVERY_BASE . rawurlencode( (string) $asset['id'] );
+        $attachment_id = wp_insert_attachment( array(
+            'post_title' => sanitize_text_field( pathinfo( $session['filename'], PATHINFO_FILENAME ) ),
+            'post_status' => 'inherit',
+            'post_mime_type' => sanitize_mime_type( $session['mime_type'] ),
+            'guid' => esc_url_raw( $delivery ),
+        ), '', 0, true );
+        if ( is_wp_error( $attachment_id ) ) return $attachment_id;
+        update_post_meta( $attachment_id, '_jkssb_asset_id', sanitize_text_field( $asset['id'] ) );
+        if ( ! empty( $asset['asset_key'] ) ) update_post_meta( $attachment_id, '_jkssb_asset_key', sanitize_text_field( $asset['asset_key'] ) );
+        if ( ! empty( $asset['object_path'] ) ) update_post_meta( $attachment_id, '_jkssb_object_path', sanitize_text_field( $asset['object_path'] ) );
+        update_post_meta( $attachment_id, '_jkssb_sha256', sanitize_text_field( $session['sha256'] ) );
+        update_post_meta( $attachment_id, '_jkssb_external_only', '1' );
+        update_post_meta( $attachment_id, '_jkssb_delivery_url', esc_url_raw( $delivery ) );
+        if ( ! empty( $session['alt_text'] ) ) update_post_meta( $attachment_id, '_wp_attachment_image_alt', sanitize_text_field( $session['alt_text'] ) );
+        return array( 'attachment_id' => (int) $attachment_id, 'delivery_url' => $delivery );
+    }
+
+
+    private function create_wordpress_fallback_attachment( $session, $actual_sha ) {
+        $uploads = wp_upload_dir();
+        if ( ! empty( $uploads['error'] ) ) {
+            return new WP_Error( 'jkssb_wp_upload_dir', 'WordPress upload directory is unavailable.', array( 'detail' => sanitize_text_field( $uploads['error'] ) ) );
+        }
+        if ( ! wp_mkdir_p( $uploads['path'] ) ) {
+            return new WP_Error( 'jkssb_wp_upload_mkdir', 'Could not prepare the WordPress upload directory.' );
+        }
+        $filename = wp_unique_filename( $uploads['path'], sanitize_file_name( $session['filename'] ) );
+        $dest = trailingslashit( $uploads['path'] ) . $filename;
+        $moved = @rename( $session['path'], $dest );
+        if ( ! $moved ) {
+            $moved = @copy( $session['path'], $dest );
+            if ( $moved ) @unlink( $session['path'] );
+        }
+        if ( ! $moved || ! file_exists( $dest ) ) {
+            return new WP_Error( 'jkssb_wp_upload_move', 'Could not move the completed large media file into WordPress Media.' );
+        }
+        $url = trailingslashit( $uploads['url'] ) . rawurlencode( $filename );
+        $attachment_id = wp_insert_attachment( array(
+            'post_title'     => sanitize_text_field( pathinfo( $session['filename'], PATHINFO_FILENAME ) ),
+            'post_status'    => 'inherit',
+            'post_mime_type' => sanitize_mime_type( $session['mime_type'] ),
+            'guid'           => esc_url_raw( $url ),
+        ), $dest, 0, true );
+        if ( is_wp_error( $attachment_id ) ) {
+            @unlink( $dest );
+            return $attachment_id;
+        }
+        update_attached_file( $attachment_id, $dest );
+        $meta = array( 'filesize' => (int) $session['bytes'] );
+        if ( ! empty( $session['width'] ) ) $meta['width'] = absint( $session['width'] );
+        if ( ! empty( $session['height'] ) ) $meta['height'] = absint( $session['height'] );
+        if ( ! empty( $session['duration_ms'] ) ) {
+            $meta['length'] = round( absint( $session['duration_ms'] ) / 1000, 3 );
+            $seconds = max( 0, (int) round( absint( $session['duration_ms'] ) / 1000 ) );
+            $meta['length_formatted'] = sprintf( '%02d:%02d', floor( $seconds / 60 ), $seconds % 60 );
+        }
+        wp_update_attachment_metadata( $attachment_id, $meta );
+        update_post_meta( $attachment_id, '_jkssb_sha256', sanitize_text_field( $actual_sha ) );
+        update_post_meta( $attachment_id, '_jkssb_local_fallback', '1' );
+        update_post_meta( $attachment_id, '_jkssb_storage_source', 'wordpress_media' );
+        update_post_meta( $attachment_id, '_jkssb_original_filename', sanitize_file_name( $session['filename'] ) );
+        if ( ! empty( $session['alt_text'] ) ) update_post_meta( $attachment_id, '_wp_attachment_image_alt', sanitize_text_field( $session['alt_text'] ) );
+        $final_url = wp_get_attachment_url( $attachment_id );
+        if ( ! $final_url ) $final_url = $url;
+        return array(
+            'attachment_id' => (int) $attachment_id,
+            'delivery_url'  => esc_url_raw( $final_url ),
+            'storage'       => 'wordpress_media',
+            'wordpress_media_bytes' => true,
+        );
+    }
+
+    public function ability_finalize_direct_upload( $input ) {
+        $upload_id = isset( $input['upload_id'] ) ? sanitize_text_field( $input['upload_id'] ) : '';
+        $session = $this->get_direct_session( $upload_id );
+        if ( is_wp_error( $session ) ) return $session;
+        $size = file_exists( $session['path'] ) ? filesize( $session['path'] ) : false;
+        if ( false === $size || (int) $size !== (int) $session['bytes'] ) {
+            return new WP_Error( 'jkssb_direct_incomplete', 'Direct upload is not complete.', array( 'received_bytes' => false === $size ? 0 : (int) $size, 'expected_bytes' => (int) $session['bytes'] ) );
+        }
+        $actual_sha = hash_file( 'sha256', $session['path'] );
+        if ( ! hash_equals( $session['sha256'], $actual_sha ) ) {
+            return new WP_Error( 'jkssb_direct_hash', 'Direct upload SHA-256 does not match the declared original.' );
+        }
+        $storage_target = isset( $session['storage_target'] ) ? sanitize_key( $session['storage_target'] ) : ( (int) $session['bytes'] > self::MAX_BYTES ? 'wordpress_media' : 'supabase' );
+        if ( 'wordpress_media' === $storage_target || (int) $session['bytes'] > self::MAX_BYTES ) {
+            $local = $this->create_wordpress_fallback_attachment( $session, $actual_sha );
+            if ( is_wp_error( $local ) ) return $local;
+            delete_transient( $this->direct_session_key( $upload_id ) );
+            $result = array(
+                'ok' => true,
+                'upload_id' => $upload_id,
+                'original_sha256' => $actual_sha,
+                'asset' => array(),
+                'attachment_id' => $local['attachment_id'],
+                'delivery_url' => $local['delivery_url'],
+                'wordpress_media_bytes' => true,
+                'storage' => 'wordpress_media',
+                'fallback_reason' => 'supabase_free_plan_over_50mb',
+            );
+            if ( ! empty( $session['metadata']['jksh_live_request'] ) && is_array( $session['metadata']['jksh_live_request'] ) ) {
+                $live = $this->create_jksh_live_content( $local['attachment_id'], $session['metadata']['jksh_live_request'], array() );
+                if ( is_wp_error( $live ) ) {
+                    $live->add_data( array_merge( (array) $live->get_error_data(), array( 'media_ingest_succeeded' => true, 'attachment_id' => $local['attachment_id'], 'storage' => 'wordpress_media' ) ) );
+                    return $live;
+                }
+                $result['live_schedule'] = $live;
+            }
+            return $result;
+        }
+        $prepare = $this->signed_post( array(
+            'action' => 'prepare_upload', 'filename' => $session['filename'], 'mime_type' => $session['mime_type'], 'bytes' => (int) $session['bytes'],
+            'sha256' => $actual_sha, 'width' => $session['width'], 'height' => $session['height'], 'duration_ms' => $session['duration_ms'],
+            'source' => 'chatgpt_direct', 'source_reference' => 'direct:' . $upload_id, 'alt_text' => $session['alt_text'],
+            'ai_generated' => ! empty( $session['ai_generated'] ), 'product_refs' => $session['product_refs'], 'metadata' => $session['metadata'],
+        ) );
+        if ( is_wp_error( $prepare ) ) return $prepare;
+        if ( ! empty( $prepare['duplicate'] ) && ! empty( $prepare['asset']['id'] ) ) {
+            $asset = $prepare['asset'];
+        } else {
+            if ( empty( $prepare['asset_id'] ) || empty( $prepare['signed_upload_url'] ) ) return new WP_Error( 'jkssb_direct_prepare', 'Vault did not return a direct upload target.' );
+            $code = 0;
+            if ( function_exists( 'curl_init' ) ) { $fh = fopen( $session['path'], 'rb' ); if ( ! $fh ) return new WP_Error( 'jkssb_direct_read', 'Could not stream the temporary original.' ); $ch = curl_init( $prepare['signed_upload_url'] ); curl_setopt( $ch, CURLOPT_UPLOAD, true ); curl_setopt( $ch, CURLOPT_INFILE, $fh ); curl_setopt( $ch, CURLOPT_INFILESIZE, (int) $session['bytes'] ); curl_setopt( $ch, CURLOPT_HTTPHEADER, array( 'Content-Type: ' . $session['mime_type'], 'Cache-Control: max-age=3600', 'x-upsert: false' ) ); curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true ); curl_setopt( $ch, CURLOPT_TIMEOUT, 900 ); curl_exec( $ch ); $code = (int) curl_getinfo( $ch, CURLINFO_HTTP_CODE ); $cerr = curl_error( $ch ); curl_close( $ch ); fclose( $fh ); if ( $cerr ) return new WP_Error( 'jkssb_direct_storage_transport', $cerr ); } else { $binary = file_get_contents( $session['path'] ); if ( false === $binary ) return new WP_Error( 'jkssb_direct_read', 'Could not read the temporary original.' ); $upload = wp_remote_request( $prepare['signed_upload_url'], array( 'method' => 'PUT', 'timeout' => 900, 'headers' => array( 'Content-Type' => $session['mime_type'], 'Cache-Control' => 'max-age=3600', 'x-upsert' => 'false' ), 'body' => $binary, 'data_format' => 'body' ) ); unset( $binary ); if ( is_wp_error( $upload ) ) return $upload; $code = wp_remote_retrieve_response_code( $upload ); }
+            if ( $code < 200 || $code >= 300 ) return new WP_Error( 'jkssb_direct_storage', 'Supabase Storage rejected the original media upload.', array( 'status' => $code ) );
+            $final = $this->signed_post( array( 'action' => 'finalize_upload', 'asset_id' => sanitize_text_field( $prepare['asset_id'] ) ) );
+            if ( is_wp_error( $final ) ) return $final;
+            $asset = isset( $final['asset'] ) && is_array( $final['asset'] ) ? $final['asset'] : array();
+        }
+        $shell = $this->create_external_attachment_shell( $session, $asset );
+        if ( is_wp_error( $shell ) ) return $shell;
+        @unlink( $session['path'] );
+        delete_transient( $this->direct_session_key( $upload_id ) );
+        $result = array( 'ok' => true, 'upload_id' => $upload_id, 'original_sha256' => $actual_sha, 'asset' => $asset, 'attachment_id' => $shell['attachment_id'], 'delivery_url' => $shell['delivery_url'], 'wordpress_media_bytes' => false, 'storage' => 'supabase' );
+        if ( ! empty( $session['metadata']['jksh_live_request'] ) && is_array( $session['metadata']['jksh_live_request'] ) ) {
+            $live = $this->create_jksh_live_content( $shell['attachment_id'], $session['metadata']['jksh_live_request'], $asset );
+            if ( is_wp_error( $live ) ) {
+                $live->add_data( array_merge( (array) $live->get_error_data(), array( 'media_ingest_succeeded' => true, 'attachment_id' => $shell['attachment_id'], 'asset_id' => isset( $asset['id'] ) ? $asset['id'] : '' ) ) );
+                return $live;
+            }
+            $result['live_schedule'] = $live;
+        }
+        return $result;
+    }
+
+    public function ability_abort_direct_upload( $input ) {
+        $upload_id = isset( $input['upload_id'] ) ? sanitize_text_field( $input['upload_id'] ) : '';
+        $session = $this->get_direct_session( $upload_id );
+        if ( is_wp_error( $session ) ) return array( 'ok' => true, 'already_gone' => true );
+        if ( ! empty( $session['path'] ) && file_exists( $session['path'] ) ) @unlink( $session['path'] );
+        delete_transient( $this->direct_session_key( $upload_id ) );
+        return array( 'ok' => true, 'aborted' => true );
+    }
+
+    public function ability_ingest_from_url( $input ) {
+        $url = isset( $input['url'] ) ? esc_url_raw( $input['url'] ) : '';
+        if ( ! $url || 0 !== stripos( $url, 'https://' ) ) {
+            return new WP_Error( 'jkssb_https_required', 'A valid HTTPS media URL is required.' );
+        }
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+        $tmp = download_url( $url, 60 );
+        if ( is_wp_error( $tmp ) ) {
+            return $tmp;
+        }
+        if ( filesize( $tmp ) > self::MAX_BYTES ) {
+            @unlink( $tmp );
+            return new WP_Error( 'jkssb_file_size', 'Downloaded media exceeds the 50 MB Phase 2 limit.' );
+        }
+        $filename = ! empty( $input['filename'] ) ? sanitize_file_name( $input['filename'] ) : sanitize_file_name( wp_basename( wp_parse_url( $url, PHP_URL_PATH ) ) );
+        if ( ! $filename ) {
+            $filename = 'jk-social-upload-' . gmdate( 'Ymd-His' );
+        }
+        $file_array = array( 'name' => $filename, 'tmp_name' => $tmp );
+        $attachment_id = media_handle_sideload( $file_array, 0, isset( $input['title'] ) ? sanitize_text_field( $input['title'] ) : '' );
+        if ( is_wp_error( $attachment_id ) ) {
+            @unlink( $tmp );
+            return $attachment_id;
+        }
+        if ( isset( $input['alt_text'] ) ) {
+            update_post_meta( $attachment_id, '_wp_attachment_image_alt', sanitize_text_field( $input['alt_text'] ) );
+        }
+        $ingest = $this->ability_ingest_media( array(
+            'attachment_id' => $attachment_id,
+            'alt_text'      => isset( $input['alt_text'] ) ? $input['alt_text'] : '',
+            'ai_generated'  => ! empty( $input['ai_generated'] ),
+            'product_refs'  => isset( $input['product_refs'] ) && is_array( $input['product_refs'] ) ? $input['product_refs'] : array(),
+            'metadata'      => isset( $input['metadata'] ) && is_array( $input['metadata'] ) ? $input['metadata'] : array(),
+        ) );
+        if ( is_wp_error( $ingest ) ) {
+            return $ingest;
+        }
+        $ingest['wordpress_attachment_id'] = $attachment_id;
+        return $ingest;
+    }
+
+    private function bridge_plugin_basename() {
+        return plugin_basename( __FILE__ );
+    }
+
+    private function inspect_update_package( $attachment_id, $expected_sha256 ) {
+        $attachment_id = absint( $attachment_id );
+        $expected_sha256 = strtolower( sanitize_text_field( $expected_sha256 ) );
+        if ( ! $attachment_id || 'attachment' !== get_post_type( $attachment_id ) ) {
+            return new WP_Error( 'jkssb_update_attachment', 'A valid ZIP media attachment is required.' );
+        }
+        $file = get_attached_file( $attachment_id );
+        if ( ! $file || ! is_readable( $file ) || 'zip' !== strtolower( pathinfo( $file, PATHINFO_EXTENSION ) ) ) {
+            return new WP_Error( 'jkssb_update_zip', 'Update package must be a readable ZIP.' );
+        }
+        $actual = strtolower( hash_file( 'sha256', $file ) );
+        if ( ! hash_equals( $expected_sha256, $actual ) ) {
+            return new WP_Error( 'jkssb_update_checksum', 'Update package SHA-256 does not match.' );
+        }
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            return new WP_Error( 'jkssb_update_ziparchive', 'ZipArchive is required for bridge update preflight.' );
+        }
+        $zip = new ZipArchive();
+        if ( true !== $zip->open( $file ) ) {
+            return new WP_Error( 'jkssb_update_open', 'Could not open update ZIP.' );
+        }
+        $main = 'jk-social-supabase-bridge/jk-social-supabase-bridge.php';
+        $idx = $zip->locateName( $main, ZipArchive::FL_NOCASE );
+        if ( false === $idx ) {
+            $zip->close();
+            return new WP_Error( 'jkssb_update_identity', 'ZIP is not a JK Social Supabase Bridge package.' );
+        }
+        $source = $zip->getFromIndex( $idx );
+        $zip->close();
+        if ( false === $source || ! preg_match( '/^\s*\*\s*Plugin Name:\s*JK Social Supabase Bridge\s*$/mi', $source ) || ! preg_match( '/^\s*\*\s*Version:\s*([^\r\n]+)/mi', $source, $m ) ) {
+            return new WP_Error( 'jkssb_update_header', 'Bridge package headers are invalid.' );
+        }
+        return array( 'ok' => true, 'attachment_id' => $attachment_id, 'sha256' => $actual, 'package_version' => trim( $m[1] ), 'file' => $file );
+    }
+
+    private function upload_bundles() { $v = get_option( 'jkssb_upload_bundles_v1', array() ); return is_array( $v ) ? $v : array(); }
+    private function save_upload_bundles( $items ) { update_option( 'jkssb_upload_bundles_v1', array_slice( array_values( $items ), 0, 100 ), false ); }
+    public function ability_list_upload_drafts( $input = array() ) { return array( 'ok' => true, 'items' => array_slice( $this->upload_bundles(), 0, 30 ) ); }
+    public function ability_get_upload_draft( $input ) { $id = isset( $input['bundle_id'] ) ? sanitize_text_field( $input['bundle_id'] ) : ''; foreach ( $this->upload_bundles() as $b ) if ( isset( $b['bundle_id'] ) && hash_equals( (string) $b['bundle_id'], $id ) ) return array( 'ok' => true, 'item' => $b ); return new WP_Error( 'jkssb_bundle_missing', 'Upload bundle not found.' ); }
+    private function create_youtube_community_handoff( $bundle, $input, $content_id = 0 ) {
+        global $wpdb;
+        $ids = array_values( array_filter( array_map( 'absint', $bundle['attachment_ids'] ?? array() ) ) );
+        if ( empty( $ids ) ) return new WP_Error( 'jkssb_yt_community_media', 'YouTube Community handoff requires uploaded media.' );
+        $scheduled_ist = sanitize_text_field( $input['scheduled_at_ist'] ?? '' );
+        if ( '' === $scheduled_ist ) $scheduled_ist = wp_date( 'Y-m-d H:i:s', time() + 5 * MINUTE_IN_SECONDS, new DateTimeZone( 'Asia/Kolkata' ) );
+        $scheduled_at = $this->ist_to_utc_mysql( $scheduled_ist );
+        if ( is_wp_error( $scheduled_at ) ) return $scheduled_at;
+        $title = sanitize_text_field( $input['title'] ?? 'JustKalinga Community Post' );
+        $body = sanitize_textarea_field( $input['body'] ?? '' );
+        $cta = sanitize_text_field( $input['cta'] ?? 'Jai Jagannātha 🙏' );
+        $yt_fields = isset( $input['platform_fields']['youtube'] ) && is_array( $input['platform_fields']['youtube'] ) ? $this->sanitize_live_value( $input['platform_fields']['youtube'] ) : array();
+        $hashtags = isset( $yt_fields['hashtags'] ) ? sanitize_text_field( $yt_fields['hashtags'] ) : '';
+        $now = gmdate( 'Y-m-d H:i:s' );
+        if ( ! $content_id ) {
+            $content_uuid = wp_generate_uuid4();
+            $ok = $wpdb->insert( $wpdb->prefix . 'jksh_content', array(
+                'uuid' => $content_uuid, 'title' => $title, 'content_type' => 'youtube_community', 'body' => $body, 'status' => 'community_ready',
+                'media_json' => wp_json_encode( $ids ), 'author_id' => get_current_user_id(), 'created_at' => $now, 'updated_at' => $now,
+                'meta_json' => wp_json_encode( array( 'source' => 'supabase_bridge', 'workflow' => 'youtube_community_handoff_v1', 'bundle_id' => sanitize_text_field( $bundle['bundle_id'] ?? '' ) ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ),
+            ) );
+            if ( false === $ok ) return new WP_Error( 'jkssb_yt_community_content', 'Could not create YouTube Community content row.' );
+            $content_id = (int) $wpdb->insert_id;
+        }
+        $delivery_urls = array();
+        foreach ( $ids as $id ) { $u = get_post_meta( $id, '_jkssb_delivery_url', true ); if ( ! $u && get_post_meta( $id, '_jkssb_local_fallback', true ) ) $u = wp_get_attachment_url( $id ); if ( $u ) $delivery_urls[] = esc_url_raw( $u ); }
+        $variant_uuid = wp_generate_uuid4();
+        $fields = array_merge( $yt_fields, array(
+            'community_handoff' => true,
+            'manual_required' => true,
+            'youtube_community_url' => 'https://www.youtube.com/channel/UCkdivvj0X_aO6FCpa394sgQ/community',
+            'media_delivery_urls' => $delivery_urls,
+            'note' => 'YouTube does not expose an official Community post creation endpoint. This job is prepared for one-click/manual handoff and must not be reported as API-published.',
+        ) );
+        $ok = $wpdb->insert( $wpdb->prefix . 'jksh_variants', array(
+            'uuid' => $variant_uuid, 'content_id' => $content_id, 'platform' => 'youtube', 'publication_type' => 'community_post',
+            'title' => $title, 'caption' => $body, 'description' => $body, 'hashtags' => $hashtags, 'cta' => $cta,
+            'media_json' => wp_json_encode( $ids ), 'publish_at' => $scheduled_at, 'status' => 'community_ready', 'external_id' => '',
+            'external_url' => 'https://www.youtube.com/channel/UCkdivvj0X_aO6FCpa394sgQ/community', 'analytics_json' => wp_json_encode( array() ),
+            'created_at' => $now, 'updated_at' => $now, 'fields_json' => wp_json_encode( $fields, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ),
+        ) );
+        if ( false === $ok ) return new WP_Error( 'jkssb_yt_community_variant', 'Could not create YouTube Community variant.' );
+        $variant_id = (int) $wpdb->insert_id;
+        $job_uuid = wp_generate_uuid4();
+        $idempotency_key = hash( 'sha256', 'jkssb-community-v1|' . sanitize_text_field( $bundle['bundle_id'] ?? '' ) . '|' . $scheduled_at );
+        $payload = array( 'variant_id' => $variant_id, 'publish_mode' => 'manual_handoff', 'manual_required' => true, 'source' => 'upload_bundle', 'media_attachment_ids' => $ids );
+        $ok = $wpdb->insert( $wpdb->prefix . 'jksh_jobs', array(
+            'uuid' => $job_uuid, 'idempotency_key' => $idempotency_key, 'content_id' => $content_id, 'variant_id' => $variant_id,
+            'platform' => 'youtube', 'job_type' => 'community_handoff', 'status' => 'community_ready', 'attempts' => 0, 'max_attempts' => 1,
+            'payload_json' => wp_json_encode( $payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ), 'last_response_json' => wp_json_encode( array() ),
+            'last_error' => '', 'scheduled_at' => $scheduled_at, 'created_at' => $now, 'updated_at' => $now,
+        ) );
+        if ( false === $ok ) return new WP_Error( 'jkssb_yt_community_job', 'Could not create YouTube Community handoff job.' );
+        return array( 'platform' => 'youtube', 'publication_type' => 'community_post', 'variant_id' => $variant_id, 'job_id' => (int) $wpdb->insert_id, 'publish_mode' => 'manual_handoff', 'status' => 'community_ready' );
+    }
+
+    private function ensure_local_youtube_thumbnail( $attachment_id ) {
+        $attachment_id = absint( $attachment_id );
+        if ( ! $attachment_id || 'attachment' !== get_post_type( $attachment_id ) ) {
+            return new WP_Error( 'jkssb_youtube_thumb_attachment', 'YouTube thumbnail must reference a valid image attachment.' );
+        }
+        $mime = (string) get_post_mime_type( $attachment_id );
+        if ( 0 !== strpos( $mime, 'image/' ) ) {
+            return new WP_Error( 'jkssb_youtube_thumb_mime', 'YouTube thumbnail must reference an image attachment.' );
+        }
+        $local_file = get_attached_file( $attachment_id );
+        if ( $local_file && file_exists( $local_file ) && is_readable( $local_file ) ) {
+            return $attachment_id;
+        }
+
+        $asset_id = sanitize_text_field( get_post_meta( $attachment_id, '_jkssb_asset_id', true ) );
+        if ( ! $asset_id ) {
+            return new WP_Error( 'jkssb_youtube_thumb_shell', 'YouTube thumbnail link-shell has no Supabase asset reference.' );
+        }
+
+        $existing = get_posts( array(
+            'post_type'      => 'attachment',
+            'post_status'    => 'inherit',
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'meta_key'       => '_jkssb_materialized_asset_id',
+            'meta_value'     => $asset_id,
+        ) );
+        if ( ! empty( $existing ) ) {
+            $existing_id = absint( $existing[0] );
+            $existing_file = get_attached_file( $existing_id );
+            if ( $existing_file && file_exists( $existing_file ) && is_readable( $existing_file ) && 0 === strpos( (string) get_post_mime_type( $existing_id ), 'image/' ) ) {
+                return $existing_id;
+            }
+        }
+
+        $delivery = $this->ability_delivery_url( array(
+            'attachment_id'     => $attachment_id,
+            'asset_id'          => $asset_id,
+            'expires_in_seconds'=> 900,
+        ) );
+        if ( is_wp_error( $delivery ) ) return $delivery;
+        $url = esc_url_raw( $delivery['signed_url'] ?? ( $delivery['delivery_url'] ?? '' ) );
+        if ( ! $url ) {
+            return new WP_Error( 'jkssb_youtube_thumb_url', 'Could not create a delivery URL for the YouTube thumbnail.' );
+        }
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+        $tmp = download_url( $url, 60 );
+        if ( is_wp_error( $tmp ) ) return $tmp;
+
+        $ext_map = array( 'image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif' );
+        $base = sanitize_file_name( get_the_title( $attachment_id ) );
+        if ( ! $base ) $base = 'jk-social-youtube-thumbnail-' . $attachment_id;
+        $ext = $ext_map[ $mime ] ?? 'jpg';
+        if ( ! preg_match( '/\\.[a-z0-9]{2,5}$/i', $base ) ) $base .= '.' . $ext;
+
+        $file_array = array( 'name' => $base, 'tmp_name' => $tmp );
+        $new_id = media_handle_sideload( $file_array, 0, get_the_title( $attachment_id ) . ' YouTube Thumbnail' );
+        if ( is_wp_error( $new_id ) ) {
+            @unlink( $tmp );
+            return $new_id;
+        }
+        update_post_meta( $new_id, '_jkssb_materialized_asset_id', $asset_id );
+        update_post_meta( $new_id, '_jkssb_materialized_from_attachment', $attachment_id );
+        update_post_meta( $new_id, '_jkssb_youtube_thumbnail', 1 );
+        $alt = get_post_meta( $attachment_id, '_wp_attachment_image_alt', true );
+        if ( $alt ) update_post_meta( $new_id, '_wp_attachment_image_alt', sanitize_text_field( $alt ) );
+        return (int) $new_id;
+    }
+
+    public function ability_queue_upload_draft( $input ) {
+        if ( empty( $input['confirm_live'] ) || true !== $input['confirm_live'] ) return new WP_Error( 'jkssb_live_confirm_required', 'confirm_live=true is required.' );
+        $got = $this->ability_get_upload_draft( array( 'bundle_id' => $input['bundle_id'] ?? '' ) ); if ( is_wp_error( $got ) ) return $got;
+        $b = $got['item'];
+        $ids = array_values( array_filter( array_map( 'absint', $b['attachment_ids'] ?? array() ) ) ); if ( empty( $ids ) ) return new WP_Error( 'jkssb_bundle_media', 'Bundle has no finalized media.' );
+        $map = array( 'single_post' => 'single_image', 'carousel' => 'carousel', 'reel' => 'reel', 'long_video' => 'video' );
+        $ct = $map[ $b['content_type'] ?? '' ] ?? 'single_image';
+        $bundle_platforms = isset( $b['selected_platforms'] ) && is_array( $b['selected_platforms'] ) ? $b['selected_platforms'] : array();
+        $requested_raw = isset( $input['platforms'] ) && is_array( $input['platforms'] ) && ! empty( $input['platforms'] ) ? $input['platforms'] : $bundle_platforms;
+        $requested = array_values( array_unique( array_intersect( array_map( 'sanitize_key', $requested_raw ), array( 'instagram', 'facebook', 'youtube' ) ) ) );
+        if ( empty( $requested ) ) return new WP_Error( 'jkssb_live_platforms', 'At least one supported platform is required.' );
+        $meta_platforms = array_values( array_intersect( $requested, array( 'instagram', 'facebook' ) ) );
+        $wants_youtube = in_array( 'youtube', $requested, true );
+        $title = sanitize_text_field( $input['title'] ?? '' );
+        $body = sanitize_textarea_field( $input['body'] ?? '' );
+        if ( '' === $title ) $title = sanitize_text_field( $b['title'] ?? '' );
+        if ( '' === $title ) $title = 'JustKalinga Social Post';
+        $first_asset = array( 'id' => get_post_meta( $ids[0], '_jkssb_asset_id', true ), 'asset_key' => get_post_meta( $ids[0], '_jkssb_asset_key', true ) );
+        $result = array( 'ok' => true, 'bundle_id' => sanitize_text_field( $b['bundle_id'] ?? '' ), 'variants' => array(), 'selected_platforms' => $requested );
+        $content_id = 0;
+        $platform_fields = is_array( $input['platform_fields'] ?? null ) ? $input['platform_fields'] : array();
+        $cover_id = absint( $b['cover_attachment_id'] ?? 0 );
+        $youtube_thumb_id = absint( $platform_fields['youtube']['thumbnail_attachment_id'] ?? 0 );
+        if ( $cover_id && in_array( 'instagram', $requested, true ) ) $platform_fields['instagram']['cover_attachment_id'] = $cover_id;
+        if ( $cover_id && in_array( 'facebook', $requested, true ) ) $platform_fields['facebook']['requested_cover_attachment_id'] = $cover_id;
+        if ( in_array( 'youtube', $requested, true ) ) {
+            $thumb_source_id = $youtube_thumb_id ?: $cover_id;
+            if ( $thumb_source_id ) {
+                $youtube_thumb_id = $this->ensure_local_youtube_thumbnail( $thumb_source_id );
+                if ( is_wp_error( $youtube_thumb_id ) ) return $youtube_thumb_id;
+                $platform_fields['youtube']['thumbnail_attachment_id'] = (int) $youtube_thumb_id;
+                $result['youtube_thumbnail_attachment_id'] = (int) $youtube_thumb_id;
+            }
+        }
+        $live_platforms = $meta_platforms;
+        if ( $wants_youtube && in_array( $ct, array( 'reel', 'video', 'short' ), true ) ) $live_platforms[] = 'youtube';
+        $live_platforms = array_values( array_unique( $live_platforms ) );
+        if ( ! empty( $live_platforms ) ) {
+            $scheduled_ist = sanitize_text_field( $input['scheduled_at_ist'] ?? '' );
+            $scheduled_utc = $this->ist_to_utc_mysql( $scheduled_ist );
+            if ( is_wp_error( $scheduled_utc ) ) return $scheduled_utc;
+            $req = array( 'confirm_live' => true, 'request_id' => 'upload-' . sanitize_key( $b['bundle_id'] ) . '-' . gmdate( 'YmdHis' ), 'title' => $title, 'body' => $body, 'content_type' => $ct, 'platforms' => $live_platforms, 'scheduled_at_utc' => $scheduled_utc, 'media_attachment_ids' => $ids, 'platform_fields' => $platform_fields, 'location' => is_array( $input['location'] ?? null ) ? $input['location'] : array(), 'products' => is_array( $input['products'] ?? null ) ? $input['products'] : array(), 'cta' => sanitize_text_field( $input['cta'] ?? 'Jai Jagannātha 🙏' ) );
+            if ( ! empty( $b['add_to_story'] ) && in_array( 'instagram', $live_platforms, true ) ) { $req['platform_fields']['instagram']['story_after_publish'] = true; $req['platform_fields']['instagram']['highlight_name'] = sanitize_text_field( $b['highlight_name'] ?? '' ); }
+            $live = $this->create_jksh_live_content( $ids[0], $req, $first_asset ); if ( is_wp_error( $live ) ) return $live;
+            $content_id = isset( $live['content_id'] ) ? absint( $live['content_id'] ) : 0;
+            $result = array_merge( $result, $live );
+        }
+        if ( $wants_youtube && in_array( $ct, array( 'single_image', 'image', 'carousel' ), true ) ) {
+            $yt_input = $input;
+            $yt_input['platform_fields'] = $platform_fields;
+            $yt = $this->create_youtube_community_handoff( $b, $yt_input, $content_id ); if ( is_wp_error( $yt ) ) return $yt;
+            if ( empty( $result['variants'] ) ) $result['variants'] = array();
+            $result['variants'][] = $yt;
+            $result['youtube_community'] = $yt;
+            if ( ! $content_id && isset( $yt['content_id'] ) ) $result['content_id'] = absint( $yt['content_id'] );
+        }
+        if ( $cover_id && in_array( 'facebook', $requested, true ) ) $result['facebook_cover_note'] = 'Cover image intent is stored with the Facebook variant; the current Facebook adapter has no explicit custom Reel-cover field.';
+        return $result;
+    }
+
+    private function youtube_community_url() {
+        return 'https://www.youtube.com/channel/UCkdivvj0X_aO6FCpa394sgQ/community';
+    }
+
+    public function ability_create_youtube_community_handoff( $input ) {
+        if ( empty( $input['confirm'] ) || true !== $input['confirm'] ) return new WP_Error( 'jkssb_community_confirm', 'confirm=true is required.' );
+        $got = $this->ability_get_upload_draft( array( 'bundle_id' => $input['bundle_id'] ?? '' ) );
+        if ( is_wp_error( $got ) ) return $got;
+        $b = $got['item'];
+        if ( ! in_array( $b['content_type'] ?? '', array( 'single_post', 'carousel' ), true ) ) return new WP_Error( 'jkssb_community_type', 'YouTube Community handoff currently supports image posts and carousels.' );
+        $existing = $this->find_community_handoff_by_bundle( sanitize_text_field( $b['bundle_id'] ?? '' ) );
+        if ( $existing ) return array( 'ok' => true, 'duplicate' => true, 'handoff' => $existing );
+        $yt = $this->create_youtube_community_handoff( $b, $input, 0 );
+        if ( is_wp_error( $yt ) ) return $yt;
+        return array( 'ok' => true, 'duplicate' => false, 'handoff' => $yt );
+    }
+
+    private function find_community_handoff_by_bundle( $bundle_id ) {
+        global $wpdb;
+        if ( ! $bundle_id ) return null;
+        $like = '%"bundle_id":"' . $wpdb->esc_like( $bundle_id ) . '"%';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT j.id AS job_id,j.status AS job_status,j.scheduled_at,j.completed_at,v.id AS variant_id,v.content_id,v.title,v.caption,v.media_json,v.external_url,v.fields_json FROM {$wpdb->prefix}jksh_jobs j JOIN {$wpdb->prefix}jksh_variants v ON v.id=j.variant_id JOIN {$wpdb->prefix}jksh_content c ON c.id=j.content_id WHERE j.platform='youtube' AND j.job_type='community_handoff' AND c.meta_json LIKE %s ORDER BY j.id DESC LIMIT 1",
+            $like
+        ), ARRAY_A );
+        return $row ? $this->sanitize_community_row( $row ) : null;
+    }
+
+    private function sanitize_community_row( $row ) {
+        $ids = json_decode( $row['media_json'] ?? '[]', true );
+        if ( ! is_array( $ids ) ) $ids = array();
+        $fields = json_decode( $row['fields_json'] ?? '[]', true );
+        if ( ! is_array( $fields ) ) $fields = array();
+        $media = array();
+        foreach ( array_values( array_filter( array_map( 'absint', $ids ) ) ) as $id ) {
+            $url = get_post_meta( $id, '_jkssb_delivery_url', true );
+            if ( ! $url ) $url = wp_get_attachment_url( $id );
+            $media[] = array(
+                'attachment_id' => $id,
+                'filename' => basename( (string) get_attached_file( $id ) ),
+                'mime_type' => get_post_mime_type( $id ),
+                'url' => $url ? esc_url_raw( $url ) : '',
+            );
+        }
+        return array(
+            'job_id' => absint( $row['job_id'] ?? 0 ),
+            'variant_id' => absint( $row['variant_id'] ?? 0 ),
+            'content_id' => absint( $row['content_id'] ?? 0 ),
+            'title' => sanitize_text_field( $row['title'] ?? '' ),
+            'body' => (string) ( $row['caption'] ?? '' ),
+            'status' => sanitize_key( $row['job_status'] ?? '' ),
+            'scheduled_at_ist' => $this->utc_mysql_to_ist( $row['scheduled_at'] ?? '' ),
+            'completed_at_ist' => $this->utc_mysql_to_ist( $row['completed_at'] ?? '' ),
+            'timezone' => 'Asia/Kolkata',
+            'external_url' => esc_url_raw( $row['external_url'] ?: $this->youtube_community_url() ),
+            'youtube_community_url' => $this->youtube_community_url(),
+            'manual_required' => true,
+            'media' => $media,
+            'fields' => $this->sanitize_live_value( $fields ),
+        );
+    }
+
+    public function ability_list_youtube_community_handoffs( $input = array() ) {
+        global $wpdb;
+        $rows = $wpdb->get_results(
+            "SELECT j.id AS job_id,j.status AS job_status,j.scheduled_at,j.completed_at,v.id AS variant_id,v.content_id,v.title,v.caption,v.media_json,v.external_url,v.fields_json FROM {$wpdb->prefix}jksh_jobs j JOIN {$wpdb->prefix}jksh_variants v ON v.id=j.variant_id WHERE j.platform='youtube' AND j.job_type='community_handoff' ORDER BY j.id DESC LIMIT 50",
+            ARRAY_A
+        );
+        $items = array();
+        foreach ( (array) $rows as $row ) $items[] = $this->sanitize_community_row( $row );
+        return array( 'ok' => true, 'count' => count( $items ), 'items' => $items, 'manual_handoff' => true, 'api_publish_supported' => false );
+    }
+
+    public function ability_mark_youtube_community_posted( $input ) {
+        global $wpdb;
+        if ( empty( $input['confirm'] ) || true !== $input['confirm'] ) return new WP_Error( 'jkssb_community_confirm', 'confirm=true is required.' );
+        $job_id = absint( $input['job_id'] ?? 0 );
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT j.id AS job_id,j.content_id,j.variant_id,j.status AS job_status,v.external_url FROM {$wpdb->prefix}jksh_jobs j JOIN {$wpdb->prefix}jksh_variants v ON v.id=j.variant_id WHERE j.id=%d AND j.platform='youtube' AND j.job_type='community_handoff' LIMIT 1",
+            $job_id
+        ), ARRAY_A );
+        if ( ! $row ) return new WP_Error( 'jkssb_community_missing', 'Community handoff job not found.' );
+        $external_url = isset( $input['external_url'] ) && $input['external_url'] ? esc_url_raw( $input['external_url'] ) : esc_url_raw( $row['external_url'] ?: $this->youtube_community_url() );
+        $now = gmdate( 'Y-m-d H:i:s' );
+        $wpdb->update( $wpdb->prefix . 'jksh_jobs', array( 'status' => 'completed', 'completed_at' => $now, 'updated_at' => $now, 'last_error' => '', 'last_response_json' => wp_json_encode( array( 'manual_handoff' => true, 'confirmed_at_utc' => $now, 'external_url' => $external_url ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) ), array( 'id' => $job_id ) );
+        $wpdb->update( $wpdb->prefix . 'jksh_variants', array( 'status' => 'published', 'external_url' => $external_url, 'updated_at' => $now ), array( 'id' => absint( $row['variant_id'] ) ) );
+        $wpdb->insert( $wpdb->prefix . 'jksh_publish_logs', array(
+            'job_id' => $job_id, 'content_id' => absint( $row['content_id'] ), 'variant_id' => absint( $row['variant_id'] ), 'user_id' => get_current_user_id(),
+            'action' => 'community_handoff', 'result' => 'manual_confirmed', 'external_id' => '', 'external_url' => $external_url,
+            'message' => 'YouTube Community handoff manually confirmed. No API publication was claimed.',
+            'context_json' => wp_json_encode( array( 'source' => 'jkssb_community_handoff_v1' ) ), 'created_at' => $now,
+        ) );
+        return array( 'ok' => true, 'job_id' => $job_id, 'status' => 'completed', 'external_url' => $external_url, 'completed_at_ist' => $this->utc_mysql_to_ist( $now ), 'timezone' => 'Asia/Kolkata' );
+    }
+
+    private function live_supervisor_defaults() {
+        return array( 'enabled' => true, 'auto_provision' => true, 'auto_dispatch' => true, 'provision_lead_minutes' => 15, 'dispatch_lead_minutes' => 5, 'actor_user_id' => 0 );
+    }
+
+    private function live_supervisor_config() {
+        $saved = get_option( self::LIVE_SUPERVISOR_OPT, array() );
+        if ( ! is_array( $saved ) ) $saved = array();
+        return array_merge( $this->live_supervisor_defaults(), $saved );
+    }
+
+    public function cron_schedules( $schedules ) {
+        $schedules['jkssb_five_minutes'] = array( 'interval' => 300, 'display' => 'Every 5 minutes (JK Social Live Supervisor)' );
+        return $schedules;
+    }
+
+    public function ensure_live_supervisor_cron() {
+        $cfg = $this->live_supervisor_config();
+        $next = wp_next_scheduled( self::LIVE_CRON_HOOK );
+        if ( ! empty( $cfg['enabled'] ) && ! $next ) wp_schedule_event( time() + 60, 'jkssb_five_minutes', self::LIVE_CRON_HOOK );
+        if ( empty( $cfg['enabled'] ) && $next ) wp_clear_scheduled_hook( self::LIVE_CRON_HOOK );
+    }
+
+    private function execute_hub_ability_as_supervisor( $name, $input = null ) {
+        if ( ! function_exists( 'wp_get_ability' ) ) return new WP_Error( 'jkssb_ability_api_missing', 'WordPress Abilities API is unavailable.' );
+        $cfg = $this->live_supervisor_config();
+        $actor = absint( $cfg['actor_user_id'] ?? 0 );
+        if ( ! $actor || ! user_can( $actor, 'manage_options' ) ) return new WP_Error( 'jkssb_supervisor_actor', 'Live supervisor service user is not configured or no longer has manage_options.' );
+        $ability = wp_get_ability( $name );
+        if ( ! $ability ) return new WP_Error( 'jkssb_hub_ability_missing', 'Required JK Social Hub ability is unavailable: ' . $name );
+        $old = get_current_user_id();
+        wp_set_current_user( $actor );
+        try { $result = $ability->execute( $input ); }
+        finally { wp_set_current_user( $old ); }
+        return $result;
+    }
+
+    private function live_supervisor_candidates( $provision_lead ) {
+        global $wpdb;
+        $now = time();
+        $until = gmdate( 'Y-m-d H:i:s', $now + max( 300, absint( $provision_lead ) * 60 ) );
+        $since = gmdate( 'Y-m-d H:i:s', $now - 1800 );
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id,title,source_type,source_json,destinations_json,metadata_json,status,scheduled_start_at,worker_job_id,last_error FROM {$wpdb->prefix}jksh_live_streams WHERE scheduled_start_at IS NOT NULL AND scheduled_start_at BETWEEN %s AND %s AND status NOT IN ('completed','ended','cancelled') ORDER BY scheduled_start_at ASC LIMIT 20",
+            $since, $until
+        ), ARRAY_A );
+        $out = array();
+        foreach ( (array) $rows as $row ) {
+            $d = json_decode( $row['destinations_json'] ?? '[]', true ); if ( ! is_array( $d ) ) $d = array();
+            $m = json_decode( $row['metadata_json'] ?? '[]', true ); if ( ! is_array( $m ) ) $m = array();
+            if ( ! in_array( 'youtube', $d, true ) ) continue;
+            if ( isset( $m['publish_mode'] ) && 'draft_only' === $m['publish_mode'] ) continue;
+            $out[] = array_merge( $row, array( 'destinations' => $d, 'metadata' => $m ) );
+        }
+        return $out;
+    }
+
+    private function compact_supervisor_error( $value ) {
+        if ( is_wp_error( $value ) ) return array( 'ok' => false, 'code' => $value->get_error_code(), 'message' => $value->get_error_message() );
+        return is_array( $value ) ? $this->sanitize_live_value( $value ) : array( 'ok' => (bool) $value );
+    }
+
+    private function run_live_supervisor_pass( $source = 'cron' ) {
+        $cfg = $this->live_supervisor_config();
+        $report = array( 'ok' => true, 'source' => sanitize_key( $source ), 'ran_at_ist' => wp_date( 'c', null, new DateTimeZone( 'Asia/Kolkata' ) ), 'config' => array( 'enabled' => (bool) $cfg['enabled'], 'auto_provision' => (bool) $cfg['auto_provision'], 'auto_dispatch' => (bool) $cfg['auto_dispatch'], 'provision_lead_minutes' => absint( $cfg['provision_lead_minutes'] ), 'dispatch_lead_minutes' => absint( $cfg['dispatch_lead_minutes'] ) ), 'actions' => array(), 'candidates' => array() );
+        if ( empty( $cfg['enabled'] ) ) { $report['ok'] = false; $report['blocked'] = 'supervisor_disabled'; update_option( self::LIVE_WATCHDOG_OPT, $report, false ); return $report; }
+        $streaming = $this->execute_hub_ability_as_supervisor( 'jk-social/get-live-streaming-readiness' );
+        $yt = $this->execute_hub_ability_as_supervisor( 'jk-social/get-youtube-live-readiness' );
+        $worker = $this->execute_hub_ability_as_supervisor( 'jk-social/get-live-worker-readiness' );
+        $report['readiness'] = array( 'streaming' => $this->compact_supervisor_error( $streaming ), 'youtube' => $this->compact_supervisor_error( $yt ), 'worker' => $this->compact_supervisor_error( $worker ) );
+        if ( is_wp_error( $streaming ) || is_wp_error( $yt ) || is_wp_error( $worker ) ) { $report['ok'] = false; $report['blocked'] = 'readiness_unavailable'; update_option( self::LIVE_WATCHDOG_OPT, $report, false ); return $report; }
+        $candidates = $this->live_supervisor_candidates( $cfg['provision_lead_minutes'] );
+        foreach ( $candidates as $row ) {
+            $id = absint( $row['id'] );
+            $entry = array( 'live_stream_id' => $id, 'title' => sanitize_text_field( $row['title'] ), 'scheduled_start_at_ist' => $this->utc_mysql_to_ist( $row['scheduled_start_at'] ), 'status_before' => sanitize_key( $row['status'] ), 'worker_job_id_present' => ! empty( $row['worker_job_id'] ), 'actions' => array() );
+            if ( ! empty( $cfg['auto_provision'] ) && 'draft' === $row['status'] ) {
+                if ( ! empty( $yt['provisioning_possible'] ) ) {
+                    $pre = $this->execute_hub_ability_as_supervisor( 'jk-social/preflight-youtube-live-draft', array( 'live_stream_id' => $id ) );
+                    if ( ! is_wp_error( $pre ) && ! empty( $pre['ok'] ) ) {
+                        $prov = $this->execute_hub_ability_as_supervisor( 'jk-social/provision-youtube-live', array( 'live_stream_id' => $id, 'confirm' => true ) );
+                        $entry['actions'][] = array( 'action' => 'youtube_provision', 'result' => $this->compact_supervisor_error( $prov ) );
+                    } else $entry['actions'][] = array( 'action' => 'youtube_preflight', 'result' => $this->compact_supervisor_error( $pre ) );
+                } else $entry['actions'][] = array( 'action' => 'youtube_provision', 'skipped' => 'youtube_live_switch_or_readiness_not_enabled' );
+            }
+            $seconds_to_start = strtotime( $row['scheduled_start_at'] . ' UTC' ) - time();
+            if ( ! empty( $cfg['auto_dispatch'] ) && $seconds_to_start <= absint( $cfg['dispatch_lead_minutes'] ) * 60 && empty( $row['worker_job_id'] ) ) {
+                if ( ! empty( $worker['dispatch_possible'] ) ) {
+                    $prew = $this->execute_hub_ability_as_supervisor( 'jk-social/preflight-live-worker-draft', array( 'live_stream_id' => $id ) );
+                    if ( ! is_wp_error( $prew ) && ! empty( $prew['ok'] ) ) {
+                        $disp = $this->execute_hub_ability_as_supervisor( 'jk-social/dispatch-live-worker', array( 'live_stream_id' => $id, 'confirm' => true ) );
+                        $entry['actions'][] = array( 'action' => 'worker_dispatch', 'result' => $this->compact_supervisor_error( $disp ) );
+                    } else $entry['actions'][] = array( 'action' => 'worker_preflight', 'result' => $this->compact_supervisor_error( $prew ) );
+                } else $entry['actions'][] = array( 'action' => 'worker_dispatch', 'skipped' => 'worker_switch_or_health_not_ready' );
+            }
+            $report['candidates'][] = $entry;
+        }
+        update_option( self::LIVE_WATCHDOG_OPT, $report, false );
+        return $report;
+    }
+
+    public function live_supervisor_tick() { return $this->run_live_supervisor_pass( 'cron' ); }
+
+    public function ability_get_live_supervisor_status( $input = array() ) {
+        $cfg = $this->live_supervisor_config();
+        $last = get_option( self::LIVE_WATCHDOG_OPT, array() );
+        $next = wp_next_scheduled( self::LIVE_CRON_HOOK );
+        return array( 'ok' => true, 'version' => self::VERSION, 'config' => array( 'enabled' => (bool) $cfg['enabled'], 'auto_provision' => (bool) $cfg['auto_provision'], 'auto_dispatch' => (bool) $cfg['auto_dispatch'], 'provision_lead_minutes' => absint( $cfg['provision_lead_minutes'] ), 'dispatch_lead_minutes' => absint( $cfg['dispatch_lead_minutes'] ), 'actor_user_id' => absint( $cfg['actor_user_id'] ) ), 'cron_hook' => self::LIVE_CRON_HOOK, 'interval_seconds' => 300, 'next_run_ist' => $next ? $this->utc_timestamp_to_ist_iso( $next ) : null, 'last_run' => is_array( $last ) ? $last : array() );
+    }
+
+    public function ability_configure_live_supervisor( $input ) {
+        if ( empty( $input['confirm'] ) || true !== $input['confirm'] ) return new WP_Error( 'jkssb_supervisor_confirm', 'confirm=true is required.' );
+        $cfg = $this->live_supervisor_config();
+        $cfg['enabled'] = ! empty( $input['enabled'] );
+        if ( array_key_exists( 'auto_provision', $input ) ) $cfg['auto_provision'] = ! empty( $input['auto_provision'] );
+        if ( array_key_exists( 'auto_dispatch', $input ) ) $cfg['auto_dispatch'] = ! empty( $input['auto_dispatch'] );
+        if ( isset( $input['provision_lead_minutes'] ) ) $cfg['provision_lead_minutes'] = min( 60, max( 5, absint( $input['provision_lead_minutes'] ) ) );
+        if ( isset( $input['dispatch_lead_minutes'] ) ) $cfg['dispatch_lead_minutes'] = min( 30, max( 1, absint( $input['dispatch_lead_minutes'] ) ) );
+        $cfg['actor_user_id'] = get_current_user_id();
+        update_option( self::LIVE_SUPERVISOR_OPT, $cfg, false );
+        $this->ensure_live_supervisor_cron();
+        return $this->ability_get_live_supervisor_status();
+    }
+
+    public function ability_run_live_supervisor( $input ) {
+        if ( empty( $input['confirm'] ) || true !== $input['confirm'] ) return new WP_Error( 'jkssb_supervisor_confirm', 'confirm=true is required.' );
+        return $this->run_live_supervisor_pass( 'manual' );
+    }
+
+    public function register_community_page() {
+        add_submenu_page( 'jksh-social-upload', 'YouTube Community Handoff', 'YouTube Community', 'manage_options', 'jkssb-youtube-community', array( $this, 'render_community_page' ) );
+        add_submenu_page( 'jksh-social-upload', 'Live Supervisor', 'Live Supervisor', 'manage_options', 'jkssb-live-supervisor', array( $this, 'render_live_supervisor_page' ) );
+    }
+
+    public function ajax_community_mark_done() {
+        if ( ! current_user_can( 'manage_options' ) ) wp_send_json_error( array( 'message' => 'Forbidden' ), 403 );
+        check_ajax_referer( 'jkssb_community', 'nonce' );
+        $out = $this->ability_mark_youtube_community_posted( array( 'job_id' => absint( $_POST['job_id'] ?? 0 ), 'external_url' => esc_url_raw( $_POST['external_url'] ?? '' ), 'confirm' => true ) );
+        if ( is_wp_error( $out ) ) wp_send_json_error( array( 'message' => $out->get_error_message() ), 422 );
+        wp_send_json_success( $out );
+    }
+
+    public function ajax_live_supervisor_save() {
+        if ( ! current_user_can( 'manage_options' ) ) wp_send_json_error( array( 'message' => 'Forbidden' ), 403 );
+        check_ajax_referer( 'jkssb_live_supervisor', 'nonce' );
+        $out = $this->ability_configure_live_supervisor( array( 'enabled' => ! empty( $_POST['enabled'] ), 'auto_provision' => ! empty( $_POST['auto_provision'] ), 'auto_dispatch' => ! empty( $_POST['auto_dispatch'] ), 'provision_lead_minutes' => absint( $_POST['provision_lead_minutes'] ?? 15 ), 'dispatch_lead_minutes' => absint( $_POST['dispatch_lead_minutes'] ?? 5 ), 'confirm' => true ) );
+        if ( is_wp_error( $out ) ) wp_send_json_error( array( 'message' => $out->get_error_message() ), 422 );
+        wp_send_json_success( $out );
+    }
+
+    public function ajax_live_supervisor_run() {
+        if ( ! current_user_can( 'manage_options' ) ) wp_send_json_error( array( 'message' => 'Forbidden' ), 403 );
+        check_ajax_referer( 'jkssb_live_supervisor', 'nonce' );
+        $out = $this->ability_run_live_supervisor( array( 'confirm' => true ) );
+        if ( is_wp_error( $out ) ) wp_send_json_error( array( 'message' => $out->get_error_message() ), 422 );
+        wp_send_json_success( $out );
+    }
+
+    public function render_community_page() {
+        if ( ! current_user_can( 'manage_options' ) ) return;
+        $data = $this->ability_list_youtube_community_handoffs();
+        $nonce = wp_create_nonce( 'jkssb_community' );
+        echo '<div class="wrap"><h1>YouTube Community Handoff</h1><p>Community posts are prepared here for manual handoff. The YouTube Data API does not provide a Community-post creation resource, so this screen never labels a handoff as API-published.</p>';
+        if ( empty( $data['items'] ) ) { echo '<div class="notice notice-info"><p>No Community handoffs yet. Queue an image or carousel with YouTube selected.</p></div></div>'; return; }
+        foreach ( $data['items'] as $item ) {
+            $posted = 'completed' === $item['status'];
+            echo '<div class="card" style="max-width:1000px;margin:16px 0;padding:16px"><h2>' . esc_html( $item['title'] ) . '</h2><p><strong>Status:</strong> ' . esc_html( $item['status'] ) . ' &nbsp; <strong>Scheduled IST:</strong> ' . esc_html( $item['scheduled_at_ist'] ?: 'Not set' ) . '</p>';
+            echo '<textarea id="jkssb-community-text-' . absint( $item['job_id'] ) . '" rows="9" style="width:100%" readonly>' . esc_textarea( $item['body'] ) . '</textarea><p>';
+            foreach ( $item['media'] as $media ) if ( ! empty( $media['url'] ) && 0 === strpos( (string) $media['mime_type'], 'image/' ) ) echo '<img src="' . esc_url( $media['url'] ) . '" alt="" style="width:120px;height:120px;object-fit:cover;margin:0 8px 8px 0;border-radius:6px">';
+            echo '</p><p><button class="button jkssb-copy-community" data-job="' . absint( $item['job_id'] ) . '">Copy text</button> <a class="button button-primary" href="' . esc_url( $item['youtube_community_url'] ) . '" target="_blank" rel="noopener">Open YouTube Community</a>';
+            if ( ! $posted ) echo ' <button class="button jkssb-mark-community" data-job="' . absint( $item['job_id'] ) . '">Mark posted</button>';
+            else echo ' <span style="color:#008a20;font-weight:600">✓ Posted receipt recorded</span>';
+            echo '</p></div>';
+        }
+        ?><script>(()=>{const nonce=<?php echo wp_json_encode( $nonce ); ?>;document.querySelectorAll('.jkssb-copy-community').forEach(b=>b.onclick=async()=>{const t=document.getElementById('jkssb-community-text-'+b.dataset.job);await navigator.clipboard.writeText(t.value);b.textContent='Copied ✓';});document.querySelectorAll('.jkssb-mark-community').forEach(b=>b.onclick=async()=>{const url=prompt('Paste the public YouTube Community post URL if available, or leave blank:','')||'';const fd=new FormData();fd.append('action','jkssb_community_mark_done');fd.append('nonce',nonce);fd.append('job_id',b.dataset.job);fd.append('external_url',url);const r=await fetch(ajaxurl,{method:'POST',body:fd,credentials:'same-origin'});const j=await r.json();if(!j.success){alert((j.data&&j.data.message)||'Could not mark posted');return;}location.reload();});})();</script><?php
+        echo '</div>';
+    }
+
+    public function render_live_supervisor_page() {
+        if ( ! current_user_can( 'manage_options' ) ) return;
+        $st = $this->ability_get_live_supervisor_status(); $cfg = $st['config']; $nonce = wp_create_nonce( 'jkssb_live_supervisor' );
+        echo '<div class="wrap"><h1>JK Social Live Supervisor</h1><p>WP-Cron checks the live control plane every 5 minutes. WordPress supervises and dispatches; FFmpeg remains on the external relay worker.</p><div class="card" style="max-width:900px;padding:18px">';
+        echo '<label><input id="jkssb-sup-enabled" type="checkbox" ' . checked( ! empty( $cfg['enabled'] ), true, false ) . '> Enable 5-minute supervisor</label><br><label><input id="jkssb-sup-provision" type="checkbox" ' . checked( ! empty( $cfg['auto_provision'] ), true, false ) . '> Auto-provision due YouTube Live drafts after Hub preflight</label><br><label><input id="jkssb-sup-dispatch" type="checkbox" ' . checked( ! empty( $cfg['auto_dispatch'] ), true, false ) . '> Auto-dispatch due relay jobs after worker preflight</label>';
+        echo '<p>Provision lead: <input id="jkssb-sup-plead" type="number" min="5" max="60" value="' . absint( $cfg['provision_lead_minutes'] ) . '"> min &nbsp; Dispatch lead: <input id="jkssb-sup-dlead" type="number" min="1" max="30" value="' . absint( $cfg['dispatch_lead_minutes'] ) . '"> min</p><p><button id="jkssb-sup-save" class="button button-primary">Save supervisor</button> <button id="jkssb-sup-run" class="button">Run watchdog now</button></p>';
+        echo '<p><strong>Next WP-Cron tick:</strong> ' . esc_html( $st['next_run_ist'] ?: 'Not scheduled' ) . '</p><pre id="jkssb-sup-status" style="max-height:420px;overflow:auto;background:#f6f7f7;padding:12px">' . esc_html( wp_json_encode( $st['last_run'], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) ) . '</pre></div></div>';
+        ?><script>(()=>{const nonce=<?php echo wp_json_encode( $nonce ); ?>,out=document.getElementById('jkssb-sup-status');async function call(action,extra={}){const fd=new FormData();fd.append('action',action);fd.append('nonce',nonce);for(const [k,v] of Object.entries(extra))fd.append(k,v);const r=await fetch(ajaxurl,{method:'POST',body:fd,credentials:'same-origin'});const j=await r.json();if(!j.success)throw new Error((j.data&&j.data.message)||'Request failed');out.textContent=JSON.stringify(j.data,null,2);return j.data;}document.getElementById('jkssb-sup-save').onclick=async()=>{try{await call('jkssb_live_supervisor_save',{enabled:document.getElementById('jkssb-sup-enabled').checked?'1':'',auto_provision:document.getElementById('jkssb-sup-provision').checked?'1':'',auto_dispatch:document.getElementById('jkssb-sup-dispatch').checked?'1':'',provision_lead_minutes:document.getElementById('jkssb-sup-plead').value,dispatch_lead_minutes:document.getElementById('jkssb-sup-dlead').value});}catch(e){out.textContent='❌ '+e.message;}};document.getElementById('jkssb-sup-run').onclick=async()=>{try{await call('jkssb_live_supervisor_run');}catch(e){out.textContent='❌ '+e.message;}};})();</script><?php
+    }
+
+    public function register_upload_page() { add_menu_page( 'Social Upload', 'Social Upload', 'manage_options', 'jksh-social-upload', array( $this, 'render_upload_page' ), 'dashicons-upload', 3 ); $this->register_community_page(); }
+    private function ui_check() { if ( ! current_user_can( 'manage_options' ) ) wp_send_json_error( array( 'message' => 'Forbidden' ), 403 ); check_ajax_referer( 'jkssb_social_upload', 'nonce' ); }
+    public function ajax_ui_begin() {
+        $this->ui_check();
+        $filename = sanitize_file_name( $_POST['filename'] ?? '' );
+        $mime = sanitize_mime_type( $_POST['mime_type'] ?? '' );
+        $bytes = absint( $_POST['bytes'] ?? 0 );
+        $allowed = array( 'image/jpeg','image/png','image/webp','image/gif','video/mp4','video/quicktime','video/webm' );
+        if ( ! $filename || ! in_array( $mime, $allowed, true ) || $bytes < 1 || $bytes > self::MAX_FALLBACK_BYTES ) wp_send_json_error( array( 'message' => 'This file exceeds the current 500 MB hybrid upload limit.' ), 422 );
+        $id = wp_generate_uuid4();
+        $path = wp_tempnam( 'jkssb-ui-' . $id . '-' . $filename );
+        if ( ! $path ) wp_send_json_error( array( 'message' => 'Could not create upload buffer.' ), 500 );
+        $s = array(
+            'path' => $path, 'filename' => $filename, 'mime_type' => $mime, 'bytes' => $bytes, 'sha256' => '',
+            'width' => absint( $_POST['width'] ?? 0 ) ?: null, 'height' => absint( $_POST['height'] ?? 0 ) ?: null,
+            'duration_ms' => absint( $_POST['duration_ms'] ?? 0 ) ?: null, 'alt_text' => '', 'ai_generated' => false,
+            'product_refs' => array(), 'metadata' => array( 'source' => 'wordpress_social_upload' ), 'storage_target' => $bytes > self::MAX_BYTES ? 'wordpress_media' : 'supabase', 'created_at' => time(), 'server_hash' => true,
+        );
+        set_transient( $this->direct_session_key( $id ), $s, 6 * HOUR_IN_SECONDS );
+        wp_send_json_success( array( 'upload_id' => $id, 'max_chunk_bytes' => self::DIRECT_CHUNK_BYTES, 'storage_target' => $s['storage_target'] ) );
+    }
+    public function ajax_ui_chunk() { $this->ui_check();$id=sanitize_text_field($_POST['upload_id']??'');$offset=absint($_POST['offset']??0);$s=$this->get_direct_session($id);if(is_wp_error($s))wp_send_json_error(array('message'=>$s->get_error_message()),404);if(empty($_FILES['chunk']['tmp_name']))wp_send_json_error(array('message'=>'Missing chunk.'),400);$raw=file_get_contents($_FILES['chunk']['tmp_name']);if(false===$raw||strlen($raw)>self::DIRECT_CHUNK_BYTES)wp_send_json_error(array('message'=>'Invalid chunk.'),400);$current=filesize($s['path']);if((int)$current!==$offset)wp_send_json_error(array('message'=>'Offset mismatch','next_offset'=>(int)$current),409);$written=file_put_contents($s['path'],$raw,FILE_APPEND|LOCK_EX);if(false===$written)wp_send_json_error(array('message'=>'Write failed.'),500);wp_send_json_success(array('next_offset'=>$offset+$written)); }
+    public function ajax_ui_finalize() { $this->ui_check();$id=sanitize_text_field($_POST['upload_id']??'');$s=$this->get_direct_session($id);if(is_wp_error($s))wp_send_json_error(array('message'=>$s->get_error_message()),404);$s['sha256']=hash_file('sha256',$s['path']);set_transient($this->direct_session_key($id),$s,6*HOUR_IN_SECONDS);$r=$this->ability_finalize_direct_upload(array('upload_id'=>$id));if(is_wp_error($r))wp_send_json_error(array('message'=>$r->get_error_message(),'data'=>$r->get_error_data()),500);wp_send_json_success($r); }
+    public function ajax_ui_save_bundle() {
+        $this->ui_check();
+        $payload = json_decode( wp_unslash( $_POST['payload'] ?? '' ), true );
+        if ( ! is_array( $payload ) ) wp_send_json_error( array( 'message' => 'Invalid bundle.' ), 400 );
+        $ids = array_values( array_filter( array_map( 'absint', $payload['attachment_ids'] ?? array() ) ) );
+        if ( empty( $ids ) ) wp_send_json_error( array( 'message' => 'No uploaded media.' ), 400 );
+        $type = sanitize_key( $payload['content_type'] ?? '' );
+        if ( ! in_array( $type, array( 'single_post','carousel','reel','long_video' ), true ) ) wp_send_json_error( array( 'message' => 'Invalid content type.' ), 400 );
+        if ( 'single_post' === $type && 1 !== count( $ids ) ) wp_send_json_error( array( 'message' => 'Single Post requires exactly one image.' ), 422 );
+        if ( 'carousel' === $type && ( count( $ids ) < 2 || count( $ids ) > 10 ) ) wp_send_json_error( array( 'message' => 'Carousel requires 2-10 images.' ), 422 );
+        if ( in_array( $type, array( 'reel','long_video' ), true ) && 1 !== count( $ids ) ) wp_send_json_error( array( 'message' => 'Video content requires exactly one main video.' ), 422 );
+        $selected_platforms = array_values( array_unique( array_intersect( array_map( 'sanitize_key', (array) ( $payload['selected_platforms'] ?? array() ) ), array( 'instagram','facebook','youtube' ) ) ) );
+        if ( empty( $selected_platforms ) ) wp_send_json_error( array( 'message' => 'Choose at least one platform.' ), 422 );
+        $cover_id = absint( $payload['cover_attachment_id'] ?? 0 );
+        if ( $cover_id && 'attachment' !== get_post_type( $cover_id ) ) $cover_id = 0;
+        $media_meta = array();
+        foreach ( (array) ( $payload['media_meta'] ?? array() ) as $i => $m ) {
+            if ( ! is_array( $m ) ) continue;
+            $media_meta[] = array(
+                'order' => $i + 1, 'attachment_id' => absint( $m['attachment_id'] ?? ( $ids[$i] ?? 0 ) ),
+                'filename' => sanitize_file_name( $m['filename'] ?? '' ), 'mime_type' => sanitize_mime_type( $m['mime_type'] ?? '' ),
+                'bytes' => absint( $m['bytes'] ?? 0 ), 'width' => absint( $m['width'] ?? 0 ), 'height' => absint( $m['height'] ?? 0 ),
+                'duration_ms' => absint( $m['duration_ms'] ?? 0 ),
+                'storage_source' => in_array( sanitize_key( $m['storage_source'] ?? '' ), array( 'supabase','wordpress_media' ), true ) ? sanitize_key( $m['storage_source'] ) : '',
+            );
+        }
+        $cover_meta = is_array( $payload['cover_meta'] ?? null ) ? $payload['cover_meta'] : array();
+        $bundle = array(
+            'bundle_id' => wp_generate_uuid4(), 'content_type' => $type, 'attachment_ids' => $ids,
+            'asset_ids' => array_map( function( $id ){ return get_post_meta( $id, '_jkssb_asset_id', true ); }, $ids ),
+            'storage_sources' => array_map( function( $id ){ return get_post_meta( $id, '_jkssb_local_fallback', true ) ? 'wordpress_media' : 'supabase'; }, $ids ),
+            'filenames' => array_map( function( $id ){ return get_the_title( $id ); }, $ids ),
+            'media_meta' => $media_meta, 'selected_platforms' => $selected_platforms,
+            'cover_attachment_id' => $cover_id,
+            'cover_asset_id' => $cover_id ? get_post_meta( $cover_id, '_jkssb_asset_id', true ) : '',
+            'cover_storage_source' => $cover_id ? ( get_post_meta( $cover_id, '_jkssb_local_fallback', true ) ? 'wordpress_media' : 'supabase' ) : '',
+            'cover_filename' => $cover_id ? get_the_title( $cover_id ) : '',
+            'cover_meta' => array(
+                'filename' => sanitize_file_name( $cover_meta['filename'] ?? '' ), 'mime_type' => sanitize_mime_type( $cover_meta['mime_type'] ?? '' ),
+                'bytes' => absint( $cover_meta['bytes'] ?? 0 ), 'width' => absint( $cover_meta['width'] ?? 0 ), 'height' => absint( $cover_meta['height'] ?? 0 ),
+            ),
+            'instructions' => sanitize_textarea_field( $payload['instructions'] ?? '' ), 'title' => sanitize_text_field( $payload['title'] ?? '' ),
+            'add_to_story' => ! empty( $payload['add_to_story'] ), 'highlight_name' => sanitize_text_field( $payload['highlight_name'] ?? '' ),
+            'location' => sanitize_text_field( $payload['location'] ?? '' ),
+            'product_refs' => array_values( array_filter( array_map( 'sanitize_text_field', (array) ( $payload['product_refs'] ?? array() ) ) ) ),
+            'created_at_utc' => gmdate( 'c' ), 'status' => 'uploaded',
+        );
+        $items = $this->upload_bundles(); array_unshift( $items, $bundle ); $this->save_upload_bundles( $items ); wp_send_json_success( $bundle );
+    }
+    public function maybe_render_upload_portal() {
+        if ( is_admin() || wp_doing_ajax() || ! is_singular( 'page' ) ) return;
+        global $post;
+        if ( ! $post instanceof WP_Post || ! has_shortcode( (string) $post->post_content, 'jk_social_upload' ) ) return;
+        if ( ! is_user_logged_in() ) {
+            auth_redirect();
+            exit;
+        }
+        if ( ! current_user_can( 'manage_options' ) ) {
+            status_header( 403 );
+            wp_die( esc_html__( 'You do not have permission to use the Social Upload Portal.', 'jk-social-supabase-bridge' ), esc_html__( 'Access denied', 'jk-social-supabase-bridge' ), array( 'response' => 403 ) );
+        }
+        nocache_headers();
+        header( 'X-Robots-Tag: noindex, nofollow, noarchive', true );
+        ?><!doctype html>
+        <html <?php language_attributes(); ?>>
+        <head>
+            <meta charset="<?php bloginfo( 'charset' ); ?>">
+            <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+            <meta name="robots" content="noindex,nofollow,noarchive">
+            <title><?php echo esc_html( get_the_title( $post ) ?: 'JustKalinga Social Upload' ); ?></title>
+        </head>
+        <body style="margin:0">
+            <?php echo do_shortcode( '[jk_social_upload standalone="1"]' ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped ?>
+        </body>
+        </html><?php
+        exit;
+    }
+
+    public function shortcode_social_upload( $atts = array() ) {
+        $atts = shortcode_atts( array( 'standalone' => '0' ), (array) $atts, 'jk_social_upload' );
+        if ( ! is_user_logged_in() ) {
+            return '<div class="jkssb-auth-card"><p>Sign in to use the JustKalinga Social Upload Portal.</p><p><a class="jkssb-auth-button" href="' . esc_url( wp_login_url( get_permalink() ) ) . '">Sign in</a></p></div>';
+        }
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '<div class="jkssb-auth-card"><p>You do not have permission to use the Social Upload Portal.</p></div>';
+        }
+        ob_start();
+        $this->render_upload_app( '1' === (string) $atts['standalone'] );
+        return ob_get_clean();
+    }
+
+    public function render_upload_page() {
+        if ( ! current_user_can( 'manage_options' ) ) return;
+        echo '<div class="wrap">';
+        $this->render_upload_app( false );
+        echo '</div>';
+    }
+
+    private function render_upload_app( $standalone = false ) {
+        $nonce = wp_create_nonce( 'jkssb_social_upload' );
+        $return_url = '';
+        if ( 'compose' === sanitize_key( $_GET['return'] ?? '' ) ) {
+            $ref = wp_get_referer();
+            if ( $ref && 0 === strpos( $ref, admin_url() ) ) $return_url = remove_query_arg( 'bundle_id', $ref );
+        }
+        $ajax_url = admin_url( 'admin-ajax.php' );
+        $admin_upload_url = admin_url( 'admin.php?page=jksh-social-upload' );
+        $portal_class = $standalone ? ' jkssb-standalone' : ' jkssb-admin-embed';
+        ?>
+        <style>
+        :root{--jk-bg:#f4f6fa;--jk-card:#fff;--jk-ink:#111827;--jk-muted:#667085;--jk-line:#e4e7ec;--jk-red:#b42318;--jk-red2:#d92d20;--jk-green:#067647;--jk-blue:#175cd3;--jk-soft:#f9fafb;--jk-shadow:0 18px 55px rgba(16,24,40,.08)}
+        .jkssb-portal<?php echo $standalone ? '' : '.jkssb-admin-embed'; ?>{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--jk-ink)}
+        .jkssb-standalone{min-height:100vh;background:radial-gradient(circle at 15% 0%,rgba(217,45,32,.08),transparent 31%),linear-gradient(180deg,#f9fafb 0%,#f2f4f7 100%);padding:clamp(16px,3vw,38px);box-sizing:border-box}
+        .jkssb-admin-embed{max-width:1180px;margin-top:18px}
+        .jkssb-shell{max-width:1180px;margin:0 auto}
+        .jkssb-topbar{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px}
+        .jkssb-brand{display:flex;align-items:center;gap:12px;min-width:0}.jkssb-mark{width:44px;height:44px;border-radius:14px;background:linear-gradient(145deg,#8f1711,#d92d20);display:grid;place-items:center;color:#fff;font-weight:800;letter-spacing:-.03em;box-shadow:0 8px 22px rgba(180,35,24,.22)}
+        .jkssb-brand h1{font-size:clamp(21px,2.2vw,29px);line-height:1.1;margin:0;font-weight:760;letter-spacing:-.03em}.jkssb-brand p{margin:4px 0 0;color:var(--jk-muted);font-size:13px}
+        .jkssb-top-actions{display:flex;gap:8px;align-items:center}.jkssb-pill,.jkssb-link{height:38px;border:1px solid var(--jk-line);background:#fff;border-radius:12px;padding:0 12px;display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:650;color:#344054;text-decoration:none;box-sizing:border-box}.jkssb-pill:before{content:"";width:8px;height:8px;border-radius:50%;background:#12b76a;box-shadow:0 0 0 3px #d1fadf}
+        .jkssb-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.65fr);gap:16px;align-items:start}
+        .jkssb-card{background:var(--jk-card);border:1px solid rgba(228,231,236,.95);border-radius:20px;box-shadow:var(--jk-shadow);overflow:hidden}.jkssb-card-body{padding:22px}.jkssb-card-head{padding:18px 22px;border-bottom:1px solid var(--jk-line);display:flex;align-items:center;justify-content:space-between;gap:10px}.jkssb-card-head h2{font-size:16px;margin:0;font-weight:730}.jkssb-card-head span{color:var(--jk-muted);font-size:12px}
+        .jkssb-section{margin-bottom:20px}.jkssb-label{display:block;font-size:12px;font-weight:700;color:#344054;margin:0 0 8px}.jkssb-help{font-size:11px;color:var(--jk-muted);margin:7px 0 0;line-height:1.5}
+        .jkssb-type-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.jkssb-type-btn{appearance:none;border:1px solid var(--jk-line);background:#fff;border-radius:13px;padding:11px 10px;text-align:left;cursor:pointer;transition:.18s ease;color:#344054;min-height:66px}.jkssb-type-btn strong{display:block;font-size:12px;margin-bottom:3px}.jkssb-type-btn small{font-size:10px;color:var(--jk-muted);line-height:1.25;display:block}.jkssb-type-btn:hover{border-color:#f0a39c;transform:translateY(-1px)}.jkssb-type-btn.is-active{border-color:#d92d20;background:#fff6f5;box-shadow:0 0 0 2px rgba(217,45,32,.08)}
+        .jkssb-platforms{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.jkssb-platform-card{border:1px solid var(--jk-line);border-radius:13px;padding:11px 12px;display:flex;align-items:center;gap:9px;background:#fff;cursor:pointer;transition:.18s}.jkssb-platform-card:has(input:checked){border-color:#98a2b3;background:#f9fafb;box-shadow:inset 0 0 0 1px #98a2b3}.jkssb-platform-card input{width:16px;height:16px;margin:0}.jkssb-platform-card span{font-size:12px;font-weight:680}
+        .jkssb-drop{position:relative;border:1.5px dashed #c7ccd4;border-radius:16px;background:linear-gradient(180deg,#fbfcfe,#f8fafc);min-height:166px;display:flex;align-items:center;justify-content:center;text-align:center;padding:22px;box-sizing:border-box;transition:.2s ease;cursor:pointer}.jkssb-drop:hover,.jkssb-drop.is-drag{border-color:#d92d20;background:#fff7f6;box-shadow:0 0 0 4px rgba(217,45,32,.05)}.jkssb-drop input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}.jkssb-drop-icon{width:44px;height:44px;border-radius:14px;margin:0 auto 10px;background:#fff;border:1px solid var(--jk-line);display:grid;place-items:center;box-shadow:0 5px 14px rgba(16,24,40,.06);font-size:20px}.jkssb-drop strong{font-size:14px;display:block}.jkssb-drop p{margin:5px 0 0;color:var(--jk-muted);font-size:11px}.jkssb-storage-note{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:10px}.jkssb-storage-note span{font-size:10px;color:#475467;background:#f2f4f7;border-radius:999px;padding:5px 8px}
+        .jkssb-order{display:grid;gap:7px;margin-top:10px}.jkssb-file-row{display:grid;grid-template-columns:28px minmax(0,1fr) auto;align-items:center;gap:9px;border:1px solid var(--jk-line);border-radius:11px;background:#fff;padding:8px 9px}.jkssb-file-num{width:28px;height:28px;border-radius:9px;background:#f2f4f7;display:grid;place-items:center;font-size:11px;font-weight:750}.jkssb-file-meta{min-width:0}.jkssb-file-name{font-size:11px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.jkssb-file-size{font-size:10px;color:var(--jk-muted);margin-top:2px}.jkssb-file-actions{display:flex;gap:4px}.jkssb-mini{border:1px solid var(--jk-line);background:#fff;border-radius:8px;width:28px;height:28px;cursor:pointer;color:#475467}.jkssb-mini:disabled{opacity:.35;cursor:default}
+        .jkssb-field{width:100%;border:1px solid #d0d5dd!important;border-radius:11px!important;background:#fff!important;min-height:42px!important;padding:9px 11px!important;font-size:12px!important;line-height:1.4!important;box-shadow:0 1px 2px rgba(16,24,40,.03)!important;box-sizing:border-box!important}.jkssb-field:focus{outline:none!important;border-color:#f04438!important;box-shadow:0 0 0 3px rgba(240,68,56,.1)!important}.jkssb-textarea{min-height:126px!important;resize:vertical}.jkssb-inline-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.jkssb-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;border:1px solid var(--jk-line);border-radius:12px;padding:10px 12px}.jkssb-toggle-copy strong{display:block;font-size:11px}.jkssb-toggle-copy small{display:block;color:var(--jk-muted);font-size:10px;margin-top:2px}.jkssb-switch{width:38px;height:22px;position:relative;flex:0 0 auto}.jkssb-switch input{opacity:0;width:0;height:0}.jkssb-slider{position:absolute;inset:0;background:#d0d5dd;border-radius:999px;transition:.2s}.jkssb-slider:after{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;box-shadow:0 1px 3px rgba(16,24,40,.2);transition:.2s}.jkssb-switch input:checked+.jkssb-slider{background:#12b76a}.jkssb-switch input:checked+.jkssb-slider:after{transform:translateX(16px)}
+        .jkssb-cover-box{border:1px solid var(--jk-line);border-radius:14px;padding:13px;background:#f9fafb}.jkssb-cover-box input{font-size:11px;max-width:100%}
+        .jkssb-advanced{border:1px solid var(--jk-line);border-radius:12px;padding:0 12px;background:#fcfcfd}.jkssb-advanced summary{cursor:pointer;padding:11px 0;font-size:11px;font-weight:680;color:#475467}.jkssb-advanced p{font-size:10px;color:var(--jk-muted);line-height:1.55;margin:0 0 12px}
+        .jkssb-submit-wrap{position:sticky;bottom:0;background:linear-gradient(180deg,rgba(255,255,255,0),#fff 22%);padding-top:22px;margin-top:4px}.jkssb-submit{width:100%;border:0;border-radius:13px;background:linear-gradient(135deg,#b42318,#d92d20);color:#fff;min-height:48px;font-size:13px;font-weight:750;cursor:pointer;box-shadow:0 10px 24px rgba(180,35,24,.2);transition:.18s}.jkssb-submit:hover{transform:translateY(-1px);box-shadow:0 13px 28px rgba(180,35,24,.25)}.jkssb-submit:disabled{opacity:.55;cursor:not-allowed;transform:none}
+        .jkssb-progress{height:7px;background:#f2f4f7;border-radius:999px;overflow:hidden;margin-top:12px;display:none}.jkssb-progress-fill{height:100%;width:0;background:linear-gradient(90deg,#d92d20,#f97066);transition:width .16s ease}.jkssb-status{font-size:11px;color:#475467;margin-top:9px;min-height:16px;white-space:pre-wrap}.jkssb-status.is-error{color:#b42318}.jkssb-status.is-good{color:#067647;font-weight:650}
+        .jkssb-ready{margin-top:14px}.jkssb-ready-card{border:1px solid #abefc6;background:#ecfdf3;border-radius:14px;padding:14px}.jkssb-ready-card h3{margin:0 0 8px;font-size:14px;color:#05603a}.jkssb-ready-card p{font-size:10px;margin:5px 0;color:#067647;line-height:1.45}.jkssb-ready-card .jkssb-ready-link{display:inline-flex;margin-top:8px;padding:8px 10px;background:#067647;color:#fff;border-radius:9px;text-decoration:none;font-size:11px;font-weight:700}
+        .jkssb-auth-card{max-width:520px;margin:40px auto;padding:28px;border:1px solid #e4e7ec;border-radius:18px;background:#fff;font-family:system-ui}.jkssb-auth-button{display:inline-block;background:#b42318;color:#fff!important;text-decoration:none;padding:10px 14px;border-radius:10px}
+        @media(max-width:860px){.jkssb-grid{grid-template-columns:1fr}.jkssb-meta-card{order:-1}.jkssb-standalone{padding:14px}.jkssb-card-body{padding:17px}.jkssb-card-head{padding:15px 17px}.jkssb-type-grid{grid-template-columns:1fr 1fr}.jkssb-platforms{grid-template-columns:1fr}.jkssb-top-actions .jkssb-link{display:none}}
+        @media(max-width:520px){.jkssb-topbar{align-items:flex-start}.jkssb-top-actions{flex-direction:column;align-items:flex-end}.jkssb-type-grid{grid-template-columns:1fr 1fr}.jkssb-inline-grid{grid-template-columns:1fr}.jkssb-drop{min-height:145px}.jkssb-brand p{max-width:210px}.jkssb-card{border-radius:16px}}
+        </style>
+        <main class="jkssb-portal<?php echo esc_attr( $portal_class ); ?>">
+          <div class="jkssb-shell">
+            <div class="jkssb-topbar">
+              <div class="jkssb-brand"><div class="jkssb-mark">JK</div><div><h1>Social Upload Studio</h1><p>One clean intake for Instagram, Facebook and YouTube.</p></div></div>
+              <div class="jkssb-top-actions"><span class="jkssb-pill">IST · Secure</span><a class="jkssb-link" href="<?php echo esc_url( $admin_upload_url ); ?>">Admin view</a></div>
+            </div>
+            <div class="jkssb-grid">
+              <section class="jkssb-card">
+                <div class="jkssb-card-head"><h2>Media & destinations</h2><span>Hybrid upload · max 500 MB/file</span></div>
+                <div class="jkssb-card-body">
+                  <div class="jkssb-section">
+                    <span class="jkssb-label">Content type</span>
+                    <input id="jkssb-type" type="hidden" value="single_post">
+                    <div class="jkssb-type-grid">
+                      <button type="button" class="jkssb-type-btn is-active" data-type="single_post"><strong>Single post</strong><small>One image</small></button>
+                      <button type="button" class="jkssb-type-btn" data-type="carousel"><strong>Carousel</strong><small>2–10 ordered images</small></button>
+                      <button type="button" class="jkssb-type-btn" data-type="reel"><strong>Reel / Short</strong><small>Vertical video</small></button>
+                      <button type="button" class="jkssb-type-btn" data-type="long_video"><strong>Long video</strong><small>YouTube / landscape</small></button>
+                    </div>
+                  </div>
+                  <div class="jkssb-section">
+                    <span class="jkssb-label">Publish to</span>
+                    <div class="jkssb-platforms">
+                      <label class="jkssb-platform-card"><input class="jkssb-platform" type="checkbox" value="instagram" checked><span>Instagram</span></label>
+                      <label class="jkssb-platform-card"><input class="jkssb-platform" type="checkbox" value="facebook" checked><span>Facebook</span></label>
+                      <label class="jkssb-platform-card"><input class="jkssb-platform" type="checkbox" value="youtube" checked><span>YouTube</span></label>
+                    </div>
+                  </div>
+                  <div class="jkssb-section">
+                    <span class="jkssb-label">Images / video</span>
+                    <label class="jkssb-drop" id="jkssb-dropzone" for="jkssb-files">
+                      <input id="jkssb-files" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm">
+                      <div><div class="jkssb-drop-icon">↑</div><strong>Drop media here or browse</strong><p>JPEG, PNG, WebP, GIF, MP4, MOV or WebM</p><div class="jkssb-storage-note"><span>≤50 MB · Supabase</span><span>&gt;50 MB · WordPress Media</span></div></div>
+                    </label>
+                    <div id="jkssb-order" class="jkssb-order"></div>
+                  </div>
+                  <div id="jkssb-cover-wrap" class="jkssb-section jkssb-cover-box" style="display:none">
+                    <span class="jkssb-label">Cover / thumbnail <span style="font-weight:500;color:#667085">optional</span></span>
+                    <input id="jkssb-cover" type="file" accept="image/jpeg,image/png,image/webp">
+                    <p class="jkssb-help">Instagram Reel cover + YouTube thumbnail. YouTube is materialized to a real WordPress image automatically.</p>
+                  </div>
+                  <details class="jkssb-advanced"><summary>Advanced / diagnostics</summary><p>Carousel order follows the numbered list above. Supabase is used up to 50 MB per file; larger files use the WordPress Media fallback. Attachment IDs are handled automatically.</p></details>
+                </div>
+              </section>
+              <aside class="jkssb-card jkssb-meta-card">
+                <div class="jkssb-card-head"><h2>Post brief</h2><span>Optional fields</span></div>
+                <div class="jkssb-card-body">
+                  <div class="jkssb-section"><label class="jkssb-label" for="jkssb-title">Master title</label><input id="jkssb-title" class="jkssb-field" placeholder="Leave blank for ChatGPT-generated copy"></div>
+                  <div class="jkssb-section"><label class="jkssb-label" for="jkssb-instructions">Content idea / notes</label><textarea id="jkssb-instructions" class="jkssb-field jkssb-textarea" placeholder="Context, message, CTA, keywords, tone…"></textarea></div>
+                  <div class="jkssb-section jkssb-inline-grid"><div><label class="jkssb-label" for="jkssb-location">Location</label><input id="jkssb-location" class="jkssb-field" placeholder="Puri, Odisha"></div><div><label class="jkssb-label" for="jkssb-highlight">Highlight</label><input id="jkssb-highlight" class="jkssb-field" placeholder="Optional name"></div></div>
+                  <div class="jkssb-section"><label class="jkssb-label" for="jkssb-products">Products / SKUs</label><input id="jkssb-products" class="jkssb-field" placeholder="Comma separated"></div>
+                  <div class="jkssb-section jkssb-toggle-row"><div class="jkssb-toggle-copy"><strong>Prepare Instagram Story</strong><small>Create a Story companion from this bundle</small></div><label class="jkssb-switch"><input id="jkssb-story" type="checkbox" checked><span class="jkssb-slider"></span></label></div>
+                  <div class="jkssb-submit-wrap"><button class="jkssb-submit" id="jkssb-upload" type="button">Upload media</button><div class="jkssb-progress" id="jkssb-progress"><div class="jkssb-progress-fill" id="jkssb-progress-fill"></div></div><div id="jkssb-status" class="jkssb-status"></div><div id="jkssb-ready" class="jkssb-ready"></div></div>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </main>
+        <script>(()=>{
+          const ajax=<?php echo wp_json_encode( $ajax_url ); ?>,nonce=<?php echo wp_json_encode( $nonce ); ?>,returnBase=<?php echo wp_json_encode( $return_url ); ?>;
+          const status=document.getElementById('jkssb-status'),ready=document.getElementById('jkssb-ready'),filesEl=document.getElementById('jkssb-files'),typeEl=document.getElementById('jkssb-type'),coverWrap=document.getElementById('jkssb-cover-wrap'),coverEl=document.getElementById('jkssb-cover'),orderEl=document.getElementById('jkssb-order'),drop=document.getElementById('jkssb-dropzone'),uploadBtn=document.getElementById('jkssb-upload'),progress=document.getElementById('jkssb-progress'),progressFill=document.getElementById('jkssb-progress-fill');
+          let selectedFiles=[];
+          const setStatus=(txt,kind='')=>{status.textContent=txt||'';status.className='jkssb-status'+(kind?' is-'+kind:'');};
+          const setProgress=(pct)=>{progress.style.display='block';progressFill.style.width=Math.max(0,Math.min(100,pct||0))+'%';};
+          const post=async(fd)=>{fd.append('nonce',nonce);const r=await fetch(ajax,{method:'POST',body:fd,credentials:'same-origin'});let j;try{j=await r.json();}catch(e){throw new Error('Server returned an unreadable response.');}if(!j.success)throw new Error((j.data&&j.data.message)||'Request failed');return j.data;};
+          const human=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB';
+          const fmtDur=ms=>ms?Math.round(ms/1000)+'s':'';
+          const probe=file=>new Promise(resolve=>{const out={filename:file.name,mime_type:file.type,bytes:file.size,width:0,height:0,duration_ms:0};const u=URL.createObjectURL(file);let done=false;const finish=()=>{if(done)return;done=true;URL.revokeObjectURL(u);resolve(out);};setTimeout(finish,4000);if(file.type.startsWith('image/')){const im=new Image();im.onload=()=>{out.width=im.naturalWidth||0;out.height=im.naturalHeight||0;finish();};im.onerror=finish;im.src=u;}else if(file.type.startsWith('video/')){const v=document.createElement('video');v.preload='metadata';v.onloadedmetadata=()=>{out.width=v.videoWidth||0;out.height=v.videoHeight||0;out.duration_ms=isFinite(v.duration)?Math.round(v.duration*1000):0;finish();};v.onerror=finish;v.src=u;}else finish();});
+          const syncType=()=>{const v=typeEl.value;coverWrap.style.display=(v==='reel'||v==='long_video')?'block':'none';if(v!=='carousel'&&selectedFiles.length>1){selectedFiles=[selectedFiles[0]];renderOrder();}};
+          const renderOrder=()=>{orderEl.innerHTML='';selectedFiles.forEach((f,i)=>{const row=document.createElement('div');row.className='jkssb-file-row';const n=document.createElement('div');n.className='jkssb-file-num';n.textContent=String(i+1);const meta=document.createElement('div');meta.className='jkssb-file-meta';const name=document.createElement('div');name.className='jkssb-file-name';name.textContent=f.name;const size=document.createElement('div');size.className='jkssb-file-size';size.textContent=human(f.size)+(typeEl.value==='carousel'?' · slide '+(i+1):'');meta.append(name,size);const acts=document.createElement('div');acts.className='jkssb-file-actions';if(typeEl.value==='carousel'){const up=document.createElement('button');up.type='button';up.className='jkssb-mini';up.textContent='↑';up.disabled=i===0;up.onclick=()=>{[selectedFiles[i-1],selectedFiles[i]]=[selectedFiles[i],selectedFiles[i-1]];renderOrder();};const down=document.createElement('button');down.type='button';down.className='jkssb-mini';down.textContent='↓';down.disabled=i===selectedFiles.length-1;down.onclick=()=>{[selectedFiles[i+1],selectedFiles[i]]=[selectedFiles[i],selectedFiles[i+1]];renderOrder();};acts.append(up,down);}row.append(n,meta,acts);orderEl.appendChild(row);});};
+          document.querySelectorAll('.jkssb-type-btn').forEach(btn=>btn.addEventListener('click',()=>{document.querySelectorAll('.jkssb-type-btn').forEach(x=>x.classList.remove('is-active'));btn.classList.add('is-active');typeEl.value=btn.dataset.type;syncType();renderOrder();}));
+          filesEl.addEventListener('change',()=>{selectedFiles=[...filesEl.files];syncType();renderOrder();});
+          ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('is-drag');}));['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('is-drag');}));drop.addEventListener('drop',e=>{const fs=[...(e.dataTransfer?.files||[])];if(!fs.length)return;selectedFiles=typeEl.value==='carousel'?fs:fs.slice(0,1);renderOrder();});
+          syncType();
+          async function uploadFile(file,index,total,meta,label='Media'){setStatus('Uploading '+label+' '+(index+1)+'/'+total+': '+file.name);let fd=new FormData();fd.append('action','jkssb_ui_begin');fd.append('filename',file.name);fd.append('mime_type',file.type);fd.append('bytes',file.size);fd.append('width',meta.width||0);fd.append('height',meta.height||0);fd.append('duration_ms',meta.duration_ms||0);const b=await post(fd);const target=b.storage_target==='wordpress_media'?'WordPress Media':'Supabase';let off=0,chunk=b.max_chunk_bytes||4194304;while(off<file.size){const blob=file.slice(off,Math.min(file.size,off+chunk));fd=new FormData();fd.append('action','jkssb_ui_chunk');fd.append('upload_id',b.upload_id);fd.append('offset',String(off));fd.append('chunk',blob,file.name+'.part');const x=await post(fd);off=x.next_offset;const filePct=off/file.size;const overall=((index+filePct)/total)*100;setProgress(overall);setStatus('Uploading '+label+' to '+target+' · '+Math.round(filePct*100)+'%');}fd=new FormData();fd.append('action','jkssb_ui_finalize');fd.append('upload_id',b.upload_id);return await post(fd);}
+          const composeUrl=bundle=>{let base=returnBase||'';if(!base)return'';try{const u=new URL(base,window.location.href);if(u.origin!==window.location.origin||u.pathname===window.location.pathname)return'';u.searchParams.set('bundle_id',bundle);return u.toString();}catch(e){return'';}};
+          const renderReady=(saved,metas,coverFile)=>{ready.innerHTML='';const box=document.createElement('div');box.className='jkssb-ready-card';const h=document.createElement('h3');h.textContent='Media ready';box.appendChild(h);metas.forEach((m,i)=>{const p=document.createElement('p');const src=m.storage_source==='wordpress_media'?'WordPress Media':'Supabase';p.textContent=(i+1)+'. '+m.filename+' · '+(m.width&&m.height?m.width+'×'+m.height+' · ':'')+(m.duration_ms?fmtDur(m.duration_ms)+' · ':'')+human(m.bytes)+' · '+src;box.appendChild(p);});if(coverFile){const p=document.createElement('p');p.textContent='Cover · '+coverFile.name+' · '+human(coverFile.size);box.appendChild(p);}const p=document.createElement('p');p.textContent='Platforms · '+saved.selected_platforms.join(', ')+' · Bundle '+saved.bundle_id;box.appendChild(p);const u=composeUrl(saved.bundle_id);if(u){const a=document.createElement('a');a.className='jkssb-ready-link';a.href=u;a.textContent='Use in Composer';box.appendChild(a);}ready.appendChild(box);};
+          uploadBtn.onclick=async()=>{const files=selectedFiles.length?selectedFiles:[...filesEl.files];ready.innerHTML='';progress.style.display='none';progressFill.style.width='0';if(!files.length){setStatus('Choose at least one file.','error');return;}const currentMax=524288000;const oversize=files.find(f=>f.size>currentMax);if(oversize){setStatus(oversize.name+' is '+human(oversize.size)+'. Maximum is 500 MB per file.','error');return;}const type=typeEl.value;if(type==='carousel'&&(files.length<2||files.length>10)){setStatus('Carousel requires 2–10 images.','error');return;}if(type!=='carousel'&&files.length!==1){setStatus('This content type requires exactly one main file.','error');return;}if((type==='single_post'||type==='carousel')&&files.some(f=>!f.type.startsWith('image/'))){setStatus('Image posts and carousels require images only.','error');return;}if((type==='reel'||type==='long_video')&&!files[0].type.startsWith('video/')){setStatus('Reel / Long Video requires a video file.','error');return;}const platforms=[...document.querySelectorAll('.jkssb-platform:checked')].map(x=>x.value);if(!platforms.length){setStatus('Choose at least one platform.','error');return;}uploadBtn.disabled=true;uploadBtn.textContent='Uploading…';try{const metas=[],ids=[];setProgress(1);for(let i=0;i<files.length;i++){const meta=await probe(files[i]);const r=await uploadFile(files[i],i,files.length,meta);const id=r.attachment_id||r.external_attachment_id||(r.shell&&r.shell.attachment_id);meta.attachment_id=id;meta.storage_source=r.storage||((r.asset&&r.asset.id)?'supabase':'wordpress_media');metas.push(meta);ids.push(id);}let coverId=0,coverMeta={};const coverFile=(coverWrap.style.display!=='none'&&coverEl.files&&coverEl.files[0])?coverEl.files[0]:null;if(coverFile){if(coverFile.size>524288000)throw new Error('Cover exceeds the 500 MB hybrid limit.');coverMeta=await probe(coverFile);const cr=await uploadFile(coverFile,0,1,coverMeta,'Cover');coverId=cr.attachment_id||cr.external_attachment_id||(cr.shell&&cr.shell.attachment_id)||0;coverMeta.storage_source=cr.storage||((cr.asset&&cr.asset.id)?'supabase':'wordpress_media');}const p={content_type:type,title:document.getElementById('jkssb-title').value,instructions:document.getElementById('jkssb-instructions').value,add_to_story:document.getElementById('jkssb-story').checked,highlight_name:document.getElementById('jkssb-highlight').value,location:document.getElementById('jkssb-location').value,product_refs:document.getElementById('jkssb-products').value.split(',').map(x=>x.trim()).filter(Boolean),attachment_ids:ids,media_meta:metas,selected_platforms:platforms,cover_attachment_id:coverId,cover_meta:coverMeta};let fd=new FormData();fd.append('action','jkssb_ui_save_bundle');fd.append('payload',JSON.stringify(p));const saved=await post(fd);setProgress(100);setStatus('Media ready.','good');renderReady(saved,metas,coverFile);}catch(err){setStatus(err.message||'Upload failed.','error');}finally{uploadBtn.disabled=false;uploadBtn.textContent='Upload media';}};
+        })();</script>
+        <?php
+    }
+
+    public function ability_inspect_jksh_runtime_with_uploads( $input = array() ) {
+        $out = $this->ability_inspect_jksh_runtime( $input );
+        if ( is_wp_error( $out ) ) return $out;
+        if ( ! is_array( $out ) ) $out = array( 'ok' => true );
+        $out['upload_bundles'] = array_slice( $this->upload_bundles(), 0, 30 );
+        return $out;
+    }
+
+    private function ist_to_utc_mysql( $value ) {
+        $value = sanitize_text_field( (string) $value );
+        $tz_ist = new DateTimeZone( 'Asia/Kolkata' );
+        $dt = DateTimeImmutable::createFromFormat( 'Y-m-d H:i:s', $value, $tz_ist );
+        if ( ! $dt || $dt->format( 'Y-m-d H:i:s' ) !== $value ) {
+            return new WP_Error( 'jkssb_ist_format', 'Time must use YYYY-MM-DD HH:MM:SS in IST (Asia/Kolkata).' );
+        }
+        return $dt->setTimezone( new DateTimeZone( 'UTC' ) )->format( 'Y-m-d H:i:s' );
+    }
+
+    private function utc_mysql_to_ist( $value ) {
+        $value = sanitize_text_field( (string) $value );
+        if ( '' === $value || '0000-00-00 00:00:00' === $value ) return '';
+        try {
+            $dt = new DateTimeImmutable( $value, new DateTimeZone( 'UTC' ) );
+            return $dt->setTimezone( new DateTimeZone( 'Asia/Kolkata' ) )->format( 'Y-m-d H:i:s' );
+        } catch ( Throwable $e ) {
+            return $value;
+        }
+    }
+
+    private function utc_timestamp_to_ist_iso( $timestamp ) {
+        $timestamp = absint( $timestamp );
+        if ( ! $timestamp ) return null;
+        return wp_date( 'c', $timestamp, new DateTimeZone( 'Asia/Kolkata' ) );
+    }
+
+    public function ability_reschedule_publish_job_ist( $input ) {
+        global $wpdb;
+        if ( empty( $input['confirm'] ) || true !== $input['confirm'] ) {
+            return new WP_Error( 'jkssb_reschedule_confirm', 'confirm=true is required.' );
+        }
+        $job_id = absint( $input['job_id'] ?? 0 );
+        if ( ! $job_id ) return new WP_Error( 'jkssb_reschedule_job', 'A valid job_id is required.' );
+        $job_table = $wpdb->prefix . 'jksh_jobs';
+        $variant_table = $wpdb->prefix . 'jksh_variants';
+        $content_table = $wpdb->prefix . 'jksh_content';
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT j.id,j.content_id,j.variant_id,j.platform,j.job_type,j.status,j.attempts,j.started_at,j.completed_at,v.status AS variant_status,v.publish_at FROM {$job_table} j JOIN {$variant_table} v ON v.id=j.variant_id WHERE j.id=%d LIMIT 1",
+            $job_id
+        ), ARRAY_A );
+        if ( ! $row ) return new WP_Error( 'jkssb_reschedule_missing', 'Publish job was not found.' );
+        if ( 'publish' !== sanitize_key( $row['job_type'] ) ) return new WP_Error( 'jkssb_reschedule_type', 'Only publish jobs can be rescheduled.' );
+        if ( ! in_array( sanitize_key( $row['status'] ), array( 'queued', 'scheduled' ), true ) ) return new WP_Error( 'jkssb_reschedule_status', 'Only queued or scheduled jobs can be rescheduled safely.' );
+        if ( ! empty( $row['started_at'] ) || ! empty( $row['completed_at'] ) || absint( $row['attempts'] ) > 0 ) return new WP_Error( 'jkssb_reschedule_started', 'This job has already started or attempted publishing and cannot be rescheduled.' );
+
+        if ( ! empty( $input['delay_minutes'] ) ) {
+            $scheduled_ts = time() + ( absint( $input['delay_minutes'] ) * MINUTE_IN_SECONDS );
+            $scheduled_utc = gmdate( 'Y-m-d H:i:s', $scheduled_ts );
+            $scheduled_ist = wp_date( 'Y-m-d H:i:s', $scheduled_ts, new DateTimeZone( 'Asia/Kolkata' ) );
+        } else {
+            $scheduled_ist = sanitize_text_field( $input['scheduled_at_ist'] ?? '' );
+            if ( '' === $scheduled_ist ) return new WP_Error( 'jkssb_reschedule_time', 'Provide delay_minutes or scheduled_at_ist.' );
+            $scheduled_utc = $this->ist_to_utc_mysql( $scheduled_ist );
+            if ( is_wp_error( $scheduled_utc ) ) return $scheduled_utc;
+            $scheduled_ts = strtotime( $scheduled_utc . ' UTC' );
+        }
+        if ( $scheduled_ts < time() + 60 || $scheduled_ts > time() + YEAR_IN_SECONDS ) return new WP_Error( 'jkssb_reschedule_range', 'Schedule must be at least 60 seconds in the future and no more than one year ahead.' );
+        $now = gmdate( 'Y-m-d H:i:s' );
+        $wpdb->query( 'START TRANSACTION' );
+        try {
+            $ok1 = $wpdb->update( $job_table, array( 'scheduled_at' => $scheduled_utc, 'status' => 'queued', 'updated_at' => $now, 'last_error' => '' ), array( 'id' => $job_id ), array( '%s','%s','%s','%s' ), array( '%d' ) );
+            $ok2 = $wpdb->update( $variant_table, array( 'publish_at' => $scheduled_utc, 'status' => 'scheduled', 'updated_at' => $now ), array( 'id' => absint( $row['variant_id'] ) ), array( '%s','%s','%s' ), array( '%d' ) );
+            $ok3 = $wpdb->update( $content_table, array( 'status' => 'scheduled', 'updated_at' => $now ), array( 'id' => absint( $row['content_id'] ) ), array( '%s','%s' ), array( '%d' ) );
+            if ( false === $ok1 || false === $ok2 || false === $ok3 ) throw new RuntimeException( $wpdb->last_error ?: 'Database update failed.' );
+            $wpdb->query( 'COMMIT' );
+        } catch ( Throwable $e ) {
+            $wpdb->query( 'ROLLBACK' );
+            return new WP_Error( 'jkssb_reschedule_failed', 'The publish job could not be rescheduled safely.', array( 'detail' => sanitize_text_field( $e->getMessage() ) ) );
+        }
+        return array(
+            'ok' => true,
+            'job_id' => $job_id,
+            'content_id' => absint( $row['content_id'] ),
+            'variant_id' => absint( $row['variant_id'] ),
+            'platform' => sanitize_key( $row['platform'] ),
+            'status' => 'scheduled',
+            'scheduled_at_ist' => $scheduled_ist,
+            'timezone' => 'Asia/Kolkata',
+        );
+    }
+
+    public function ability_export_live_social_hub( $input ) {
+        if ( empty( $input['confirm'] ) ) {
+            return new WP_Error( 'jkssb_export_confirm', 'confirm=true is required.' );
+        }
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            return new WP_Error( 'jkssb_export_zip_missing', 'ZipArchive is unavailable.' );
+        }
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+
+        $plugin_dir  = WP_PLUGIN_DIR . '/jk-social-hub';
+        $plugin_file = $plugin_dir . '/jk-social-hub.php';
+        if ( ! is_dir( $plugin_dir ) || ! is_readable( $plugin_dir ) || ! is_file( $plugin_file ) || ! is_readable( $plugin_file ) ) {
+            return new WP_Error( 'jkssb_export_hub_missing', 'The live JK Social Hub plugin directory could not be read.' );
+        }
+
+        $data = get_plugin_data( $plugin_file, false, false );
+        $name = isset( $data['Name'] ) ? trim( (string) $data['Name'] ) : '';
+        $version = isset( $data['Version'] ) ? sanitize_text_field( $data['Version'] ) : '';
+        $accepted_names = array( 'JK Social Hub', 'JustKalinga Social Hub' );
+        if ( ! in_array( $name, $accepted_names, true ) || '' === $version || 'jk-social-hub/jk-social-hub.php' !== plugin_basename( $plugin_file ) ) {
+            return new WP_Error( 'jkssb_export_identity', 'Installed plugin identity is not the expected JK Social Hub.', array( 'detected_name' => $name, 'detected_version' => $version, 'detected_plugin' => plugin_basename( $plugin_file ) ) );
+        }
+
+        $real_root = realpath( $plugin_dir );
+        if ( ! $real_root ) {
+            return new WP_Error( 'jkssb_export_root', 'Could not resolve the JK Social Hub plugin directory.' );
+        }
+
+        $uploads = wp_upload_dir();
+        if ( ! empty( $uploads['error'] ) ) {
+            return new WP_Error( 'jkssb_export_upload_dir', (string) $uploads['error'] );
+        }
+        if ( ! wp_mkdir_p( $uploads['path'] ) ) {
+            return new WP_Error( 'jkssb_export_upload_mkdir', 'Could not prepare the WordPress uploads directory.' );
+        }
+
+        $base_name = 'jk-social-hub-live-v' . preg_replace( '/[^0-9A-Za-z._-]/', '-', $version ) . '-export.zip';
+        $filename = wp_unique_filename( $uploads['path'], $base_name );
+        $target = trailingslashit( $uploads['path'] ) . $filename;
+
+        $zip = new ZipArchive();
+        $opened = $zip->open( $target, ZipArchive::CREATE | ZipArchive::OVERWRITE );
+        if ( true !== $opened ) {
+            return new WP_Error( 'jkssb_export_zip_open', 'Could not create the JK Social Hub export ZIP.' );
+        }
+        $zip->addEmptyDir( 'jk-social-hub' );
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $real_root, FilesystemIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        $file_count = 0;
+        foreach ( $iterator as $item ) {
+            $path = $item->getPathname();
+            if ( is_link( $path ) ) {
+                $zip->close();
+                @unlink( $target );
+                return new WP_Error( 'jkssb_export_symlink', 'Export refused because a symlink exists inside JK Social Hub.' );
+            }
+            $real = realpath( $path );
+            if ( ! $real || 0 !== strpos( $real, $real_root . DIRECTORY_SEPARATOR ) ) {
+                $zip->close();
+                @unlink( $target );
+                return new WP_Error( 'jkssb_export_path_escape', 'Export refused because a plugin path resolved outside the JK Social Hub directory.' );
+            }
+            $relative = ltrim( str_replace( '\\', '/', substr( $real, strlen( $real_root ) ) ), '/' );
+            $zip_path = 'jk-social-hub/' . $relative;
+            if ( $item->isDir() ) {
+                $zip->addEmptyDir( $zip_path );
+            } elseif ( $item->isFile() ) {
+                if ( ! $zip->addFile( $real, $zip_path ) ) {
+                    $zip->close();
+                    @unlink( $target );
+                    return new WP_Error( 'jkssb_export_add_file', 'Could not add a JK Social Hub file to the export ZIP.' );
+                }
+                $file_count++;
+            }
+        }
+        $zip->close();
+
+        if ( ! is_file( $target ) || filesize( $target ) < 100 ) {
+            @unlink( $target );
+            return new WP_Error( 'jkssb_export_empty', 'The JK Social Hub export ZIP was not created correctly.' );
+        }
+
+        $check = new ZipArchive();
+        if ( true !== $check->open( $target ) || false === $check->locateName( 'jk-social-hub/jk-social-hub.php', ZipArchive::FL_NOCASE ) ) {
+            if ( $check instanceof ZipArchive ) { $check->close(); }
+            @unlink( $target );
+            return new WP_Error( 'jkssb_export_verify', 'The exported ZIP did not contain the expected JK Social Hub plugin root.' );
+        }
+        $check->close();
+
+        $sha256 = hash_file( 'sha256', $target );
+        $bytes = filesize( $target );
+        $attachment_id = wp_insert_attachment( array(
+            'post_mime_type' => 'application/zip',
+            'post_title'     => 'JK Social Hub live v' . $version . ' export',
+            'post_content'   => 'Byte-preserving maintenance export created by JK Social Supabase Bridge ' . self::VERSION . '.',
+            'post_status'    => 'inherit',
+        ), $target, 0, true );
+        if ( is_wp_error( $attachment_id ) ) {
+            @unlink( $target );
+            return $attachment_id;
+        }
+        update_post_meta( $attachment_id, '_jkssb_export_sha256', $sha256 );
+        update_post_meta( $attachment_id, '_jkssb_export_source_version', $version );
+
+        return array(
+            'ok'            => true,
+            'attachment_id' => (int) $attachment_id,
+            'plugin'        => 'jk-social-hub/jk-social-hub.php',
+            'version'       => $version,
+            'filename'      => $filename,
+            'url'           => wp_get_attachment_url( $attachment_id ),
+            'bytes'         => (int) $bytes,
+            'sha256'        => $sha256,
+            'file_count'    => (int) $file_count,
+            'exported_at_ist' => wp_date( 'c', null, new DateTimeZone( 'Asia/Kolkata' ) ),
+        );
+    }
+
+    public function ability_update_readiness() {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        $data = get_plugin_data( __FILE__, false, false );
+        return array(
+            'ok' => true,
+            'plugin' => $this->bridge_plugin_basename(),
+            'current_version' => isset( $data['Version'] ) ? $data['Version'] : self::VERSION,
+            'active' => is_plugin_active( $this->bridge_plugin_basename() ),
+            'zip_supported' => class_exists( 'ZipArchive' ),
+            'can_install_plugins' => current_user_can( 'install_plugins' ),
+            'can_update_plugins' => current_user_can( 'update_plugins' ),
+            'accepted_plugin_identity' => 'jk-social-supabase-bridge/jk-social-supabase-bridge.php',
+        );
+    }
+
+    public function ability_preflight_update( $input ) {
+        return $this->inspect_update_package( $input['attachment_id'], $input['expected_sha256'] );
+    }
+
+    public function ability_install_update( $input ) {
+        if ( empty( $input['confirm'] ) ) {
+            return new WP_Error( 'jkssb_update_confirm', 'confirm=true is required.' );
+        }
+        $preflight = $this->inspect_update_package( $input['attachment_id'], $input['expected_sha256'] );
+        if ( is_wp_error( $preflight ) ) {
+            return $preflight;
+        }
+        $current = $this->ability_update_readiness();
+        if ( ! hash_equals( (string) $current['current_version'], (string) $input['expected_current_version'] ) ) {
+            return new WP_Error( 'jkssb_update_version_changed', 'Installed bridge version changed since the caller inspected it.' );
+        }
+        if ( version_compare( $preflight['package_version'], $current['current_version'], '<=' ) ) {
+            return new WP_Error( 'jkssb_update_not_newer', 'Bridge package version must be newer than the installed version.' );
+        }
+        require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        $was_active = is_plugin_active( $this->bridge_plugin_basename() );
+        $skin = new Automatic_Upgrader_Skin();
+        $upgrader = new Plugin_Upgrader( $skin );
+        $result = $upgrader->install( $preflight['file'], array( 'overwrite_package' => true ) );
+        if ( is_wp_error( $result ) || false === $result ) {
+            return is_wp_error( $result ) ? $result : new WP_Error( 'jkssb_update_failed', 'Bridge update failed.' );
+        }
+        if ( $was_active && ! is_plugin_active( $this->bridge_plugin_basename() ) ) {
+            $activated = activate_plugin( $this->bridge_plugin_basename() );
+            if ( is_wp_error( $activated ) ) {
+                return $activated;
+            }
+        }
+        $plugin_file = WP_PLUGIN_DIR . '/jk-social-supabase-bridge/jk-social-supabase-bridge.php';
+        $installed = file_exists( $plugin_file ) ? get_plugin_data( $plugin_file, false, false ) : array();
+        $version = isset( $installed['Version'] ) ? $installed['Version'] : '';
+        if ( ! hash_equals( (string) $preflight['package_version'], (string) $version ) ) {
+            return new WP_Error( 'jkssb_update_verify_failed', 'Installed bridge version did not match the package after update.' );
+        }
+        if ( ! empty( $input['delete_package_after'] ) ) {
+            wp_delete_attachment( absint( $input['attachment_id'] ), true );
+        }
+        return array( 'ok' => true, 'version' => $version, 'active' => is_plugin_active( $this->bridge_plugin_basename() ) );
+    }
+
+    public static function deactivate() {
+        wp_clear_scheduled_hook( self::LIVE_CRON_HOOK );
+    }
+
+}
+
+register_activation_hook( __FILE__, array( 'JKSSB_Bridge', 'activate' ) );
+register_deactivation_hook( __FILE__, array( 'JKSSB_Bridge', 'deactivate' ) );
+JKSSB_Bridge::instance();
