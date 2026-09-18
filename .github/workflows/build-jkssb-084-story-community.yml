@@ -1,0 +1,70 @@
+name: Build Bridge 0.8.4 Story music Community
+
+on:
+  push:
+    branches: [recover-jksh-bridge-073]
+    paths:
+      - .github/workflows/build-jkssb-084-story-community.yml
+      - scripts/build_jkssb_084_story_community.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: recover-jksh-bridge-073
+      - name: Verify exact Bridge 0.8.3 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=dist/jk-social-supabase-bridge-v0.8.3.zip
+          test -f "$ZIP"
+          test "$(sha256sum "$ZIP" | awk '{print $1}')" = '1c19bc1f280874015ff3a7628e9dee7a1a7552df022f662212e694f3bfdb7845'
+          rm -rf /tmp/jkssb084
+          mkdir -p /tmp/jkssb084
+          unzip -q "$ZIP" -d /tmp/jkssb084
+          grep -q 'Version: 0.8.3' /tmp/jkssb084/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+      - name: Apply Story music Community patch
+        run: python3 scripts/build_jkssb_084_story_community.py /tmp/jkssb084/jk-social-supabase-bridge
+      - name: Validate Bridge 0.8.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          PHP=/tmp/jkssb084/jk-social-supabase-bridge/jk-social-supabase-bridge.php
+          php -l "$PHP"
+          grep -q 'Version: 0.8.4' "$PHP"
+          grep -q "jkssb_community_prepare_bundle" "$PHP"
+          grep -q "Prepare YouTube Community" "$PHP"
+          grep -q "Single-image and carousel posts only" "$PHP"
+          grep -q "if ( ! \$image_music ) unset" "$PHP"
+          grep -q "window.open('about:blank','_blank')" "$PHP"
+      - name: Package Bridge 0.8.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/jkssb084
+          zip -qr /tmp/jk-social-supabase-bridge-v0.8.4.zip jk-social-supabase-bridge
+          unzip -t /tmp/jk-social-supabase-bridge-v0.8.4.zip
+          mkdir -p "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/reports"
+          cp /tmp/jk-social-supabase-bridge-v0.8.4.zip "$GITHUB_WORKSPACE/dist/"
+          SHA="$(sha256sum /tmp/jk-social-supabase-bridge-v0.8.4.zip | awk '{print $1}')"
+          SIZE="$(stat -c%s /tmp/jk-social-supabase-bridge-v0.8.4.zip)"
+          printf '%s\n'             'JK Social Supabase Bridge v0.8.4 Story music Community'             "sha256=$SHA"             "bytes=$SIZE"             'base_version=0.8.3'             'base_sha256=1c19bc1f280874015ff3a7628e9dee7a1a7552df022f662212e694f3bfdb7845'             'features=music suggestion only on single/carousel images; reliable YouTube Community prepare/open buttons; Story UI preserved'             > "$GITHUB_WORKSPACE/reports/jkssb-084-story-community-manifest.txt"
+      - name: Commit distributable
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Maintenance Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add dist/jk-social-supabase-bridge-v0.8.4.zip reports/jkssb-084-story-community-manifest.txt
+          if git diff --cached --quiet; then
+            echo 'Bridge 0.8.4 package already current.'
+          else
+            git commit -m 'Build Bridge 0.8.4 Story music Community'
+            git push origin HEAD:recover-jksh-bridge-073
+          fi
