@@ -21,10 +21,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : > /tmp/jkssb082.zip
-          for p in staging/jkssb082full/part{00,01,02,03,04,05,06}.b64; do
-            base64 -d "$p" >> /tmp/jkssb082.zip
+          rm -f /tmp/jkssb082.part*
+          for n in 00 01 02 03 04 05 06; do
+            base64 -d "staging/jkssb082full/part${n}.b64" > "/tmp/jkssb082.part${n}"
           done
+          cat /tmp/jkssb082.part00 > /tmp/jkssb082.zip
+          tail -c +1501 /tmp/jkssb082.part01 >> /tmp/jkssb082.zip
+          cat /tmp/jkssb082.part02 /tmp/jkssb082.part03 /tmp/jkssb082.part04 /tmp/jkssb082.part05 >> /tmp/jkssb082.zip
+          tail -c +3310 /tmp/jkssb082.part06 >> /tmp/jkssb082.zip
           EXPECT='a281309c2e76d0250781daf615949e83ca607e7dce6ddaae9206c7f0b40508dd'
           ACTUAL="$(sha256sum /tmp/jkssb082.zip | awk '{print $1}')"
           SIZE="$(stat -c%s /tmp/jkssb082.zip)"
