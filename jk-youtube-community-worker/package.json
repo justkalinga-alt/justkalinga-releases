@@ -1,0 +1,15 @@
+{
+  "name": "jk-youtube-community-worker",
+  "version": "0.9.3.1",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=20"},
+  "scripts": {
+    "start": "node src/worker.mjs",
+    "login": "node src/login.mjs",
+    "check": "node --check src/worker.mjs && node --check src/login.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}
