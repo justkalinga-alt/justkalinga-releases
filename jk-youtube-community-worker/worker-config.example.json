@@ -1,0 +1,9 @@
+{
+  "hub_url": "https://social-justkalinga.tempurl.host",
+  "worker_token": "PASTE_TOKEN_FROM_JK_SOCIAL_HUB",
+  "worker_id": "jk-community-windows-01",
+  "profile_dir": "D:\\Dev\\JKSocialHub\\jk-youtube-community-mcp\\.youtube-profile",
+  "channel_url": "https://www.youtube.com/channel/UCkdivvj0X_aO6FCpa394sgQ",
+  "poll_seconds": 20,
+  "headless": false
+}
