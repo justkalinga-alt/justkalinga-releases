@@ -1,0 +1,127 @@
+name: Build JKSH Pinterest diagnostic
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - .github/workflows/jksh-pinterest-diagnostic.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+
+      - name: Fetch verified v0.13.4 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.4.zip' -o base.zip
+          echo 'efa76f3bf8fcc4a51520a38c15765748ce8621a35c7502b1a8e1dbe47f1f7b42  base.zip' | sha256sum -c -
+          rm -rf build && mkdir build
+          unzip -q base.zip -d build
+
+      - name: Add guarded connector diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/jk-social-hub/includes/class-jksh-pinterest-diagnostic-v0135.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { exit; }
+
+          final class JKSH_Pinterest_Diagnostic_V0135 {
+              public static function init(): void {
+                  add_action( 'rest_api_init', [ __CLASS__, 'routes' ] );
+              }
+              public static function routes(): void {
+                  register_rest_route(
+                      'jksh/v1',
+                      '/maintenance/pinterest-connector-method',
+                      [
+                          'methods' => 'GET',
+                          'permission_callback' => static fn() => current_user_can( 'manage_options' ),
+                          'callback' => [ __CLASS__, 'inspect' ],
+                      ]
+                  );
+              }
+              public static function inspect( WP_REST_Request $request ): WP_REST_Response {
+                  $method = sanitize_key( (string) ( $request->get_param( 'method' ) ?: 'process_job' ) );
+                  if ( ! class_exists( 'JKSH_Pinterest_Connector' ) ) {
+                      return new WP_REST_Response( [ 'ok' => false, 'message' => 'Pinterest connector class not loaded.' ], 404 );
+                  }
+                  if ( ! method_exists( 'JKSH_Pinterest_Connector', $method ) ) {
+                      return new WP_REST_Response( [ 'ok' => false, 'message' => 'Method not found.' ], 404 );
+                  }
+                  try {
+                      $ref = new ReflectionMethod( 'JKSH_Pinterest_Connector', $method );
+                      $file = $ref->getFileName();
+                      $lines = is_string( $file ) && is_readable( $file ) ? file( $file, FILE_IGNORE_NEW_LINES ) : [];
+                      $start = max( 1, $ref->getStartLine() - 8 );
+                      $end = min( count( $lines ), $ref->getEndLine() + 8 );
+                      $source = [];
+                      for ( $i = $start; $i <= $end; $i++ ) {
+                          $source[] = [ 'line' => $i, 'text' => (string) ( $lines[ $i - 1 ] ?? '' ) ];
+                      }
+                      return new WP_REST_Response(
+                          [
+                              'ok' => true,
+                              'class' => 'JKSH_Pinterest_Connector',
+                              'method' => $method,
+                              'file' => basename( (string) $file ),
+                              'start' => $ref->getStartLine(),
+                              'end' => $ref->getEndLine(),
+                              'source' => $source,
+                          ],
+                          200
+                      );
+                  } catch ( Throwable $e ) {
+                      return new WP_REST_Response( [ 'ok' => false, 'message' => $e->getMessage() ], 500 );
+                  }
+              }
+          }
+          JKSH_Pinterest_Diagnostic_V0135::init();
+          PHP
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('build/jk-social-hub/jk-social-hub.php')
+          s=p.read_text()
+          s=s.replace(" * Version:     0.13.4"," * Version:     0.13.5",1)
+          s=s.replace("define( 'JKSH_VERSION', '0.13.4' );","define( 'JKSH_VERSION', '0.13.5' );",1)
+          marker="// JKSH_V0133_ACCOUNTS_UI"
+          insert="""// JKSH_V0135_PINTEREST_DIAGNOSTIC
+          $jksh_v0135_pinterest_diagnostic = __DIR__ . '/includes/class-jksh-pinterest-diagnostic-v0135.php';
+          if ( is_readable( $jksh_v0135_pinterest_diagnostic ) ) { require_once $jksh_v0135_pinterest_diagnostic; }
+
+          """
+          if marker not in s:
+              raise SystemExit('Loader marker missing')
+          s=s.replace(marker,insert+marker,1)
+          p.write_text(s)
+          PY
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0135.txt
+          (cd build && zip -qr ../jk-social-hub-v0.13.5.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.5.zip | tee jk-social-hub-v0.13.5.zip.sha256
+          unzip -t jk-social-hub-v0.13.5.zip > zip-test-v0135.txt
+          grep -q 'No errors detected' zip-test-v0135.txt
+
+      - name: Commit diagnostic artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add jk-social-hub-v0.13.5.zip jk-social-hub-v0.13.5.zip.sha256 php-lint-v0135.txt zip-test-v0135.txt
+          git commit -m 'Build JK Social Hub v0.13.5 Pinterest diagnostic [skip ci]'
+          git push origin HEAD:jksh-pinterest-fix-20260920
