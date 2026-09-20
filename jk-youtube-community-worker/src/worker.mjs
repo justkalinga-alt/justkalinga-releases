@@ -253,22 +253,77 @@ async function openComposer(page) {
 
 async function attachImages(page, files) {
   if (!files.length) return;
+  if (files.length > 10) throw new Error('community_image_limit_exceeded');
 
-  let input = page.locator('input[type="file"]');
-  if (await input.count() === 0) {
+  const locateInput = async () => {
+    const inputs = page.locator('input[type="file"][accept*="image" i], input[type="file"]');
+    const count = await inputs.count();
+    return count ? inputs.last() : null;
+  };
+
+  const openImagePicker = async () => {
     await clickFirst([
-      page.getByRole('button', { name: /image|photo/i }),
-      page.getByText(/image|photo/i, { exact: true })
+      page.getByRole('button', { name: /add image|image|photo/i }),
+      page.getByText(/^image$/i, { exact: true }),
+      page.locator('[aria-label*="image" i]'),
+      page.locator('[title*="image" i]')
     ]).catch(() => false);
+    await sleep(650);
+  };
 
-    await sleep(800);
-    input = page.locator('input[type="file"]');
+  let input = await locateInput();
+  if (!input) {
+    await openImagePicker();
+    input = await locateInput();
+  }
+  if (!input) throw new Error('community_image_input_not_found');
+
+  const multiple = await input.evaluate(el => !!el.multiple).catch(() => false);
+
+  if (multiple) {
+    log('INFO', 'Uploading Community images', { count: files.length, mode: 'multiple-input' });
+    await input.setInputFiles(files);
+    await sleep(Math.min(18000, 3000 + files.length * 1000));
+    return;
   }
 
-  if (await input.count() === 0) throw new Error('community_image_input_not_found');
+  // Current YouTube desktop Community composer exposes a single-file input
+  // even though image posts support multiple images. Add them one at a time.
+  for (let i = 0; i < files.length; i++) {
+    if (i > 0) {
+      // Reacquire because YouTube may replace the input node after each upload.
+      input = await locateInput();
+      if (!input) {
+        await openImagePicker();
+        input = await locateInput();
+      }
+    }
 
-  await input.first().setInputFiles(files);
-  await sleep(Math.min(15000, 2500 + files.length * 1000));
+    if (!input) {
+      throw new Error('community_image_input_not_found_at_' + (i + 1));
+    }
+
+    log('INFO', 'Uploading Community image', {
+      index: i + 1,
+      total: files.length,
+      file: path.basename(files[i])
+    });
+
+    await input.setInputFiles(files[i]);
+    await sleep(1400);
+
+    // For subsequent images, prefer YouTube's add-image control if it appears.
+    if (i < files.length - 1) {
+      await clickFirst([
+        page.getByRole('button', { name: /add image|add photo|image|photo/i }),
+        page.locator('[aria-label*="add image" i]'),
+        page.locator('[aria-label*="image" i]')
+      ]).catch(() => false);
+      await sleep(450);
+    }
+  }
+
+  await sleep(Math.min(12000, 1800 + files.length * 700));
 }
 
 async function findNewPostUrl(page, before, caption) {
