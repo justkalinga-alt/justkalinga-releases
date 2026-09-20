@@ -1,0 +1,47 @@
+name: Build Pinterest Connector v0.1.5
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - pinterest-connector-src/jk-social-pinterest/jk-social-pinterest.php
+      - .github/workflows/build-pinterest-connector.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+
+      - name: Validate PHP
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -l pinterest-connector-src/jk-social-pinterest/jk-social-pinterest.php | tee pinterest-v015-lint.txt
+          grep -q 'No syntax errors detected' pinterest-v015-lint.txt
+
+      - name: Build connector ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f jk-social-pinterest-v0.1.5.zip jk-social-pinterest-v0.1.5.zip.sha256
+          (cd pinterest-connector-src && zip -qr ../jk-social-pinterest-v0.1.5.zip jk-social-pinterest)
+          sha256sum jk-social-pinterest-v0.1.5.zip | tee jk-social-pinterest-v0.1.5.zip.sha256
+          unzip -t jk-social-pinterest-v0.1.5.zip > pinterest-v015-zip-test.txt
+          grep -q 'No errors detected' pinterest-v015-zip-test.txt
+
+      - name: Commit release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add jk-social-pinterest-v0.1.5.zip jk-social-pinterest-v0.1.5.zip.sha256 pinterest-v015-lint.txt pinterest-v015-zip-test.txt
+          git commit -m 'Build JK Social Pinterest Connector v0.1.5 unified Sandbox UI [skip ci]' || true
+          git push origin HEAD:jksh-pinterest-fix-20260920
