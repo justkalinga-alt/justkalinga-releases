@@ -1,6 +1,6 @@
 {
   "name": "jk-youtube-community-worker",
-  "version": "0.9.3.4",
+  "version": "0.9.3.5",
   "private": true,
   "type": "module",
   "engines": {"node": ">=20"},
