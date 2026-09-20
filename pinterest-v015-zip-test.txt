@@ -1,0 +1,4 @@
+Archive:  jk-social-pinterest-v0.1.5.zip
+    testing: jk-social-pinterest/     OK
+    testing: jk-social-pinterest/jk-social-pinterest.php   OK
+No errors detected in compressed data of jk-social-pinterest-v0.1.5.zip.
