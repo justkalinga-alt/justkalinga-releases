@@ -5,7 +5,7 @@ on:
     branches:
       - jksh-pinterest-fix-20260920
     paths:
-      - .github/workflows/jksh-pinterest-sandbox-proof.yml
+      - .github/workflows/jksh-pinterest-final.yml
 
 permissions:
   contents: write
