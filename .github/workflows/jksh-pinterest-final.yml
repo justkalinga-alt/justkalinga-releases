@@ -1,11 +1,11 @@
-name: Build JKSH Pinterest final fix
+name: Build JKSH Pinterest Sandbox proof mode
 
 on:
   push:
     branches:
       - jksh-pinterest-fix-20260920
     paths:
-      - .github/workflows/jksh-pinterest-final.yml
+      - .github/workflows/jksh-pinterest-sandbox-proof.yml
 
 permissions:
   contents: write
@@ -18,51 +18,293 @@ jobs:
         with:
           ref: jksh-pinterest-fix-20260920
 
-      - name: Fetch verified v0.13.6 base
+      - name: Fetch verified v0.13.7 base
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.6.zip' -o base.zip
-          echo '685d4f83ddc8d9a393fe5a4c9a6eaf423bf456af55b46b22c5a077ac27147dc9  base.zip' | sha256sum -c -
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.7.zip' -o base.zip
+          echo '5d4aa638e71dc8e8bb69bcc7632e6ac9da82207a607283c3fdbd25bbda0677ba  base.zip' | sha256sum -c -
           rm -rf build && mkdir build
           unzip -q base.zip -d build
+          test -f build/jk-social-hub/jk-social-hub.php
+          test -f build/jk-social-hub/includes/class-jksh-content-library-v091.php
 
-      - name: Add Pinterest Trial sandbox routing
+      - name: Add secure Pinterest Sandbox proof mode
         shell: bash
         run: |
           set -euo pipefail
-          cat > build/jk-social-hub/includes/class-jksh-pinterest-sandbox-v0137.php <<'PHP'
+          cat > build/jk-social-hub/includes/class-jksh-pinterest-sandbox-v0138.php <<'PHP'
           <?php
           if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-          final class JKSH_Pinterest_Sandbox_V0137 {
-              public static function init(): void {
-                  add_filter( 'pre_http_request', [ __CLASS__, 'route_trial_api' ], 5, 3 );
+          final class JKSH_Pinterest_Sandbox_V0138 {
+              private const PLATFORM = 'pinterest_sandbox';
+              private const API_HOST = 'https://api-sandbox.pinterest.com/v5';
+              private const BOARD_NAME = 'JustKalinga Sandbox Proof';
+              private static $instance = null;
+              private $request_active = false;
+
+              public static function instance() {
+                  if ( ! self::$instance ) { self::$instance = new self(); }
+                  return self::$instance;
               }
 
-              public static function route_trial_api( $preempt, array $args, string $url ) {
-                  if ( false !== $preempt ) {
-                      return $preempt;
+              private function __construct() {
+                  add_action( 'admin_post_jksh_pinterest_sandbox_save', [ $this, 'save_token' ] );
+                  add_action( 'admin_post_jksh_pinterest_sandbox_disconnect', [ $this, 'disconnect' ] );
+                  add_action( 'admin_footer', [ $this, 'admin_footer' ], 900 );
+                  add_action( 'rest_api_init', [ $this, 'register_routes' ] );
+                  add_filter( 'pre_http_request', [ $this, 'route_request' ], 4, 3 );
+                  add_action( 'shutdown', [ $this, 'reconcile_recent_published' ], 90 );
+              }
+
+              private function repo() {
+                  return new \JKSH\Repositories\AccountRepository();
+              }
+
+              private function can_manage() {
+                  return current_user_can( 'jksh_manage_accounts' ) || current_user_can( 'manage_options' );
+              }
+
+              private function account() {
+                  $rows = $this->repo()->connected( self::PLATFORM );
+                  return $rows ? $rows[0] : null;
+              }
+
+              private function account_data() {
+                  $account = $this->account();
+                  if ( ! $account ) { return [ null, [], [] ]; }
+                  return [ $account, $this->repo()->settings( $account ), $this->repo()->credentials( $account ) ];
+              }
+
+              public function readiness() {
+                  [ $account, $settings, $credentials ] = $this->account_data();
+                  $connected = $account && ! empty( $credentials['access_token'] ) && ! empty( $settings['board_id'] );
+                  return [
+                      'ok' => true,
+                      'environment' => 'sandbox',
+                      'connected' => (bool) $connected,
+                      'profile' => $account ? (string) $account->account_name : '',
+                      'external_account_id' => $account ? (string) $account->external_account_id : '',
+                      'board_id' => (string) ( $settings['board_id'] ?? '' ),
+                      'board_name' => (string) ( $settings['board_name'] ?? '' ),
+                      'token_expires_at_utc' => $account ? (string) ( $account->token_expires_at ?? '' ) : '',
+                      'image_pins_supported' => true,
+                      'video_pins_supported' => false,
+                      'publisher_label' => $connected ? 'Sandbox Published' : 'Sandbox not connected',
+                      'token_present' => ! empty( $credentials['access_token'] ),
+                  ];
+              }
+
+              public function register_routes() {
+                  register_rest_route( 'jksh/v1', '/pinterest/sandbox/readiness', [
+                      'methods' => 'GET',
+                      'callback' => function () { return rest_ensure_response( $this->readiness() ); },
+                      'permission_callback' => [ $this, 'can_manage' ],
+                  ] );
+                  register_rest_route( 'jksh/v1', '/pinterest/sandbox/boards', [
+                      'methods' => 'GET',
+                      'callback' => [ $this, 'rest_boards' ],
+                      'permission_callback' => [ $this, 'can_manage' ],
+                  ] );
+              }
+
+              public function rest_boards() {
+                  [ $account, $settings, $credentials ] = $this->account_data();
+                  if ( ! $account || empty( $credentials['access_token'] ) ) {
+                      return new WP_Error( 'jksh_pinterest_sandbox_not_connected', 'Pinterest Sandbox is not connected.', [ 'status' => 409 ] );
                   }
-                  if ( ! class_exists( 'JKSH_Pinterest_Connector' ) ) {
-                      return $preempt;
+                  $result = $this->api_request( (string) $credentials['access_token'], 'GET', '/boards?page_size=100' );
+                  if ( ! $result['ok'] ) {
+                      return new WP_Error( 'jksh_pinterest_sandbox_boards', $result['message'], [ 'status' => 502 ] );
                   }
-                  if ( 0 !== strpos( $url, 'https://api.pinterest.com/' ) ) {
-                      return $preempt;
+                  return rest_ensure_response( [
+                      'ok' => true,
+                      'environment' => 'sandbox',
+                      'items' => is_array( $result['data']['items'] ?? null ) ? $result['data']['items'] : [],
+                      'selected_board_id' => (string) ( $settings['board_id'] ?? '' ),
+                  ] );
+              }
+
+              public function save_token() {
+                  if ( ! $this->can_manage() ) { wp_die( 'Not allowed.' ); }
+                  check_admin_referer( 'jksh_pinterest_sandbox_save' );
+
+                  $token = trim( (string) wp_unslash( $_POST['sandbox_token'] ?? '' ) );
+                  if ( '' === $token ) {
+                      $this->redirect( 'error', 'Pinterest Sandbox token is required.' );
                   }
 
-                  $readiness = JKSH_Pinterest_Connector::instance()->readiness();
-                  if ( empty( $readiness['configured'] ) || empty( $readiness['api_access_confirmed'] ) ) {
+                  $profile = $this->api_request( $token, 'GET', '/user_account' );
+                  if ( ! $profile['ok'] ) {
+                      $this->redirect( 'error', 'Pinterest Sandbox token verification failed: ' . $profile['message'] );
+                  }
+
+                  $boards = $this->api_request( $token, 'GET', '/boards?page_size=100' );
+                  if ( ! $boards['ok'] ) {
+                      $this->redirect( 'error', 'Pinterest Sandbox board discovery failed: ' . $boards['message'] );
+                  }
+
+                  $items = is_array( $boards['data']['items'] ?? null ) ? $boards['data']['items'] : [];
+                  $board = null;
+                  foreach ( $items as $item ) {
+                      if ( self::BOARD_NAME === (string) ( $item['name'] ?? '' ) ) {
+                          $board = $item;
+                          break;
+                      }
+                  }
+
+                  if ( ! $board ) {
+                      $created = $this->api_request(
+                          $token,
+                          'POST',
+                          '/boards',
+                          [
+                              'name' => self::BOARD_NAME,
+                              'description' => 'Private Pinterest API Sandbox proof board for JustKalinga Standard Access review.',
+                              'privacy' => 'PUBLIC',
+                          ]
+                      );
+                      if ( $created['ok'] && ! empty( $created['data']['id'] ) ) {
+                          $board = $created['data'];
+                      }
+                  }
+
+                  if ( ! $board && $items ) {
+                      $board = $items[0];
+                  }
+
+                  if ( ! $board || empty( $board['id'] ) ) {
+                      $this->redirect( 'error', 'Pinterest Sandbox is connected, but no usable board could be created or discovered.' );
+                  }
+
+                  $username = sanitize_text_field( (string) ( $profile['data']['username'] ?? '' ) );
+                  $profile_id = sanitize_text_field( (string) ( $profile['data']['id'] ?? $username ?: 'sandbox' ) );
+                  $account_name = $username ? '@' . $username . ' · Sandbox' : 'Pinterest Sandbox';
+
+                  $this->repo()->upsert( [
+                      'platform' => self::PLATFORM,
+                      'account_name' => $account_name,
+                      'external_account_id' => $profile_id,
+                      'status' => 'connected',
+                      'settings' => [
+                          'environment' => 'sandbox',
+                          'username' => $username,
+                          'board_id' => sanitize_text_field( (string) $board['id'] ),
+                          'board_name' => sanitize_text_field( (string) ( $board['name'] ?? self::BOARD_NAME ) ),
+                          'verified_at_utc' => current_time( 'mysql', true ),
+                          'proof_mode' => true,
+                          'image_pins_supported' => true,
+                          'video_pins_supported' => false,
+                      ],
+                      'credentials' => [
+                          'access_token' => $token,
+                      ],
+                      'token_expires_at' => gmdate( 'Y-m-d H:i:s', time() + DAY_IN_SECONDS * 30 ),
+                      'last_checked_at' => current_time( 'mysql', true ),
+                      'last_error' => '',
+                  ] );
+
+                  $this->redirect( 'success', 'Pinterest Sandbox connected securely. Image Pins can now publish as Sandbox Published.' );
+              }
+
+              public function disconnect() {
+                  if ( ! $this->can_manage() ) { wp_die( 'Not allowed.' ); }
+                  check_admin_referer( 'jksh_pinterest_sandbox_disconnect' );
+                  $account = $this->account();
+                  if ( $account ) {
+                      $this->repo()->disconnect( (int) $account->id );
+                  }
+                  $this->redirect( 'success', 'Pinterest Sandbox disconnected locally. Production Pinterest was not changed.' );
+              }
+
+              private function redirect( $type, $message ) {
+                  wp_safe_redirect(
+                      add_query_arg(
+                          [
+                              'page' => 'jksh-accounts',
+                              'jksh_notice' => sanitize_key( $type ),
+                              'jksh_msg' => $message,
+                          ],
+                          admin_url( 'admin.php' )
+                      ) . '#account-pinterest'
+                  );
+                  exit;
+              }
+
+              private function api_request( $token, $method, $path, $body = null ) {
+                  $args = [
+                      'method' => strtoupper( (string) $method ),
+                      'timeout' => 30,
+                      'headers' => [
+                          'Authorization' => 'Bearer ' . $token,
+                          'Content-Type' => 'application/json',
+                          'Accept' => 'application/json',
+                      ],
+                  ];
+                  if ( null !== $body ) {
+                      $args['body'] = wp_json_encode( $body );
+                  }
+                  $response = wp_remote_request( self::API_HOST . $path, $args );
+                  if ( is_wp_error( $response ) ) {
+                      return [ 'ok' => false, 'message' => $response->get_error_message(), 'data' => [] ];
+                  }
+                  $code = (int) wp_remote_retrieve_response_code( $response );
+                  $raw = (string) wp_remote_retrieve_body( $response );
+                  $data = json_decode( $raw, true );
+                  $data = is_array( $data ) ? $data : [];
+                  $message = sanitize_text_field( (string) ( $data['message'] ?? $data['error']['message'] ?? $raw ) );
+                  return [
+                      'ok' => $code >= 200 && $code < 300,
+                      'code' => $code,
+                      'message' => $message ?: ( $code >= 200 && $code < 300 ? 'OK' : 'Pinterest Sandbox API request failed.' ),
+                      'data' => $data,
+                  ];
+              }
+
+              private function replace_authorization( array $args, $token ) {
+                  $headers = is_array( $args['headers'] ?? null ) ? $args['headers'] : [];
+                  $headers['Authorization'] = 'Bearer ' . $token;
+                  $headers['Content-Type'] = $headers['Content-Type'] ?? 'application/json';
+                  $headers['Accept'] = $headers['Accept'] ?? 'application/json';
+                  $args['headers'] = $headers;
+                  return $args;
+              }
+
+              private function replace_board_in_body( array $args, $board_id ) {
+                  if ( empty( $args['body'] ) || ! is_string( $args['body'] ) ) {
+                      return $args;
+                  }
+                  $data = json_decode( $args['body'], true );
+                  if ( is_array( $data ) ) {
+                      $data['board_id'] = (string) $board_id;
+                      $args['body'] = wp_json_encode( $data );
+                  }
+                  return $args;
+              }
+
+              public function route_request( $preempt, array $args, string $url ) {
+                  if ( false !== $preempt ) { return $preempt; }
+                  if ( 0 !== strpos( $url, 'https://api.pinterest.com/' ) ) { return $preempt; }
+
+                  [ $account, $settings, $credentials ] = $this->account_data();
+                  if ( ! $account || empty( $credentials['access_token'] ) || empty( $settings['board_id'] ) ) {
                       return $preempt;
                   }
 
                   $method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
-                  if ( ! in_array( $method, [ 'POST', 'PUT', 'PATCH', 'DELETE' ], true ) ) {
-                      return $preempt;
+                  $path = wp_parse_url( $url, PHP_URL_PATH );
+                  $path = is_string( $path ) ? $path : '';
+
+                  if ( in_array( $method, [ 'POST', 'PUT', 'PATCH' ], true ) && false !== strpos( $path, '/media' ) ) {
+                      return new WP_Error(
+                          'jksh_pinterest_sandbox_video_unsupported',
+                          'Pinterest Sandbox supports image Pins only. Video Pins require Standard API access.'
+                      );
                   }
 
                   $sandbox_url = preg_replace(
-                      '#^https://api\\.pinterest\\.com/#',
+                      '#^https://api\.pinterest\.com/#',
                       'https://api-sandbox.pinterest.com/',
                       $url,
                       1
@@ -71,56 +313,255 @@ jobs:
                       return $preempt;
                   }
 
-                  remove_filter( 'pre_http_request', [ __CLASS__, 'route_trial_api' ], 5 );
+                  $args = $this->replace_authorization( $args, (string) $credentials['access_token'] );
+                  if ( 'POST' === $method && false !== strpos( $path, '/pins' ) ) {
+                      $args = $this->replace_board_in_body( $args, (string) $settings['board_id'] );
+                  }
+
+                  remove_filter( 'pre_http_request', [ $this, 'route_request' ], 4 );
                   try {
                       return wp_remote_request( $sandbox_url, $args );
                   } finally {
-                      add_filter( 'pre_http_request', [ __CLASS__, 'route_trial_api' ], 5, 3 );
+                      add_filter( 'pre_http_request', [ $this, 'route_request' ], 4, 3 );
                   }
+              }
+
+              public function reconcile_recent_published() {
+                  $ready = $this->readiness();
+                  if ( empty( $ready['connected'] ) ) { return; }
+
+                  global $wpdb;
+                  $jobs = $wpdb->prefix . 'jksh_jobs';
+                  $variants = $wpdb->prefix . 'jksh_variants';
+                  $logs = $wpdb->prefix . 'jksh_publish_logs';
+                  $since = gmdate( 'Y-m-d H:i:s', time() - HOUR_IN_SECONDS * 12 );
+
+                  $rows = $wpdb->get_results(
+                      $wpdb->prepare(
+                          "SELECT j.id job_id,j.content_id,j.variant_id,j.last_response_json,j.completed_at,
+                                  v.status variant_status,v.fields_json,v.external_id,v.external_url
+                           FROM {$jobs} j
+                           INNER JOIN {$variants} v ON v.id=j.variant_id
+                           WHERE j.platform='pinterest' AND j.status='published' AND j.completed_at >= %s
+                           ORDER BY j.id DESC LIMIT 30",
+                          $since
+                      ),
+                      ARRAY_A
+                  );
+
+                  foreach ( (array) $rows as $row ) {
+                      $fields = json_decode( (string) ( $row['fields_json'] ?? '{}' ), true );
+                      $fields = is_array( $fields ) ? $fields : [];
+                      if ( ! empty( $fields['sandbox_published'] ) ) { continue; }
+
+                      $pin_id = sanitize_text_field( (string) ( $row['external_id'] ?? '' ) );
+                      $pin_url = esc_url_raw( (string) ( $row['external_url'] ?? '' ) );
+                      if ( '' === $pin_url && '' !== $pin_id ) {
+                          $pin_url = 'https://www.pinterest.com/pin/' . rawurlencode( $pin_id ) . '/';
+                      }
+
+                      $fields['jksh_environment'] = 'sandbox';
+                      $fields['sandbox_published'] = true;
+                      $fields['sandbox_pin_id'] = $pin_id;
+                      $fields['sandbox_pin_url'] = $pin_url;
+                      $fields['sandbox_board_id'] = (string) $ready['board_id'];
+                      $fields['sandbox_board_name'] = (string) $ready['board_name'];
+                      $fields['sandbox_published_at_utc'] = (string) ( $row['completed_at'] ?? current_time( 'mysql', true ) );
+
+                      $update = [ 'fields_json' => wp_json_encode( $fields ), 'updated_at' => current_time( 'mysql', true ) ];
+                      if ( $pin_url ) { $update['external_url'] = $pin_url; }
+                      $wpdb->update( $variants, $update, [ 'id' => (int) $row['variant_id'] ] );
+
+                      $response = json_decode( (string) ( $row['last_response_json'] ?? '{}' ), true );
+                      $response = is_array( $response ) ? $response : [];
+                      $response['environment'] = 'sandbox';
+                      $response['sandbox_published'] = true;
+                      $response['sandbox_pin_id'] = $pin_id;
+                      $response['sandbox_pin_url'] = $pin_url;
+                      $wpdb->update(
+                          $jobs,
+                          [ 'last_response_json' => wp_json_encode( $response ) ],
+                          [ 'id' => (int) $row['job_id'] ]
+                      );
+
+                      $exists = (int) $wpdb->get_var(
+                          $wpdb->prepare(
+                              "SELECT COUNT(*) FROM {$logs} WHERE job_id=%d AND action='pinterest_sandbox_published'",
+                              (int) $row['job_id']
+                          )
+                      );
+                      if ( ! $exists ) {
+                          $wpdb->insert(
+                              $logs,
+                              [
+                                  'job_id' => (int) $row['job_id'],
+                                  'content_id' => (int) $row['content_id'],
+                                  'variant_id' => (int) $row['variant_id'],
+                                  'user_id' => get_current_user_id(),
+                                  'action' => 'pinterest_sandbox_published',
+                                  'result' => 'success',
+                                  'external_id' => $pin_id,
+                                  'external_url' => $pin_url,
+                                  'message' => 'Pinterest image Pin published successfully to the API Sandbox environment.',
+                                  'context_json' => wp_json_encode( [
+                                      'environment' => 'sandbox',
+                                      'board_id' => (string) $ready['board_id'],
+                                      'status_label' => 'Sandbox Published',
+                                  ] ),
+                                  'created_at' => current_time( 'mysql', true ),
+                              ]
+                          );
+                      }
+                  }
+              }
+
+              public function admin_footer() {
+                  if ( ! is_admin() || 'jksh-accounts' !== sanitize_key( (string) ( $_GET['page'] ?? '' ) ) ) {
+                      return;
+                  }
+                  $ready = $this->readiness();
+                  ?>
+                  <section id="jksh-pinterest-sandbox-v0138" class="jksh-card">
+                      <h2>Pinterest Sandbox <span class="jksh-badge <?php echo ! empty( $ready['connected'] ) ? 'status-connected' : 'status-not_connected'; ?>"><?php echo ! empty( $ready['connected'] ) ? 'Connected' : 'Not connected'; ?></span></h2>
+                      <p><strong>Standard Access proof mode.</strong> This is a separate encrypted Sandbox credential lane. Your production Pinterest OAuth connection is not modified.</p>
+                      <p class="description">Sandbox supports image Pins only. Successful image Pins are recorded in Content Library as <strong>Sandbox Published</strong> with their Pin ID and Open link. Video Pins remain blocked until Pinterest grants Standard API access.</p>
+                      <?php if ( ! empty( $ready['connected'] ) ) : ?>
+                          <table class="widefat striped">
+                              <tbody>
+                                  <tr><th>Profile</th><td><?php echo esc_html( $ready['profile'] ); ?></td></tr>
+                                  <tr><th>Environment</th><td><strong>Sandbox</strong></td></tr>
+                                  <tr><th>Proof board</th><td><?php echo esc_html( $ready['board_name'] ); ?><br><code><?php echo esc_html( $ready['board_id'] ); ?></code></td></tr>
+                                  <tr><th>Token expiry</th><td><?php echo esc_html( $ready['token_expires_at_utc'] ?: 'Not reported' ); ?> UTC</td></tr>
+                              </tbody>
+                          </table>
+                          <p><span class="jksh-badge status-connected">Ready for image proof Pins</span></p>
+                          <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" onsubmit="return confirm('Disconnect only the Pinterest Sandbox token? Production Pinterest will remain untouched.');">
+                              <input type="hidden" name="action" value="jksh_pinterest_sandbox_disconnect">
+                              <?php wp_nonce_field( 'jksh_pinterest_sandbox_disconnect' ); ?>
+                              <button class="button button-link-delete">Disconnect Sandbox</button>
+                          </form>
+                      <?php else : ?>
+                          <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="jksh-form">
+                              <input type="hidden" name="action" value="jksh_pinterest_sandbox_save">
+                              <?php wp_nonce_field( 'jksh_pinterest_sandbox_save' ); ?>
+                              <label>
+                                  <span>Sandbox access token</span>
+                                  <input type="password" name="sandbox_token" value="" autocomplete="new-password" required>
+                              </label>
+                              <p class="description">Paste the token generated from Pinterest → Generate Access Tokens → Sandbox. It is encrypted in the JK Social account vault and is never shown again.</p>
+                              <button class="button button-primary">Save & verify Sandbox token</button>
+                          </form>
+                      <?php endif; ?>
+                  </section>
+                  <?php
               }
           }
 
-          JKSH_Pinterest_Sandbox_V0137::init();
+          JKSH_Pinterest_Sandbox_V0138::instance();
           PHP
 
           python3 - <<'PY'
           from pathlib import Path
-          p=Path('build/jk-social-hub/jk-social-hub.php')
-          s=p.read_text()
-          s=s.replace(" * Version:     0.13.6"," * Version:     0.13.7",1)
-          s=s.replace("define( 'JKSH_VERSION', '0.13.6' );","define( 'JKSH_VERSION', '0.13.7' );",1)
-          old=" * Description: Internal social-media operating system for JustKalinga. v0.13.6 completes guarded native Pinterest publishing and accurate blocked-job Library state."
-          new=" * Description: Internal social-media operating system for JustKalinga. v0.13.7 routes Pinterest Trial API writes through the official sandbox endpoint."
-          if old in s:
-              s=s.replace(old,new,1)
-          marker="// JKSH_V0133_ACCOUNTS_UI"
-          insert="""// JKSH_V0137_PINTEREST_SANDBOX
-          $jksh_v0137_pinterest_sandbox = __DIR__ . '/includes/class-jksh-pinterest-sandbox-v0137.php';
-          if ( is_readable( $jksh_v0137_pinterest_sandbox ) ) { require_once $jksh_v0137_pinterest_sandbox; }
 
-          """
-          if marker not in s:
-              raise SystemExit('Loader marker missing')
-          s=s.replace(marker,insert+marker,1)
-          p.write_text(s)
+          root = Path('build/jk-social-hub')
+          main = root / 'jk-social-hub.php'
+          lib = root / 'includes/class-jksh-content-library-v091.php'
+
+          s = main.read_text()
+          replacements = [
+              (" * Version:     0.13.7", " * Version:     0.13.8"),
+              ("define( 'JKSH_VERSION', '0.13.7' );", "define( 'JKSH_VERSION', '0.13.8' );"),
+              (
+                  " * Description: Internal social-media operating system for JustKalinga. v0.13.7 routes Pinterest Trial API writes through the official sandbox endpoint.",
+                  " * Description: Internal social-media operating system for JustKalinga. v0.13.8 adds a secure Pinterest Sandbox proof lane with encrypted token storage and Sandbox Published receipts."
+              ),
+          ]
+          for old,new in replacements:
+              if old not in s:
+                  raise SystemExit(f'Missing main pattern: {old}')
+              s = s.replace(old,new,1)
+
+          old = """// JKSH_V0137_PINTEREST_SANDBOX
+          $jksh_v0137_pinterest_sandbox = __DIR__ . '/includes/class-jksh-pinterest-sandbox-v0137.php';
+          if ( is_readable( $jksh_v0137_pinterest_sandbox ) ) { require_once $jksh_v0137_pinterest_sandbox; }"""
+          new = """// JKSH_V0138_PINTEREST_SANDBOX
+          $jksh_v0138_pinterest_sandbox = __DIR__ . '/includes/class-jksh-pinterest-sandbox-v0138.php';
+          if ( is_readable( $jksh_v0138_pinterest_sandbox ) ) { require_once $jksh_v0138_pinterest_sandbox; }"""
+          if old not in s:
+              raise SystemExit('Missing v0.13.7 sandbox loader')
+          s = s.replace(old,new,1)
+          main.write_text(s)
+
+          s = lib.read_text()
+          old = "$published = false; $queued = false; $failed = false; $cancelled = false; $community = false;"
+          new = "$published = false; $sandbox_published = false; $queued = false; $failed = false; $cancelled = false; $community = false;"
+          if old not in s:
+              raise SystemExit('Missing state init')
+          s = s.replace(old,new,1)
+
+          old = """        foreach ($variants as $v) {
+                      $s = strtolower((string)$v['status']);
+                      if ($s === 'published') $published = true;"""
+          new = """        foreach ($variants as $v) {
+                      $s = strtolower((string)$v['status']);
+                      if ($s === 'published') $published = true;
+                      $vf = json_decode((string)($v['fields_json'] ?? '{}'), true);
+                      if ($s === 'published' && is_array($vf) && !empty($vf['sandbox_published'])) $sandbox_published = true;"""
+          if old not in s:
+              raise SystemExit('Missing variants state loop')
+          s = s.replace(old,new,1)
+
+          old = """        if ($failed) $state = 'Needs attention';
+                  elseif ($published && $queued) $state = 'Part published';
+                  elseif ($published) $state = 'Published';"""
+          new = """        if ($failed) $state = 'Needs attention';
+                  elseif ($published && $queued) $state = 'Part published';
+                  elseif ($sandbox_published) $state = 'Sandbox Published';
+                  elseif ($published) $state = 'Published';"""
+          if old not in s:
+              raise SystemExit('Missing state decision block')
+          s = s.replace(old,new,1)
+
+          old = "foreach(['Uploaded','Scheduled','Published','Part published','Community ready','Needs attention','Cancelled','Draft'] as $x)"
+          new = "foreach(['Uploaded','Scheduled','Published','Sandbox Published','Part published','Community ready','Needs attention','Cancelled','Draft'] as $x)"
+          if old not in s:
+              raise SystemExit('Missing filter list')
+          s = s.replace(old,new,1)
+
+          old = ".state-published{background:#dcfae6;color:#067647}"
+          new = ".state-published,.state-sandbox-published{background:#dcfae6;color:#067647}"
+          if old not in s:
+              raise SystemExit('Missing published CSS')
+          s = s.replace(old,new,1)
+
+          lib.write_text(s)
           PY
 
-      - name: Validate and package
+          rm -f build/jk-social-hub/includes/class-jksh-pinterest-sandbox-v0137.php
+
+      - name: Validate PHP
         shell: bash
         run: |
           set -euo pipefail
-          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0137.txt
-          (cd build && zip -qr ../jk-social-hub-v0.13.7.zip jk-social-hub)
-          sha256sum jk-social-hub-v0.13.7.zip | tee jk-social-hub-v0.13.7.zip.sha256
-          unzip -t jk-social-hub-v0.13.7.zip > zip-test-v0137.txt
-          grep -q 'No errors detected' zip-test-v0137.txt
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0138.txt
+          grep -q 'No syntax errors detected' php-lint-v0138.txt
 
-      - name: Commit release artifact
+      - name: Package v0.13.8
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f jk-social-hub-v0.13.8.zip jk-social-hub-v0.13.8.zip.sha256
+          (cd build && zip -qr ../jk-social-hub-v0.13.8.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.8.zip | tee jk-social-hub-v0.13.8.zip.sha256
+          unzip -t jk-social-hub-v0.13.8.zip > zip-test-v0138.txt
+          grep -q 'No errors detected' zip-test-v0138.txt
+
+      - name: Commit release
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'JK Social Build Bot'
           git config user.email 'justkalinga@gmail.com'
-          git add jk-social-hub-v0.13.7.zip jk-social-hub-v0.13.7.zip.sha256 php-lint-v0137.txt zip-test-v0137.txt
-          git commit -m 'Build JK Social Hub v0.13.7 Pinterest Trial sandbox routing [skip ci]'
+          git add jk-social-hub-v0.13.8.zip jk-social-hub-v0.13.8.zip.sha256 php-lint-v0138.txt zip-test-v0138.txt
+          git commit -m 'Build JK Social Hub v0.13.8 Pinterest Sandbox proof mode [skip ci]'
           git push origin HEAD:jksh-pinterest-fix-20260920
