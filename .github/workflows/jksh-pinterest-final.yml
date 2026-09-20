@@ -1,0 +1,104 @@
+name: Build JKSH Pinterest final fix
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - .github/workflows/jksh-pinterest-final.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+
+      - name: Fetch verified v0.13.5 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.5.zip' -o base.zip
+          echo '8c39dc1ac4eb78f7ecacd0be4c94242d7df363df8455b5b41850b42cc0bf49e2  base.zip' | sha256sum -c -
+          rm -rf build && mkdir build
+          unzip -q base.zip -d build
+
+      - name: Fix captured publish mode hydration and remove diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root=Path('build/jk-social-hub')
+          main=root/'jk-social-hub.php'
+          repo=root/'src/Repositories/JobRepository.php'
+          diagnostic=root/'includes/class-jksh-pinterest-diagnostic-v0135.php'
+
+          s=main.read_text()
+          s=s.replace(" * Version:     0.13.5"," * Version:     0.13.6",1)
+          s=s.replace("define( 'JKSH_VERSION', '0.13.5' );","define( 'JKSH_VERSION', '0.13.6' );",1)
+
+          block="""// JKSH_V0135_PINTEREST_DIAGNOSTIC
+          $jksh_v0135_pinterest_diagnostic = __DIR__ . '/includes/class-jksh-pinterest-diagnostic-v0135.php';
+          if ( is_readable( $jksh_v0135_pinterest_diagnostic ) ) { require_once $jksh_v0135_pinterest_diagnostic; }
+
+          """
+          if block not in s:
+              raise SystemExit('Diagnostic loader block missing')
+          s=s.replace(block,'',1)
+          old_desc=" * Description: Internal social-media operating system for JustKalinga. v0.13.4 adds guarded native Pinterest dispatch and accurate blocked-job Library state."
+          new_desc=" * Description: Internal social-media operating system for JustKalinga. v0.13.6 completes guarded native Pinterest publishing and accurate blocked-job Library state."
+          if old_desc in s:
+              s=s.replace(old_desc,new_desc,1)
+          main.write_text(s)
+
+          if diagnostic.exists():
+              diagnostic.unlink()
+
+          s=repo.read_text()
+          old="""\tpublic function get( int $id ): ?object {
+          \t\tglobal $wpdb;
+          \t\treturn $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$this->table} WHERE id = %d", $id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+          \t}"""
+          new="""\tpublic function get( int $id ): ?object {
+          \t\tglobal $wpdb;
+          \t\t$row = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$this->table} WHERE id = %d", $id ) ); // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+          \t\tif ( $row ) {
+          \t\t\t$payload = json_decode( (string) ( $row->payload_json ?? '{}' ), true );
+          \t\t\t$payload = is_array( $payload ) ? $payload : array();
+          \t\t\t// publish_mode is intentionally captured inside payload_json, not a DB column.
+          \t\t\t// Hydrate it for platform connectors that consume the repository object directly.
+          \t\t\t$row->publish_mode = sanitize_key( (string) ( $payload['publish_mode'] ?? ( ! empty( $payload['dry_run'] ) ? 'dry_run' : 'dry_run' ) ) );
+          \t\t}
+          \t\treturn $row;
+          \t}"""
+          if old not in s:
+              raise SystemExit('JobRepository get() pattern missing')
+          s=s.replace(old,new,1)
+          repo.write_text(s)
+          PY
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0136.txt
+          (cd build && zip -qr ../jk-social-hub-v0.13.6.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.6.zip | tee jk-social-hub-v0.13.6.zip.sha256
+          unzip -t jk-social-hub-v0.13.6.zip > zip-test-v0136.txt
+          grep -q 'No errors detected' zip-test-v0136.txt
+
+      - name: Commit final artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add jk-social-hub-v0.13.6.zip jk-social-hub-v0.13.6.zip.sha256 php-lint-v0136.txt zip-test-v0136.txt
+          git commit -m 'Build JK Social Hub v0.13.6 Pinterest live-mode hydration fix [skip ci]'
+          git push origin HEAD:jksh-pinterest-fix-20260920
