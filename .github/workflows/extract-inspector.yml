@@ -1,0 +1,36 @@
+name: Extract JKSH inspector source
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - .github/workflows/extract-inspector.yml
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+      - name: Extract inspector plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf inspector-src
+          mkdir inspector-src
+          unzip -q jksh-ui-inspector-v0.1.0.zip -d inspector-src
+          find inspector-src -type f -maxdepth 3 -print
+      - name: Commit extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add inspector-src
+          git commit -m 'Extract JKSH UI inspector source [skip ci]'
+          git push origin HEAD:jksh-pinterest-fix-20260920
