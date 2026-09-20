@@ -1,4 +1,4 @@
-name: Build JKSH Pinterest Sandbox inline-card fix
+name: Build JKSH Pinterest inline markup fix
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - jksh-pinterest-fix-20260920
     paths:
       - .github/workflows/jksh-pinterest-final.yml
-      - scripts/patch_v01315.py
+      - scripts/patch_v01316.py
 
 permissions:
   contents: write
@@ -19,30 +19,30 @@ jobs:
         with:
           ref: jksh-pinterest-fix-20260920
 
-      - name: Fetch verified v0.13.14 base
+      - name: Fetch verified v0.13.15 base
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.14.zip' -o base.zip
-          echo 'fb6119d06320dbd515f3a6d8e34671cc987a896a15be8303b016eeffc1fd5282  base.zip' | sha256sum -c -
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.15.zip' -o base.zip
+          echo 'd01f8b763be835de51ea8056b8f93c9eb2ff91093d3a02afb1e1af55b45d1fd4  base.zip' | sha256sum -c -
           rm -rf build
           mkdir build
           unzip -q base.zip -d build
 
-      - name: Apply inline-card patch
-        run: python3 scripts/patch_v01315.py
+      - name: Apply markup fix
+        run: python3 scripts/patch_v01316.py
 
       - name: Validate and package
         shell: bash
         run: |
           set -euo pipefail
-          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v01315.txt
-          grep -q 'No syntax errors detected' php-lint-v01315.txt
-          rm -f jk-social-hub-v0.13.15.zip jk-social-hub-v0.13.15.zip.sha256
-          (cd build && zip -qr ../jk-social-hub-v0.13.15.zip jk-social-hub)
-          sha256sum jk-social-hub-v0.13.15.zip | tee jk-social-hub-v0.13.15.zip.sha256
-          unzip -t jk-social-hub-v0.13.15.zip > zip-test-v01315.txt
-          grep -q 'No errors detected' zip-test-v01315.txt
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v01316.txt
+          grep -q 'No syntax errors detected' php-lint-v01316.txt
+          rm -f jk-social-hub-v0.13.16.zip jk-social-hub-v0.13.16.zip.sha256
+          (cd build && zip -qr ../jk-social-hub-v0.13.16.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.16.zip | tee jk-social-hub-v0.13.16.zip.sha256
+          unzip -t jk-social-hub-v0.13.16.zip > zip-test-v01316.txt
+          grep -q 'No errors detected' zip-test-v01316.txt
 
       - name: Commit release
         shell: bash
@@ -50,6 +50,6 @@ jobs:
           set -euo pipefail
           git config user.name 'JK Social Build Bot'
           git config user.email 'justkalinga@gmail.com'
-          git add jk-social-hub-v0.13.15.zip jk-social-hub-v0.13.15.zip.sha256 php-lint-v01315.txt zip-test-v01315.txt
-          git commit -m 'Build JK Social Hub v0.13.15 inline Pinterest Sandbox controls [skip ci]' || true
+          git add jk-social-hub-v0.13.16.zip jk-social-hub-v0.13.16.zip.sha256 php-lint-v01316.txt zip-test-v01316.txt
+          git commit -m 'Build JK Social Hub v0.13.16 Pinterest inline markup fix [skip ci]' || true
           git push origin HEAD:jksh-pinterest-fix-20260920
