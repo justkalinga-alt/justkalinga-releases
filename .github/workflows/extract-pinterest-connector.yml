@@ -1,0 +1,39 @@
+name: Extract Pinterest connector v0.1.4
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - .github/workflows/extract-pinterest-connector.yml
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+
+      - name: Fetch exact live connector package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf pinterest-connector-src
+          mkdir -p pinterest-connector-src
+          curl -fL --retry 3 --retry-delay 2 'https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-pinterest-v0.1.4.zip' -o pinterest-v0.1.4.zip
+          unzip -q pinterest-v0.1.4.zip -d pinterest-connector-src
+          find pinterest-connector-src -maxdepth 4 -type f -print
+
+      - name: Commit extracted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add pinterest-connector-src
+          git commit -m 'Extract live JK Social Pinterest Connector v0.1.4 [skip ci]' || true
+          git push origin HEAD:jksh-pinterest-fix-20260920
