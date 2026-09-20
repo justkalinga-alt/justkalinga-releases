@@ -192,26 +192,58 @@ async function ensureLoggedIn(page) {
 }
 
 async function openComposer(page) {
-  await clickFirst([
+  const findEditor = async () => {
+    const editors = [
+      page.locator('ytd-backstage-post-dialog-renderer [contenteditable="true"]'),
+      page.locator('[role="dialog"] [contenteditable="true"]'),
+      page.locator('div[role="textbox"][contenteditable="true"]'),
+      page.locator('[contenteditable="true"]'),
+      page.getByRole('textbox'),
+      page.locator('textarea')
+    ];
+
+    for (const locator of editors) {
+      try {
+        const count = await locator.count();
+        for (let i = 0; i < count; i++) {
+          const candidate = locator.nth(i);
+          if (await candidate.isVisible()) return candidate;
+        }
+      } catch {}
+    }
+    return null;
+  };
+
+  let editor = await findEditor();
+  if (editor) return editor;
+
+  const opened = await clickFirst([
+    page.getByText(/what[’']s on your mind\??/i, { exact: false }),
+    page.locator('[role="button"]').filter({ hasText: /what[’']s on your mind/i }),
+    page.locator('yt-formatted-string').filter({ hasText: /what[’']s on your mind/i }),
     page.getByRole('button', { name: /create post/i }),
     page.getByText(/create post/i, { exact: true }),
     page.locator('button').filter({ hasText: /create post/i })
   ]).catch(() => false);
 
-  await sleep(1200);
+  if (opened) await sleep(1600);
 
-  const editors = [
-    page.locator('[contenteditable="true"]'),
-    page.getByRole('textbox'),
-    page.locator('textarea')
-  ];
+  editor = await findEditor();
+  if (editor) return editor;
 
-  for (const locator of editors) {
+  // Some YouTube layouts make the whole composer card clickable rather than
+  // exposing a button or textbox until the card receives focus.
+  for (const locator of [
+    page.locator('ytd-backstage-post-renderer').first(),
+    page.locator('ytd-backstage-post-dialog-renderer').first(),
+    page.locator('[aria-label*="post" i]').first()
+  ]) {
     try {
-      const count = await locator.count();
-      for (let i = 0; i < count; i++) {
-        const candidate = locator.nth(i);
-        if (await candidate.isVisible()) return candidate;
+      if (await locator.isVisible({ timeout: 1200 })) {
+        await locator.click({ position: { x: 140, y: 60 } }).catch(() => {});
+        await sleep(900);
+        editor = await findEditor();
+        if (editor) return editor;
       }
     } catch {}
   }
