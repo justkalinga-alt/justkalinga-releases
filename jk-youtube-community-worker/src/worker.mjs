@@ -13,7 +13,7 @@ if (!fs.existsSync(configPath)) {
   throw new Error('worker-config.json not found. Run setup.ps1 first.');
 }
 
-const configRaw = fs.readFileSync(configPath, 'utf8').replace(/^\\uFEFF/, '');
+const configRaw = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '');
 const config = JSON.parse(configRaw);
 
 const hubUrl = String(config.hub_url || '').replace(/\/$/, '');
@@ -519,7 +519,7 @@ async function publishJob(job) {
       }).catch(() => {});
     }
 
-    log('ERROR', 'Community job failed', {
+    log('ERROR', 'YouTube public post job failed', {
       job_id: job.job_id,
       clicked,
       error: message
@@ -531,7 +531,7 @@ async function publishJob(job) {
 }
 
 async function loop() {
-  log('INFO', 'JK YouTube Community Worker v0.9.3.1 starting', {
+  log('INFO', 'JK YouTube Community Worker v0.9.3.4 starting', {
     hub: hubUrl,
     worker: workerId,
     poll_seconds: pollSeconds,
