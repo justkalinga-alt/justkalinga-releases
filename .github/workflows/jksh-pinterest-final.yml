@@ -1,4 +1,4 @@
-name: Build JKSH Pinterest Sandbox deterministic UI fix
+name: Build JKSH Pinterest Sandbox direct-render fix
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - jksh-pinterest-fix-20260920
     paths:
       - .github/workflows/jksh-pinterest-final.yml
-      - scripts/patch_v01312.py
+      - scripts/patch_v01313.py
 
 permissions:
   contents: write
@@ -19,30 +19,30 @@ jobs:
         with:
           ref: jksh-pinterest-fix-20260920
 
-      - name: Fetch verified v0.13.11 base
+      - name: Fetch verified v0.13.12 base
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.11.zip' -o base.zip
-          echo '5dccf9a1552b4648ae2b542410f4b9b9a14e5e44d0de43ec7784a2c27d38ea11  base.zip' | sha256sum -c -
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.12.zip' -o base.zip
+          echo '7880205e925a628543f36ea232960169c6e3ee07a9140e41c015ee2508581dfb  base.zip' | sha256sum -c -
           rm -rf build
           mkdir build
           unzip -q base.zip -d build
 
-      - name: Apply deterministic Accounts UI patch
-        run: python3 scripts/patch_v01312.py
+      - name: Apply direct-render patch
+        run: python3 scripts/patch_v01313.py
 
       - name: Validate and package
         shell: bash
         run: |
           set -euo pipefail
-          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v01312.txt
-          grep -q 'No syntax errors detected' php-lint-v01312.txt
-          rm -f jk-social-hub-v0.13.12.zip jk-social-hub-v0.13.12.zip.sha256
-          (cd build && zip -qr ../jk-social-hub-v0.13.12.zip jk-social-hub)
-          sha256sum jk-social-hub-v0.13.12.zip | tee jk-social-hub-v0.13.12.zip.sha256
-          unzip -t jk-social-hub-v0.13.12.zip > zip-test-v01312.txt
-          grep -q 'No errors detected' zip-test-v01312.txt
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v01313.txt
+          grep -q 'No syntax errors detected' php-lint-v01313.txt
+          rm -f jk-social-hub-v0.13.13.zip jk-social-hub-v0.13.13.zip.sha256
+          (cd build && zip -qr ../jk-social-hub-v0.13.13.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.13.zip | tee jk-social-hub-v0.13.13.zip.sha256
+          unzip -t jk-social-hub-v0.13.13.zip > zip-test-v01313.txt
+          grep -q 'No errors detected' zip-test-v01313.txt
 
       - name: Commit release
         shell: bash
@@ -50,6 +50,6 @@ jobs:
           set -euo pipefail
           git config user.name 'JK Social Build Bot'
           git config user.email 'justkalinga@gmail.com'
-          git add jk-social-hub-v0.13.12.zip jk-social-hub-v0.13.12.zip.sha256 php-lint-v01312.txt zip-test-v01312.txt
-          git commit -m 'Build JK Social Hub v0.13.12 deterministic Pinterest Sandbox UI fix [skip ci]' || true
+          git add jk-social-hub-v0.13.13.zip jk-social-hub-v0.13.13.zip.sha256 php-lint-v01313.txt zip-test-v01313.txt
+          git commit -m 'Build JK Social Hub v0.13.13 direct Pinterest Sandbox renderer [skip ci]' || true
           git push origin HEAD:jksh-pinterest-fix-20260920
