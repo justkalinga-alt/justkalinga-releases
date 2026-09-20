@@ -325,6 +325,7 @@ async function publishJob(job) {
     }
 
     context = await chromium.launchPersistentContext(profileDir, {
+      channel: 'chrome',
       headless,
       viewport: headless ? { width: 1440, height: 1000 } : null,
       args: headless ? [] : ['--start-maximized']
