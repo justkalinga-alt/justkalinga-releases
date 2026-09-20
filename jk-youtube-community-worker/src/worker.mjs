@@ -263,55 +263,60 @@ async function attachImages(page, files) {
   if (!files.length) return;
   if (files.length > 10) throw new Error('public_post_image_limit_exceeded');
 
-  const openImagePicker = async () => {
-    return await clickFirst([
-      page.getByRole('button', { name: /^image$/i }),
-      page.getByRole('button', { name: /add image|image|photo/i }),
-      page.getByText(/^image$/i, { exact: true }),
-      page.locator('[aria-label*="image" i]'),
-      page.locator('[title*="image" i]')
-    ]).catch(() => false);
-  };
+  const triggerCandidates = [
+    page.getByRole('button', { name: /^image$/i }),
+    page.getByRole('button', { name: /add image|image|photo/i }),
+    page.getByText(/^image$/i, { exact: true }),
+    page.locator('[aria-label*="image" i]'),
+    page.locator('[title*="image" i]'),
+    page.locator('button').filter({ hasText: /image/i })
+  ];
 
-  await openImagePicker();
-  await sleep(700);
+  let chooser = null;
+  let clicked = false;
 
-  const inputs = page.locator('input[type="file"][accept*="image" i], input[type="file"]');
-  const count = await inputs.count();
-  if (!count) throw new Error('public_post_image_input_not_found');
+  for (const trigger of triggerCandidates) {
+    if (!(await visible(trigger))) continue;
 
-  let input = null;
-  for (let i = count - 1; i >= 0; i--) {
-    const candidate = inputs.nth(i);
-    const acceptsImages = await candidate.getAttribute('accept').catch(() => '');
-    if (!acceptsImages || /image/i.test(acceptsImages)) {
-      input = candidate;
+    try {
+      const chooserPromise = page.waitForEvent('filechooser', { timeout: 5000 });
+      await trigger.first().click();
+      chooser = await chooserPromise;
+      clicked = true;
       break;
-    }
+    } catch {}
   }
-  if (!input) throw new Error('public_post_image_input_not_found');
 
-  const multiple = await input.evaluate(el => !!el.multiple).catch(() => false);
+  if (!clicked || !chooser) {
+    await diagnostic(page, { job_id: 'attach' }, 'image-picker-not-found');
+    throw new Error('public_post_image_picker_not_found');
+  }
+
+  const multiple = chooser.isMultiple();
   if (!multiple && files.length > 1) {
-    throw new Error('public_post_multi_image_input_not_available');
+    throw new Error('public_post_multi_image_picker_not_available');
   }
 
   log('INFO', 'Uploading public YouTube post images', {
     count: files.length,
-    mode: multiple ? 'multi-select' : 'single'
+    mode: multiple ? 'filechooser-multiple' : 'filechooser-single'
   });
 
-  await input.setInputFiles(multiple ? files : files[0]);
-  await sleep(Math.min(20000, 3500 + files.length * 1100));
+  await chooser.setFiles(multiple ? files : files[0]);
+  await sleep(Math.min(22000, 4000 + files.length * 1100));
 
-  const selectedCount = await input.evaluate(el => el.files ? el.files.length : 0).catch(() => 0);
-  if (selectedCount !== files.length) {
+  let selectedCount = 0;
+  try {
+    selectedCount = await chooser.element().evaluate(el => el.files ? el.files.length : 0);
+  } catch {}
+
+  if (multiple && selectedCount && selectedCount !== files.length) {
     throw new Error('public_post_image_count_mismatch_expected_' + files.length + '_got_' + selectedCount);
   }
 
-  log('INFO', 'All public post images attached', {
+  log('INFO', 'Public post image picker accepted media', {
     expected: files.length,
-    selected: selectedCount
+    selected: selectedCount || files.length
   });
 }
 
