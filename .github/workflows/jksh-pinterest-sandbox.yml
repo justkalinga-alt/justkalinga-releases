@@ -1,0 +1,131 @@
+name: Build JKSH Pinterest sandbox routing
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - .github/workflows/jksh-pinterest-sandbox.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+
+      - name: Fetch verified v0.13.6 base
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.6.zip' -o base.zip
+          echo '685d4f83ddc8d9a393fe5a4c9a6eaf423bf456af55b46b22c5a077ac27147dc9  base.zip' | sha256sum -c -
+          rm -rf build && mkdir build
+          unzip -q base.zip -d build
+
+      - name: Add Trial API sandbox routing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/jk-social-hub/includes/class-jksh-pinterest-sandbox-v0137.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { exit; }
+
+          final class JKSH_Pinterest_Sandbox_V0137 {
+              public static function init(): void {
+                  add_filter( 'pre_http_request', [ __CLASS__, 'route_trial_api' ], 5, 3 );
+              }
+
+              public static function route_trial_api( $preempt, array $args, string $url ) {
+                  if ( false !== $preempt ) {
+                      return $preempt;
+                  }
+
+                  if ( ! class_exists( 'JKSH_Pinterest_Connector' ) ) {
+                      return $preempt;
+                  }
+
+                  if ( 0 !== strpos( $url, 'https://api.pinterest.com/' ) ) {
+                      return $preempt;
+                  }
+
+                  $readiness = JKSH_Pinterest_Connector::instance()->readiness();
+                  if ( empty( $readiness['configured'] ) || empty( $readiness['api_access_confirmed'] ) ) {
+                      return $preempt;
+                  }
+
+                  // Pinterest Trial API writes are only permitted against the sandbox host.
+                  // Keep OAuth/token traffic and all non-Pinterest traffic untouched.
+                  $method = strtoupper( (string) ( $args['method'] ?? 'GET' ) );
+                  if ( ! in_array( $method, [ 'POST', 'PUT', 'PATCH', 'DELETE' ], true ) ) {
+                      return $preempt;
+                  }
+
+                  $sandbox_url = preg_replace(
+                      '#^https://api\.pinterest\.com/#',
+                      'https://api-sandbox.pinterest.com/',
+                      $url,
+                      1
+                  );
+
+                  if ( ! is_string( $sandbox_url ) || $sandbox_url === $url ) {
+                      return $preempt;
+                  }
+
+                  remove_filter( 'pre_http_request', [ __CLASS__, 'route_trial_api' ], 5 );
+                  try {
+                      return wp_remote_request( $sandbox_url, $args );
+                  } finally {
+                      add_filter( 'pre_http_request', [ __CLASS__, 'route_trial_api' ], 5, 3 );
+                  }
+              }
+          }
+
+          JKSH_Pinterest_Sandbox_V0137::init();
+          PHP
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('build/jk-social-hub/jk-social-hub.php')
+          s=p.read_text()
+          s=s.replace(" * Version:     0.13.6"," * Version:     0.13.7",1)
+          s=s.replace("define( 'JKSH_VERSION', '0.13.6' );","define( 'JKSH_VERSION', '0.13.7' );",1)
+          old=" * Description: Internal social-media operating system for JustKalinga. v0.13.6 completes guarded native Pinterest publishing and accurate blocked-job Library state."
+          new=" * Description: Internal social-media operating system for JustKalinga. v0.13.7 routes Pinterest Trial API writes through the official sandbox endpoint."
+          if old in s:
+              s=s.replace(old,new,1)
+          marker="// JKSH_V0133_ACCOUNTS_UI"
+          insert="""// JKSH_V0137_PINTEREST_SANDBOX
+          $jksh_v0137_pinterest_sandbox = __DIR__ . '/includes/class-jksh-pinterest-sandbox-v0137.php';
+          if ( is_readable( $jksh_v0137_pinterest_sandbox ) ) { require_once $jksh_v0137_pinterest_sandbox; }
+
+          """
+          if marker not in s:
+              raise SystemExit('Loader marker missing')
+          s=s.replace(marker,insert+marker,1)
+          p.write_text(s)
+          PY
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0137.txt
+          (cd build && zip -qr ../jk-social-hub-v0.13.7.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.7.zip | tee jk-social-hub-v0.13.7.zip.sha256
+          unzip -t jk-social-hub-v0.13.7.zip > zip-test-v0137.txt
+          grep -q 'No errors detected' zip-test-v0137.txt
+
+      - name: Commit release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add jk-social-hub-v0.13.7.zip jk-social-hub-v0.13.7.zip.sha256 php-lint-v0137.txt zip-test-v0137.txt
+          git commit -m 'Build JK Social Hub v0.13.7 Pinterest Trial sandbox routing [skip ci]'
+          git push origin HEAD:jksh-pinterest-fix-20260920
