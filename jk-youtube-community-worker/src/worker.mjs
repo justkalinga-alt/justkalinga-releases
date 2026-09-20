@@ -13,7 +13,8 @@ if (!fs.existsSync(configPath)) {
   throw new Error('worker-config.json not found. Run setup.ps1 first.');
 }
 
-const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const configRaw = fs.readFileSync(configPath, 'utf8').replace(/^\\uFEFF/, '');
+const config = JSON.parse(configRaw);
 
 const hubUrl = String(config.hub_url || '').replace(/\/$/, '');
 const token = String(config.worker_token || '').trim();
