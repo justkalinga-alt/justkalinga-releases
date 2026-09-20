@@ -192,138 +192,127 @@ async function ensureLoggedIn(page) {
 }
 
 async function openComposer(page) {
-  const findEditor = async () => {
-    const editors = [
-      page.locator('ytd-backstage-post-dialog-renderer [contenteditable="true"]'),
-      page.locator('[role="dialog"] [contenteditable="true"]'),
-      page.locator('div[role="textbox"][contenteditable="true"]'),
-      page.locator('[contenteditable="true"]'),
-      page.getByRole('textbox'),
-      page.locator('textarea')
-    ];
+  // IMPORTANT: Use YouTube's creator-wide Create > Create post flow.
+  // Do not post from /community, because that creates Community-only posts
+  // which do not appear on the channel's normal Published/Posts surface.
+  await page.goto('https://www.youtube.com/', {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000
+  });
+  await sleep(1800);
 
-    for (const locator of editors) {
-      try {
-        const count = await locator.count();
-        for (let i = 0; i < count; i++) {
-          const candidate = locator.nth(i);
-          if (await candidate.isVisible()) return candidate;
-        }
-      } catch {}
-    }
-    return null;
-  };
+  if (!(await ensureLoggedIn(page))) {
+    throw new Error('youtube_login_required');
+  }
 
-  let editor = await findEditor();
-  if (editor) return editor;
-
-  const opened = await clickFirst([
-    page.getByText(/what[’']s on your mind\??/i, { exact: false }),
-    page.locator('[role="button"]').filter({ hasText: /what[’']s on your mind/i }),
-    page.locator('yt-formatted-string').filter({ hasText: /what[’']s on your mind/i }),
-    page.getByRole('button', { name: /create post/i }),
-    page.getByText(/create post/i, { exact: true }),
-    page.locator('button').filter({ hasText: /create post/i })
+  const createOpened = await clickFirst([
+    page.getByRole('button', { name: /^create$/i }),
+    page.locator('button[aria-label="Create"]'),
+    page.locator('[aria-label="Create"]').filter({ has: page.locator('svg, yt-icon') })
   ]).catch(() => false);
 
-  if (opened) await sleep(1600);
+  if (!createOpened) throw new Error('youtube_create_menu_not_found');
 
-  editor = await findEditor();
-  if (editor) return editor;
+  await sleep(900);
 
-  // Some YouTube layouts make the whole composer card clickable rather than
-  // exposing a button or textbox until the card receives focus.
-  for (const locator of [
-    page.locator('ytd-backstage-post-renderer').first(),
-    page.locator('ytd-backstage-post-dialog-renderer').first(),
-    page.locator('[aria-label*="post" i]').first()
-  ]) {
+  const postOpened = await clickFirst([
+    page.getByRole('menuitem', { name: /create post/i }),
+    page.getByText(/create post/i, { exact: true }),
+    page.locator('tp-yt-paper-item').filter({ hasText: /create post/i }),
+    page.locator('ytd-compact-link-renderer').filter({ hasText: /create post/i })
+  ]).catch(() => false);
+
+  if (!postOpened) throw new Error('youtube_create_post_action_not_found');
+
+  await sleep(1400);
+
+  // Guard against accidentally landing in the Community-only composer.
+  const communityOnly = [
+    page.getByText(/^my community$/i, { exact: true }),
+    page.getByText(/community-only/i, { exact: false })
+  ];
+  for (const locator of communityOnly) {
+    if (await visible(locator)) {
+      throw new Error('wrong_surface_community_only');
+    }
+  }
+
+  const editors = [
+    page.locator('ytd-backstage-post-dialog-renderer [contenteditable="true"]'),
+    page.locator('[role="dialog"] [contenteditable="true"]'),
+    page.locator('div[role="textbox"][contenteditable="true"]'),
+    page.getByRole('textbox'),
+    page.locator('[contenteditable="true"]'),
+    page.locator('textarea')
+  ];
+
+  for (const locator of editors) {
     try {
-      if (await locator.isVisible({ timeout: 1200 })) {
-        await locator.click({ position: { x: 140, y: 60 } }).catch(() => {});
-        await sleep(900);
-        editor = await findEditor();
-        if (editor) return editor;
+      const count = await locator.count();
+      for (let i = 0; i < count; i++) {
+        const candidate = locator.nth(i);
+        if (await candidate.isVisible()) return candidate;
       }
     } catch {}
   }
 
-  throw new Error('community_composer_not_found');
+  throw new Error('public_post_composer_not_found');
 }
 
 async function attachImages(page, files) {
   if (!files.length) return;
-  if (files.length > 10) throw new Error('community_image_limit_exceeded');
-
-  const locateInput = async () => {
-    const inputs = page.locator('input[type="file"][accept*="image" i], input[type="file"]');
-    const count = await inputs.count();
-    return count ? inputs.last() : null;
-  };
+  if (files.length > 10) throw new Error('public_post_image_limit_exceeded');
 
   const openImagePicker = async () => {
-    await clickFirst([
+    return await clickFirst([
+      page.getByRole('button', { name: /^image$/i }),
       page.getByRole('button', { name: /add image|image|photo/i }),
       page.getByText(/^image$/i, { exact: true }),
       page.locator('[aria-label*="image" i]'),
       page.locator('[title*="image" i]')
     ]).catch(() => false);
-    await sleep(650);
   };
 
-  let input = await locateInput();
-  if (!input) {
-    await openImagePicker();
-    input = await locateInput();
+  await openImagePicker();
+  await sleep(700);
+
+  const inputs = page.locator('input[type="file"][accept*="image" i], input[type="file"]');
+  const count = await inputs.count();
+  if (!count) throw new Error('public_post_image_input_not_found');
+
+  let input = null;
+  for (let i = count - 1; i >= 0; i--) {
+    const candidate = inputs.nth(i);
+    const acceptsImages = await candidate.getAttribute('accept').catch(() => '');
+    if (!acceptsImages || /image/i.test(acceptsImages)) {
+      input = candidate;
+      break;
+    }
   }
-  if (!input) throw new Error('community_image_input_not_found');
+  if (!input) throw new Error('public_post_image_input_not_found');
 
   const multiple = await input.evaluate(el => !!el.multiple).catch(() => false);
-
-  if (multiple) {
-    log('INFO', 'Uploading Community images', { count: files.length, mode: 'multiple-input' });
-    await input.setInputFiles(files);
-    await sleep(Math.min(18000, 3000 + files.length * 1000));
-    return;
+  if (!multiple && files.length > 1) {
+    throw new Error('public_post_multi_image_input_not_available');
   }
 
-  // Current YouTube desktop Community composer exposes a single-file input
-  // even though image posts support multiple images. Add them one at a time.
-  for (let i = 0; i < files.length; i++) {
-    if (i > 0) {
-      // Reacquire because YouTube may replace the input node after each upload.
-      input = await locateInput();
-      if (!input) {
-        await openImagePicker();
-        input = await locateInput();
-      }
-    }
+  log('INFO', 'Uploading public YouTube post images', {
+    count: files.length,
+    mode: multiple ? 'multi-select' : 'single'
+  });
 
-    if (!input) {
-      throw new Error('community_image_input_not_found_at_' + (i + 1));
-    }
+  await input.setInputFiles(multiple ? files : files[0]);
+  await sleep(Math.min(20000, 3500 + files.length * 1100));
 
-    log('INFO', 'Uploading Community image', {
-      index: i + 1,
-      total: files.length,
-      file: path.basename(files[i])
-    });
-
-    await input.setInputFiles(files[i]);
-    await sleep(1400);
-
-    // For subsequent images, prefer YouTube's add-image control if it appears.
-    if (i < files.length - 1) {
-      await clickFirst([
-        page.getByRole('button', { name: /add image|add photo|image|photo/i }),
-        page.locator('[aria-label*="add image" i]'),
-        page.locator('[aria-label*="image" i]')
-      ]).catch(() => false);
-      await sleep(450);
-    }
+  const selectedCount = await input.evaluate(el => el.files ? el.files.length : 0).catch(() => 0);
+  if (selectedCount !== files.length) {
+    throw new Error('public_post_image_count_mismatch_expected_' + files.length + '_got_' + selectedCount);
   }
 
-  await sleep(Math.min(12000, 1800 + files.length * 700));
+  log('INFO', 'All public post images attached', {
+    expected: files.length,
+    selected: selectedCount
+  });
 }
 
 async function findNewPostUrl(page, before, caption) {
@@ -400,7 +389,7 @@ async function publishJob(job) {
   let clicked = false;
 
   try {
-    log('INFO', 'Starting Community job', {
+    log('INFO', 'Starting YouTube public post job', {
       job_id: job.job_id,
       media: (job.media_urls || []).length
     });
@@ -421,11 +410,11 @@ async function publishJob(job) {
 
     page = context.pages()[0] || await context.newPage();
 
-    await page.goto(job.community_url, {
+    await page.goto('https://www.youtube.com/', {
       waitUntil: 'domcontentloaded',
       timeout: 60000
     });
-    await sleep(2000);
+    await sleep(1200);
 
     if (!(await ensureLoggedIn(page))) {
       await diagnostic(page, job, 'login-required');
@@ -502,7 +491,7 @@ async function publishJob(job) {
       external_url: externalUrl
     });
 
-    log('INFO', 'Community post verified', {
+    log('INFO', 'Public YouTube post verified', {
       job_id: job.job_id,
       external_url: externalUrl
     });
