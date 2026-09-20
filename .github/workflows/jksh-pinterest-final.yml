@@ -1,4 +1,4 @@
-name: Build JKSH Pinterest Sandbox callback fix
+name: Build JKSH Pinterest Sandbox UI fix
 
 on:
   push:
@@ -18,16 +18,16 @@ jobs:
         with:
           ref: jksh-pinterest-fix-20260920
 
-      - name: Fetch verified v0.13.8 base
+      - name: Fetch verified v0.13.9 base
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.8.zip' -o base.zip
-          echo 'fedbef136f99ae3c81641b2beaff42dac644942f8695fc452e731d7e1e42695c  base.zip' | sha256sum -c -
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.9.zip' -o base.zip
+          echo 'cccd10edfe308c423465219c3fac2816d8cbf5071b19a62c61f7be2b4414f640  base.zip' | sha256sum -c -
           rm -rf build && mkdir build
           unzip -q base.zip -d build
 
-      - name: Patch callback visibility and version
+      - name: Mount Sandbox card inside Pinterest Accounts tab
         shell: bash
         run: |
           set -euo pipefail
@@ -39,11 +39,11 @@ jobs:
 
           s = main.read_text()
           pairs = [
-            (" * Version:     0.13.8", " * Version:     0.13.9"),
-            ("define( 'JKSH_VERSION', '0.13.8' );", "define( 'JKSH_VERSION', '0.13.9' );"),
+            (" * Version:     0.13.9", " * Version:     0.13.10"),
+            ("define( 'JKSH_VERSION', '0.13.9' );", "define( 'JKSH_VERSION', '0.13.10' );"),
             (
-              " * Description: Internal social-media operating system for JustKalinga. v0.13.8 adds a secure Pinterest Sandbox proof lane with encrypted token storage and Sandbox Published receipts.",
-              " * Description: Internal social-media operating system for JustKalinga. v0.13.9 fixes Pinterest Sandbox REST permission callbacks while preserving the encrypted proof lane."
+              " * Description: Internal social-media operating system for JustKalinga. v0.13.9 fixes Pinterest Sandbox REST permission callbacks while preserving the encrypted proof lane.",
+              " * Description: Internal social-media operating system for JustKalinga. v0.13.10 mounts Pinterest Sandbox cleanly inside the Accounts Pinterest tab with responsive enterprise layout."
             ),
           ]
           for old,new in pairs:
@@ -53,10 +53,77 @@ jobs:
           main.write_text(s)
 
           s = sandbox.read_text()
-          old = "private function can_manage() {"
-          new = "public function can_manage() {"
+          old = """        </section>
+        <?php
+    }"""
+          new = """        </section>
+        <style>
+        #jksh-pinterest-sandbox-v0138{
+            width:100%;
+            max-width:100%;
+            min-width:0;
+            box-sizing:border-box;
+            overflow:visible;
+        }
+        #jksh-pinterest-sandbox-v0138 *{box-sizing:border-box}
+        #jksh-pinterest-sandbox-v0138 p,
+        #jksh-pinterest-sandbox-v0138 td,
+        #jksh-pinterest-sandbox-v0138 th{overflow-wrap:anywhere;word-break:normal}
+        #jksh-pinterest-sandbox-v0138 .jksh-form{
+            display:grid;
+            gap:12px;
+            width:100%;
+            max-width:760px;
+            min-width:0;
+        }
+        #jksh-pinterest-sandbox-v0138 .jksh-form label{display:grid;gap:6px;min-width:0}
+        #jksh-pinterest-sandbox-v0138 input[type=password],
+        #jksh-pinterest-sandbox-v0138 input[type=text],
+        #jksh-pinterest-sandbox-v0138 select,
+        #jksh-pinterest-sandbox-v0138 textarea{
+            width:100%;
+            max-width:100%;
+            min-width:0;
+        }
+        #jksh-pinterest-sandbox-v0138 table{
+            width:100%;
+            max-width:100%;
+            table-layout:fixed;
+        }
+        .jksh-account-panel[data-account-panel="pinterest"],
+        .jksh-account-panel[data-account-panel="pinterest"] .jksh-account-panel-grid{
+            min-width:0;
+            width:100%;
+            max-width:100%;
+        }
+        @media(max-width:782px){
+            #jksh-pinterest-sandbox-v0138{padding:16px!important}
+            #jksh-pinterest-sandbox-v0138 .button{width:100%;justify-content:center}
+        }
+        </style>
+        <script>
+        (() => {
+            const mountSandbox = () => {
+                const card = document.getElementById('jksh-pinterest-sandbox-v0138');
+                const grid = document.querySelector('.jksh-account-panel[data-account-panel="pinterest"] .jksh-account-panel-grid');
+                if (!card || !grid) return false;
+                if (card.parentElement !== grid) grid.appendChild(card);
+                card.classList.add('jksh-account-card-wide');
+                card.style.display = 'block';
+                card.style.width = '100%';
+                card.style.maxWidth = '100%';
+                card.style.minWidth = '0';
+                return true;
+            };
+            document.addEventListener('DOMContentLoaded', mountSandbox, {once:true});
+            setTimeout(mountSandbox, 0);
+            setTimeout(mountSandbox, 120);
+        })();
+        </script>
+        <?php
+    }"""
           if old not in s:
-              raise SystemExit('Missing can_manage visibility pattern')
+              raise SystemExit('Missing Sandbox admin_footer closing block')
           s=s.replace(old,new,1)
           sandbox.write_text(s)
           PY
@@ -65,13 +132,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0139.txt
-          grep -q 'No syntax errors detected' php-lint-v0139.txt
-          rm -f jk-social-hub-v0.13.9.zip jk-social-hub-v0.13.9.zip.sha256
-          (cd build && zip -qr ../jk-social-hub-v0.13.9.zip jk-social-hub)
-          sha256sum jk-social-hub-v0.13.9.zip | tee jk-social-hub-v0.13.9.zip.sha256
-          unzip -t jk-social-hub-v0.13.9.zip > zip-test-v0139.txt
-          grep -q 'No errors detected' zip-test-v0139.txt
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v01310.txt
+          grep -q 'No syntax errors detected' php-lint-v01310.txt
+          rm -f jk-social-hub-v0.13.10.zip jk-social-hub-v0.13.10.zip.sha256
+          (cd build && zip -qr ../jk-social-hub-v0.13.10.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.10.zip | tee jk-social-hub-v0.13.10.zip.sha256
+          unzip -t jk-social-hub-v0.13.10.zip > zip-test-v01310.txt
+          grep -q 'No errors detected' zip-test-v01310.txt
 
       - name: Commit release
         shell: bash
@@ -79,6 +146,6 @@ jobs:
           set -euo pipefail
           git config user.name 'JK Social Build Bot'
           git config user.email 'justkalinga@gmail.com'
-          git add jk-social-hub-v0.13.9.zip jk-social-hub-v0.13.9.zip.sha256 php-lint-v0139.txt zip-test-v0139.txt
-          git commit -m 'Build JK Social Hub v0.13.9 Sandbox callback fix [skip ci]'
+          git add jk-social-hub-v0.13.10.zip jk-social-hub-v0.13.10.zip.sha256 php-lint-v01310.txt zip-test-v01310.txt
+          git commit -m 'Build JK Social Hub v0.13.10 Pinterest Sandbox Accounts UI fix [skip ci]'
           git push origin HEAD:jksh-pinterest-fix-20260920
