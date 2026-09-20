@@ -272,13 +272,6 @@ async function attachImages(page, files, job) {
     page.locator('button').filter({ hasText: /image/i })
   ];
 
-  const chooserTriggers = [
-    page.getByRole('button', { name: /select files|choose files|browse|upload|select from computer/i }),
-    page.getByText(/select files|choose files|browse|upload|select from computer/i, { exact: false }),
-    page.locator('[aria-label*="select" i]'),
-    page.locator('[aria-label*="upload" i]')
-  ];
-
   const findInput = async () => {
     const inputs = page.locator('input[type="file"]');
     const count = await inputs.count().catch(() => 0);
@@ -292,76 +285,54 @@ async function attachImages(page, files, job) {
     return inputs.last();
   };
 
-  const setFilesOnInput = async input => {
-    const multiple = await input.evaluate(el => !!el.multiple).catch(() => false);
+  const uploadThroughInput = async input => {
+    let multiple = await input.evaluate(el => !!el.multiple).catch(() => false);
+    let forcedMultiple = false;
+
     if (!multiple && files.length > 1) {
-      throw new Error('public_post_multi_image_input_not_available');
+      forcedMultiple = await input.evaluate(el => {
+        try {
+          el.setAttribute('multiple', '');
+          return !!el.multiple;
+        } catch {
+          return false;
+        }
+      }).catch(() => false);
+      multiple = forcedMultiple;
     }
+
+    if (!multiple && files.length > 1) return false;
 
     log('INFO', 'Uploading public YouTube post images', {
       count: files.length,
-      mode: multiple ? 'dom-input-multiple' : 'dom-input-single'
+      mode: forcedMultiple ? 'dom-input-forced-multiple' : 'dom-input-multiple'
     });
 
-    await input.setInputFiles(multiple ? files : files[0]);
+    await input.setInputFiles(files);
     await sleep(Math.min(22000, 4000 + files.length * 1100));
 
     const selectedCount = await input.evaluate(el => el.files ? el.files.length : 0).catch(() => 0);
-    if (multiple && selectedCount && selectedCount !== files.length) {
+
+    if (selectedCount && selectedCount !== files.length) {
       throw new Error('public_post_image_count_mismatch_expected_' + files.length + '_got_' + selectedCount);
     }
 
+    await diagnostic(page, job, 'after-image-upload');
+
     log('INFO', 'Public post image input accepted media', {
       expected: files.length,
-      selected: selectedCount || files.length
+      selected: selectedCount || files.length,
+      forced_multiple: forcedMultiple
     });
+
     return true;
-  };
-
-  const tryChooser = async trigger => {
-    if (!(await visible(trigger))) return false;
-
-    try {
-      const [chooser] = await Promise.all([
-        page.waitForEvent('filechooser', { timeout: 4500 }),
-        trigger.first().click()
-      ]);
-
-      const multiple = chooser.isMultiple();
-      if (!multiple && files.length > 1) {
-        throw new Error('public_post_multi_image_picker_not_available');
-      }
-
-      log('INFO', 'Uploading public YouTube post images', {
-        count: files.length,
-        mode: multiple ? 'filechooser-multiple' : 'filechooser-single'
-      });
-
-      await chooser.setFiles(multiple ? files : files[0]);
-      await sleep(Math.min(22000, 4000 + files.length * 1100));
-
-      log('INFO', 'Public post file chooser accepted media', {
-        expected: files.length,
-        selected: files.length
-      });
-      return true;
-    } catch (err) {
-      const message = String(err?.message || err);
-      if (/multi_image_picker_not_available/.test(message)) throw err;
-      return false;
-    }
   };
 
   await diagnostic(page, job, 'before-image-upload');
 
-  // Sometimes the input already exists after Create > Create post.
   let input = await findInput();
-  if (input) {
-    await setFilesOnInput(input);
-    return;
-  }
+  if (input && await uploadThroughInput(input)) return;
 
-  // First Image click can open an intermediate upload layer rather than a picker.
   const opened = await clickFirst(imageTriggers).catch(() => false);
   if (!opened) {
     await diagnostic(page, job, 'image-control-not-found');
@@ -371,36 +342,66 @@ async function attachImages(page, files, job) {
   await sleep(900);
   await diagnostic(page, job, 'after-image-control');
 
-  // The intermediate layer may now expose a hidden file input.
   input = await findInput();
-  if (input) {
-    await setFilesOnInput(input);
-    return;
-  }
+  if (input && await uploadThroughInput(input)) return;
 
-  // Or it may expose a Select files / Browse button that launches the chooser.
-  for (const trigger of chooserTriggers) {
-    if (await tryChooser(trigger)) return;
-
-    // Some controls create the input after a normal click rather than firing filechooser.
-    if (await visible(trigger)) {
-      await trigger.first().click().catch(() => {});
-      await sleep(600);
-      input = await findInput();
-      if (input) {
-        await setFilesOnInput(input);
-        return;
-      }
+  // Fallback for single-file UIs: add files sequentially and require the
+  // composer preview count to grow after every image.
+  const previewCount = async () => {
+    const scopes = [
+      page.locator('ytd-backstage-post-dialog-renderer'),
+      page.locator('[role="dialog"]')
+    ];
+    let best = 0;
+    for (const scope of scopes) {
+      try {
+        if (!(await scope.first().isVisible({ timeout: 500 }))) continue;
+        const count = await scope.first().locator('img[src], img[alt]').count();
+        best = Math.max(best, count);
+      } catch {}
     }
+    return best;
+  };
+
+  let lastPreviewCount = await previewCount();
+
+  for (let i = 0; i < files.length; i++) {
+    input = await findInput();
+
+    if (!input) {
+      const added = await clickFirst(imageTriggers).catch(() => false);
+      if (added) await sleep(500);
+      input = await findInput();
+    }
+
+    if (!input) {
+      await diagnostic(page, job, 'single-image-input-missing-' + (i + 1));
+      throw new Error('public_post_single_image_input_not_found_at_' + (i + 1));
+    }
+
+    log('INFO', 'Uploading public YouTube post image', {
+      index: i + 1,
+      total: files.length,
+      mode: 'sequential-single'
+    });
+
+    await input.setInputFiles(files[i]);
+    await sleep(1400);
+
+    const now = await previewCount();
+    if (now <= lastPreviewCount && i > 0) {
+      await diagnostic(page, job, 'preview-count-stalled-' + (i + 1));
+      throw new Error('public_post_preview_count_stalled_at_' + (i + 1));
+    }
+    lastPreviewCount = Math.max(lastPreviewCount, now);
   }
 
-  // Final fallback: try the Image controls themselves as native chooser triggers.
-  for (const trigger of imageTriggers) {
-    if (await tryChooser(trigger)) return;
-  }
+  await diagnostic(page, job, 'after-image-upload-sequential');
 
-  await diagnostic(page, job, 'image-picker-not-found');
-  throw new Error('public_post_image_picker_not_found');
+  log('INFO', 'Sequential public post image upload completed', {
+    expected: files.length,
+    preview_count: lastPreviewCount
+  });
 }
 
 async function findNewPostUrl(page, before, caption) {
@@ -619,7 +620,7 @@ async function publishJob(job) {
 }
 
 async function loop() {
-  log('INFO', 'JK YouTube Community Worker v0.9.3.5 starting', {
+  log('INFO', 'JK YouTube Community Worker v0.9.3.6 starting', {
     hub: hubUrl,
     worker: workerId,
     poll_seconds: pollSeconds,
