@@ -22,8 +22,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.7.zip' -o base.zip
-          echo '5d4aa638e71dc8e8bb69bcc7632e6ac9da82207a607283c3fdbd25bbda0677ba  base.zip' | sha256sum -c -
+          curl -fL --retry 3 'https://raw.githubusercontent.com/justkalinga-alt/justkalinga-releases/jksh-pinterest-fix-20260920/jk-social-hub-v0.13.8.zip' -o base.zip
+          echo 'fedbef136f99ae3c81641b2beaff42dac644942f8695fc452e731d7e1e42695c  base.zip' | sha256sum -c -
           rm -rf build && mkdir build
           unzip -q base.zip -d build
           test -f build/jk-social-hub/jk-social-hub.php
@@ -62,7 +62,7 @@ jobs:
                   return new \JKSH\Repositories\AccountRepository();
               }
 
-              private function can_manage() {
+              public function can_manage() {
                   return current_user_can( 'jksh_manage_accounts' ) || current_user_can( 'manage_options' );
               }
 
@@ -469,11 +469,11 @@ jobs:
 
           s = main.read_text()
           replacements = [
-              (" * Version:     0.13.7", " * Version:     0.13.8"),
-              ("define( 'JKSH_VERSION', '0.13.7' );", "define( 'JKSH_VERSION', '0.13.8' );"),
+              (" * Version:     0.13.7", " * Version:     0.13.9"),
+              ("define( 'JKSH_VERSION', '0.13.7' );", "define( 'JKSH_VERSION', '0.13.9' );"),
               (
                   " * Description: Internal social-media operating system for JustKalinga. v0.13.7 routes Pinterest Trial API writes through the official sandbox endpoint.",
-                  " * Description: Internal social-media operating system for JustKalinga. v0.13.8 adds a secure Pinterest Sandbox proof lane with encrypted token storage and Sandbox Published receipts."
+                  " * Description: Internal social-media operating system for JustKalinga. v0.13.9 adds a secure Pinterest Sandbox proof lane with encrypted token storage and Sandbox Published receipts."
               ),
           ]
           for old,new in replacements:
@@ -546,14 +546,14 @@ jobs:
           find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint-v0138.txt
           grep -q 'No syntax errors detected' php-lint-v0138.txt
 
-      - name: Package v0.13.8
+      - name: Package v0.13.9
         shell: bash
         run: |
           set -euo pipefail
-          rm -f jk-social-hub-v0.13.8.zip jk-social-hub-v0.13.8.zip.sha256
-          (cd build && zip -qr ../jk-social-hub-v0.13.8.zip jk-social-hub)
-          sha256sum jk-social-hub-v0.13.8.zip | tee jk-social-hub-v0.13.8.zip.sha256
-          unzip -t jk-social-hub-v0.13.8.zip > zip-test-v0138.txt
+          rm -f jk-social-hub-v0.13.9.zip jk-social-hub-v0.13.9.zip.sha256
+          (cd build && zip -qr ../jk-social-hub-v0.13.9.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.9.zip | tee jk-social-hub-v0.13.9.zip.sha256
+          unzip -t jk-social-hub-v0.13.9.zip > zip-test-v0138.txt
           grep -q 'No errors detected' zip-test-v0138.txt
 
       - name: Commit release
@@ -562,6 +562,6 @@ jobs:
           set -euo pipefail
           git config user.name 'JK Social Build Bot'
           git config user.email 'justkalinga@gmail.com'
-          git add jk-social-hub-v0.13.8.zip jk-social-hub-v0.13.8.zip.sha256 php-lint-v0138.txt zip-test-v0138.txt
-          git commit -m 'Build JK Social Hub v0.13.8 Pinterest Sandbox proof mode [skip ci]'
+          git add jk-social-hub-v0.13.9.zip jk-social-hub-v0.13.9.zip.sha256 php-lint-v0138.txt zip-test-v0138.txt
+          git commit -m 'Build JK Social Hub v0.13.9 Pinterest Sandbox proof mode [skip ci]'
           git push origin HEAD:jksh-pinterest-fix-20260920
