@@ -1,0 +1,147 @@
+name: Build JKSH Pinterest dispatcher fix
+
+on:
+  push:
+    branches:
+      - jksh-pinterest-fix-20260920
+    paths:
+      - .github/workflows/jksh-pinterest-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jksh-pinterest-fix-20260920
+
+      - name: Fetch exact live v0.13.3 package
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://social-justkalinga.tempurl.host/wp-content/uploads/2026/09/jk-social-hub-live-v0.13.3-export-2.zip'
+          curl -fL --retry 3 --retry-delay 2 "$URL" -o live.zip
+          echo '93f884f8efe7ff36bd709fe68bed7ad7879b4c13cc627dbf928831cf94cf7ca8  live.zip' | sha256sum -c -
+          rm -rf build
+          mkdir build
+          unzip -q live.zip -d build
+          test -f build/jk-social-hub/jk-social-hub.php
+          test -f build/jk-social-hub/src/Queue/Dispatcher.php
+          test -f build/jk-social-hub/includes/class-jksh-content-library-v091.php
+
+      - name: Patch Pinterest dispatcher and Library blocked state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("build/jk-social-hub")
+          main = root / "jk-social-hub.php"
+          dispatcher = root / "src/Queue/Dispatcher.php"
+          library = root / "includes/class-jksh-content-library-v091.php"
+
+          s = main.read_text()
+          for old,new in [
+              (" * Description: Internal social-media operating system for JustKalinga. v0.13.3 adds native Threads publishing and a tabbed enterprise Accounts workspace.",
+               " * Description: Internal social-media operating system for JustKalinga. v0.13.4 adds guarded native Pinterest dispatch and accurate blocked-job Library state."),
+              (" * Version:     0.13.3"," * Version:     0.13.4"),
+              ("define( 'JKSH_VERSION', '0.13.3' );","define( 'JKSH_VERSION', '0.13.4' );"),
+          ]:
+              if old not in s:
+                  raise SystemExit(f"Missing main-file pattern: {old}")
+              s = s.replace(old,new,1)
+          main.write_text(s)
+
+          s = dispatcher.read_text()
+
+          old = """\t\t\t} elseif ( 'threads' === $platform ) {
+          \t\t\t\t$preflight = ( new ThreadsPublisher() )->preflight( $variant );
+          \t\t\t}"""
+          new = """\t\t\t} elseif ( 'threads' === $platform ) {
+          \t\t\t\t$preflight = ( new ThreadsPublisher() )->preflight( $variant );
+          \t\t\t} elseif ( 'pinterest' === $platform ) {
+          \t\t\t\tif ( ! class_exists( '\\\\JKSH_Pinterest_Connector' ) ) {
+          \t\t\t\t\t$preflight = array( 'ok' => false, 'message' => 'Pinterest connector is not loaded.' );
+          \t\t\t\t} else {
+          \t\t\t\t\t$pinterest_ready = \\JKSH_Pinterest_Connector::instance()->readiness();
+          \t\t\t\t\t$preflight = ! empty( $pinterest_ready['live_publish_possible'] )
+          \t\t\t\t\t\t? array( 'ok' => true )
+          \t\t\t\t\t\t: array( 'ok' => false, 'message' => (string) ( $pinterest_ready['message'] ?? $pinterest_ready['note'] ?? 'Pinterest live publishing is not ready.' ) );
+          \t\t\t\t}
+          \t\t\t}"""
+          if old not in s:
+              raise SystemExit("Missing Dispatcher preflight pattern")
+          s = s.replace(old,new,1)
+
+          old = """\t\t} elseif ( 'threads' === $platform ) {
+          \t\t\tif ( ! $settings->get( 'threads_live_publish_enabled', 0 ) ) {
+          \t\t\t\t$this->block_job( $jobs, $variants, $logs, $job, 'Threads live publishing master switch is OFF. No external platform was modified.' );
+          \t\t\t\treturn;
+          \t\t\t}
+          \t\t\t$result = ( new ThreadsPublisher() )->publish( $variant, $payload );
+          \t\t} else {"""
+          new = """\t\t} elseif ( 'threads' === $platform ) {
+          \t\t\tif ( ! $settings->get( 'threads_live_publish_enabled', 0 ) ) {
+          \t\t\t\t$this->block_job( $jobs, $variants, $logs, $job, 'Threads live publishing master switch is OFF. No external platform was modified.' );
+          \t\t\t\treturn;
+          \t\t\t}
+          \t\t\t$result = ( new ThreadsPublisher() )->publish( $variant, $payload );
+          \t\t} elseif ( 'pinterest' === $platform ) {
+          \t\t\tif ( ! class_exists( '\\\\JKSH_Pinterest_Connector' ) ) {
+          \t\t\t\t$this->block_job( $jobs, $variants, $logs, $job, 'Pinterest connector is not loaded. No external platform was modified.' );
+          \t\t\t\treturn;
+          \t\t\t}
+          \t\t\t$pinterest = \\JKSH_Pinterest_Connector::instance();
+          \t\t\t$pinterest_ready = $pinterest->readiness();
+          \t\t\tif ( empty( $pinterest_ready['live_publish_possible'] ) ) {
+          \t\t\t\t$this->block_job( $jobs, $variants, $logs, $job, (string) ( $pinterest_ready['message'] ?? $pinterest_ready['note'] ?? 'Pinterest live publishing is not ready.' ) );
+          \t\t\t\treturn;
+          \t\t\t}
+          \t\t\t// The Pinterest connector owns Pin media processing, API writes and receipts.
+          \t\t\t$pinterest->process_job( $job_id );
+          \t\t\treturn;
+          \t\t} else {"""
+          if old not in s:
+              raise SystemExit("Missing Dispatcher live branch pattern")
+          s = s.replace(old,new,1)
+          dispatcher.write_text(s)
+
+          s = library.read_text()
+          old = "if ($s === 'failed') $failed = true;"
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f"Expected 2 Library failed-state patterns, got {count}")
+          s = s.replace(old, "if (in_array($s,['failed','blocked','needs_attention'],true)) $failed = true;")
+          library.write_text(s)
+          PY
+
+      - name: Validate PHP
+        shell: bash
+        run: |
+          set -euo pipefail
+          find build/jk-social-hub -name '*.php' -print0 | xargs -0 -n1 php -l > php-lint.txt
+          grep -q 'No syntax errors detected' php-lint.txt
+
+      - name: Build verified v0.13.4 ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f jk-social-hub-v0.13.4.zip jk-social-hub-v0.13.4.zip.sha256
+          (cd build && zip -qr ../jk-social-hub-v0.13.4.zip jk-social-hub)
+          sha256sum jk-social-hub-v0.13.4.zip | tee jk-social-hub-v0.13.4.zip.sha256
+          unzip -t jk-social-hub-v0.13.4.zip > zip-test.txt
+          grep -q 'No errors detected' zip-test.txt
+
+      - name: Commit release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'JK Social Build Bot'
+          git config user.email 'justkalinga@gmail.com'
+          git add jk-social-hub-v0.13.4.zip jk-social-hub-v0.13.4.zip.sha256 php-lint.txt zip-test.txt
+          git commit -m 'Build JK Social Hub v0.13.4 Pinterest dispatcher fix [skip ci]'
+          git push origin HEAD:jksh-pinterest-fix-20260920
