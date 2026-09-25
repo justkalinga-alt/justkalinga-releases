@@ -17,6 +17,7 @@ final class JKSH_Large_Video_Transport_V100 {
         add_action( 'wp_ajax_jksh_large_video_register', array( __CLASS__, 'register_finished' ), 1 );
         add_action( 'admin_footer', array( __CLASS__, 'inject_fetch_router' ), 1 );
         add_action( 'wp_footer', array( __CLASS__, 'inject_fetch_router' ), 1 );
+        add_action( 'template_redirect', array( __CLASS__, 'redirect_old_portal' ), 0 );
         add_action( 'rest_api_init', array( __CLASS__, 'register_routes' ) );
     }
 
@@ -237,8 +238,18 @@ final class JKSH_Large_Video_Transport_V100 {
         ) );
     }
 
+    public static function redirect_old_portal() : void {
+        if ( is_admin() || wp_doing_ajax() || ! is_singular( 'page' ) ) return;
+        global $post;
+        if ( ! $post instanceof WP_Post || ! has_shortcode( (string) $post->post_content, 'jk_social_upload' ) ) return;
+        if ( ! is_user_logged_in() || ! current_user_can( 'manage_options' ) ) return;
+        wp_safe_redirect( admin_url( 'admin.php?page=jksh-social-upload&view=upload' ), 302 );
+        exit;
+    }
+
     public static function inject_fetch_router() : void {
         if ( ! is_user_logged_in() || ! current_user_can( 'manage_options' ) ) return;
+        if ( is_admin() && 'jksh-social-upload' !== sanitize_key( $_GET['page'] ?? '' ) ) return;
         ?>
         <script id="jksh-large-video-transport-v100">
         (() => {
