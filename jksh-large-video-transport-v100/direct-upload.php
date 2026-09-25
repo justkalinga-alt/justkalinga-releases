@@ -5,20 +5,20 @@ header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('X-Robots-Tag: noindex, nofollow, noarchive');
 
-function jksh_lv_out(bool $success, array $data, int $status = 200): never {
+function jksh_lv_out($success, $data, $status = 200) {
     http_response_code($status);
     echo json_encode(array('success'=>$success,'data'=>$data), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
-function jksh_lv_wp_content(): string { return dirname(__DIR__, 2); }
-function jksh_lv_stage(): string { return jksh_lv_wp_content() . '/uploads/jksh-large-upload-staging'; }
-function jksh_lv_secret(): string {
+function jksh_lv_wp_content() { return dirname(__DIR__, 2); }
+function jksh_lv_stage() { return jksh_lv_wp_content() . '/uploads/jksh-large-upload-staging'; }
+function jksh_lv_secret() {
     $f = __DIR__ . '/secret.php';
     if (!is_file($f)) return '';
     $s = include $f;
     return is_string($s) ? $s : '';
 }
-function jksh_lv_parse(string $id): array|false {
+function jksh_lv_parse($id) {
     if (!preg_match('/^jklg1\.([a-f0-9-]{36})\.(\d{10})\.([a-f0-9]{64})$/', $id, $m)) return false;
     $secret = jksh_lv_secret();
     if ($secret === '') return false;
@@ -28,13 +28,13 @@ function jksh_lv_parse(string $id): array|false {
     if (!hash_equals($sig, $m[3])) return false;
     return array('uuid'=>$uuid,'exp'=>$exp);
 }
-function jksh_lv_session(string $uuid): array|false {
+function jksh_lv_session($uuid) {
     $f = jksh_lv_stage() . '/' . $uuid . '.json';
     if (!is_file($f)) return false;
     $j = json_decode((string)file_get_contents($f), true);
     return is_array($j) ? $j : false;
 }
-function jksh_lv_save_session(string $uuid, array $s): bool {
+function jksh_lv_save_session($uuid, $s) {
     $f = jksh_lv_stage() . '/' . $uuid . '.json';
     return false !== file_put_contents($f, json_encode($s, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
 }
